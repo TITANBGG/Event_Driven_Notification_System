@@ -81,12 +81,6 @@ func NewMetrics(opts MetricsOptions) *Metrics {
 
 	m := &Metrics{registry: reg}
 
-	m.notificationsProcessed = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "notifications_processed_total",
-		Help: "Total notifications transitioned to processed outcomes by channel and status.",
-	}, []string{"channel", "status"})
-	reg.MustRegister(m.notificationsProcessed)
-
 	if opts.IncludeHTTP {
 		m.notificationsCreated = prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "notifications_created_total",
@@ -125,6 +119,10 @@ func NewMetrics(opts MetricsOptions) *Metrics {
 	}
 
 	if opts.IncludeWorker {
+		m.notificationsProcessed = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "notifications_processed_total",
+			Help: "Total notifications transitioned to processed outcomes by channel and status.",
+		}, []string{"channel", "status"})
 		m.providerRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "provider_requests_total",
 			Help: "Total external provider HTTP requests grouped by channel and status/error code.",
@@ -170,6 +168,7 @@ func NewMetrics(opts MetricsOptions) *Metrics {
 		})
 
 		reg.MustRegister(
+			m.notificationsProcessed,
 			m.providerRequests,
 			m.deliveryDuration,
 			m.endToEndLatency,

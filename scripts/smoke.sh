@@ -7,34 +7,45 @@ RUN_TAG="$(date +%s)-$$"
 
 run_req() {
   local label="$1"
-  shift
-  echo "=== ${label} ==="
-  "$@" -i -sS -w "\n--- HTTP %{http_code} ---\n\n"
+  local expected_pattern="$2"
+  shift 2
+  echo "=== ${label} (expect HTTP ${expected_pattern}) ==="
+  local tmp_out
+  tmp_out="$(mktemp)"
+  local code
+  code="$("$@" -i -sS -o "${tmp_out}" -w "%{http_code}")"
+  cat "${tmp_out}"
+  rm -f "${tmp_out}"
+  echo -e "\n--- HTTP ${code} ---\n"
+  if ! [[ "${code}" =~ ^(${expected_pattern})$ ]]; then
+    echo "ERROR: ${label} returned HTTP ${code}, expected ${expected_pattern}" >&2
+    exit 1
+  fi
 }
 
-run_req "GET /health/live" \
+run_req "GET /health/live" "200" \
   curl "${API_URL}/health/live"
 
-run_req "GET /health/ready" \
+run_req "GET /health/ready" "200" \
   curl "${API_URL}/health/ready"
 
-run_req "GET /health (alias for /health/ready)" \
+run_req "GET /health (alias for /health/ready)" "200" \
   curl "${API_URL}/health"
 
-run_req "GET /metrics (Prometheus scrape headers + status check)" \
-  curl -o /dev/null -D - "${API_URL}/metrics"
+run_req "GET /metrics (Prometheus scrape headers + status check)" "200" \
+  curl -I "${API_URL}/metrics"
 
-run_req "GET /openapi.yaml (headers + status check)" \
-  curl -o /dev/null -D - "${API_URL}/openapi.yaml"
+run_req "GET /openapi.yaml (headers + status check)" "200" \
+  curl -I "${API_URL}/openapi.yaml"
 
-run_req "POST /api/v1/notifications (Turkish SMS, high priority)" \
+run_req "POST /api/v1/notifications (Turkish SMS, high priority)" "202" \
   curl -X POST "${API_URL}/api/v1/notifications" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: smoke-single-${RUN_TAG}" \
   -H "X-Correlation-ID: smoke-corr-${RUN_TAG}" \
   -d '{"recipient":"+905551234567","channel":"sms","content":"Sipari\u015finiz kargoya verildi","priority":"high"}'
 
-run_req "POST /api/v1/notifications (idempotent replay)" \
+run_req "POST /api/v1/notifications (idempotent replay)" "202" \
   curl -X POST "${API_URL}/api/v1/notifications" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: smoke-single-${RUN_TAG}" \
@@ -49,17 +60,17 @@ SINGLE_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/notifications" \
 SINGLE_ID="$(printf '%s' "${SINGLE_JSON}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
 echo "Created notification id=${SINGLE_ID}"
 
-run_req "GET /api/v1/notifications/${SINGLE_ID}" \
+run_req "GET /api/v1/notifications/${SINGLE_ID}" "200" \
   curl "${API_URL}/api/v1/notifications/${SINGLE_ID}"
 
-run_req "GET /api/v1/notifications?limit=5" \
+run_req "GET /api/v1/notifications?limit=5" "200" \
   curl "${API_URL}/api/v1/notifications?limit=5"
 
-run_req "POST /api/v1/notifications/${SINGLE_ID}/cancel (200 if queued or 409 if already sent)" \
+run_req "POST /api/v1/notifications/${SINGLE_ID}/cancel (200 if queued or 409 if already sent)" "200|409" \
   curl -X POST "${API_URL}/api/v1/notifications/${SINGLE_ID}/cancel"
 
-run_req "POST /api/v1/notifications/${SINGLE_ID}/retry (expect 409)" \
-  curl -X POST "${API_URL}/api/v1/notifications/${SINGLE_ID}/retry" || true
+run_req "POST /api/v1/notifications/${SINGLE_ID}/retry (expect 409)" "409" \
+  curl -X POST "${API_URL}/api/v1/notifications/${SINGLE_ID}/retry"
 
 echo "=== POST /api/v1/notifications/batch (10 mixed-channel notifications -> verify end-to-end delivery) ==="
 E2E_BATCH_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/notifications/batch" \
@@ -97,14 +108,14 @@ if [ "${ALL_SENT}" -ne 1 ]; then
   exit 1
 fi
 
-run_req "GET /api/v1/batches/${E2E_BATCH_ID} (all 10 sent)" \
+run_req "GET /api/v1/batches/${E2E_BATCH_ID} (all 10 sent)" "200" \
   curl "${API_URL}/api/v1/batches/${E2E_BATCH_ID}"
 
-run_req "POST /api/v1/batches/${E2E_BATCH_ID}/cancel (after completion: cancelled=0, notCancellable=10)" \
+run_req "POST /api/v1/batches/${E2E_BATCH_ID}/cancel (after completion: cancelled=0, notCancellable=10)" "200" \
   curl -X POST "${API_URL}/api/v1/batches/${E2E_BATCH_ID}/cancel"
 
-run_req "GET /api/v1/metrics (real-time JSON observability snapshot)" \
+run_req "GET /api/v1/metrics (real-time JSON observability snapshot)" "200" \
   curl "${API_URL}/api/v1/metrics"
 
-run_req "GET ${MOCK_URL}/stats" \
+run_req "GET ${MOCK_URL}/stats" "200" \
   curl "${MOCK_URL}/stats"

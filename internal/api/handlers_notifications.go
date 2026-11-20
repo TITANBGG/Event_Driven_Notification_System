@@ -660,7 +660,6 @@ func (h *handler) handleCancelNotification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	h.metrics.IncNotificationProcessed(updated.Channel.String(), domain.StatusCancelled.String())
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
 }
 

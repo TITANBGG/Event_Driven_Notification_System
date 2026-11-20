@@ -742,30 +742,57 @@ func TestCoreIntegration(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		// 2. Create a 20-item batch via API, then wipe Redis completely to simulate Redis data loss.
+		// Configure first 5 batch items to hit transient 500 first (entering status='retrying'),
+		// and add a brief provider delay so other items remain pending when Redis keys are wiped mid-run.
+		for i := 0; i < 5; i++ {
+			inf.provider.setSequence(fmt.Sprintf("+90555%07d", 6100000+i), []int{500, 202})
+		}
+		inf.provider.setDelay(20 * time.Millisecond)
+
+		stopWorker := inf.startWorker(t, func(c *config.Config) {
+			c.WorkerConcurrency = 2
+			c.RetryMin = 400 * time.Millisecond
+			c.RetryBase = 450 * time.Millisecond
+			c.RetryCap = 600 * time.Millisecond
+			c.PendingStaleAfter = 150 * time.Millisecond
+			c.ReconcileInterval = 50 * time.Millisecond
+		}, 500, 10)
+		defer stopWorker()
+
+		// 2. Submit a 20-item batch while the worker is actively running.
 		items := make([]map[string]any, 20)
 		for i := 0; i < 20; i++ {
 			items[i] = map[string]any{
 				"recipient": fmt.Sprintf("+90555%07d", 6100000+i),
 				"channel":   "sms",
 				"priority":  "normal",
-				"content":   fmt.Sprintf("Lost from redis %d", i),
+				"content":   fmt.Sprintf("Lost from redis mid-run %d", i),
 			}
 		}
 		var batch api.BatchCreateResponse
 		code, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/notifications/batch", nil, map[string]any{"notifications": items}, &batch)
 		require.Equal(t, http.StatusAccepted, code)
 
-		require.NoError(t, inf.rdb.FlushDB(t.Context()).Err())
+		// Wait until at least 3 notifications have transitioned to status='retrying' mid-run.
+		require.Eventually(t, func() bool {
+			var retryingCount int
+			_ = inf.pool.QueryRow(t.Context(),
+				"SELECT count(*) FROM notifications WHERE batch_id = $1 AND status = 'retrying'",
+				batch.BatchID,
+			).Scan(&retryingCount)
+			return retryingCount >= 3
+		}, 5*time.Second, 15*time.Millisecond)
 
-		// Wait past PendingStaleAfter (150ms) so FindStalePending sees all 21 untracked pending rows.
-		time.Sleep(250 * time.Millisecond)
-
-		stopWorker := inf.startWorker(t, func(c *config.Config) {
-			c.PendingStaleAfter = 150 * time.Millisecond
-			c.ReconcileInterval = 40 * time.Millisecond
-		}, 500, 10)
-		defer stopWorker()
+		// Simulate mid-run Redis data loss by deleting {notif}:msg, {notif}:delayed, and SMS priority queues
+		// while the worker is running. Reconciler step (a) must recover pending rows and step (b) must recover retrying rows.
+		require.NoError(t, inf.rdb.Del(
+			t.Context(),
+			queue.MsgHashKey,
+			queue.DelayedZSetKey,
+			queue.Key(domain.ChannelSMS, domain.PriorityHigh),
+			queue.Key(domain.ChannelSMS, domain.PriorityNormal),
+			queue.Key(domain.ChannelSMS, domain.PriorityLow),
+		).Err())
 
 		var detail api.NotificationDetailResponse
 		require.Eventually(t, func() bool {
@@ -777,7 +804,7 @@ func TestCoreIntegration(t *testing.T) {
 		require.Eventually(t, func() bool {
 			c, _ := doJSON(t, http.MethodGet, inf.apiSrv.URL+"/api/v1/batches/"+batch.BatchID.String()+"?limit=1", nil, nil, &summary)
 			return c == http.StatusOK && summary.CountsByStatus["sent"] == 20
-		}, 10*time.Second, 30*time.Millisecond)
+		}, 12*time.Second, 40*time.Millisecond)
 	})
 
 	t.Run("i_list_filters_and_three_page_keyset_pagination", func(t *testing.T) {

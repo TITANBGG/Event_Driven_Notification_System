@@ -18,6 +18,7 @@ A production-grade, horizontally scalable multi-channel notification management 
 10. [Testing & Load Generation](#10-testing--load-generation)
 11. [Live `webhook.site` (`EXT-1`) Setup](#11-live-webhooksite-ext-1-setup)
 12. [Known Limitations](#12-known-limitations)
+13. [Requirement Traceability Matrix (`FR-1.1` … `D-6`)](#13-requirement-traceability-matrix-fr-11--d-6)
 
 ---
 
@@ -462,4 +463,35 @@ By default, `docker-compose.yml` points `PROVIDER_URL` at the in-cluster `http:/
 1. **SMS Turkish National Language Shift Table:** GSM 03.38 basic/extension tables include `ö ü Ö Ü Ç`, whereas `ç ğ Ğ ı İ ş Ş` require the 3GPP TS 23.038 Turkish Locking/Single Shift table. When those characters appear, our segmenter automatically switches the message to `UCS-2` (`70`/`67` code units per segment), matching conservative carrier gateway behavior.
 2. **Global Idempotency Key Namespace:** `idempotency_keys.key` is currently a global primary key (single-tenant model). In a multi-tenant deployment, the primary key would be composite `(tenant_id, key)`.
 3. **In-Memory Per-Replica Circuit Breaker:** Circuit breaker state is tracked per channel in memory on each worker replica rather than shared in Redis, trading a small per-replica detection warm-up (`10` failures per replica) for zero Redis overhead and resilience during Redis outages.
+
+---
+
+## 13. Requirement Traceability Matrix (`FR-1.1` … `D-6`)
+
+| ID | Requirement | Implementation File(s) | Automated Test(s) | Status |
+|---|---|---|---|---|
+| **FR-1.1** | Create single notification (`recipient`, `channel`, `content`, `priority`) | `internal/api/handlers_notifications.go`, `internal/repository/repository.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/a_single_notification_end_to_end` | **DONE** |
+| **FR-1.2** | Batch creation (`<= 1000` notifications, `pgx.CopyFrom`, all-or-nothing validation) | `internal/api/handlers_notifications.go`, `internal/repository/repository.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/c_batch_1000_and_batch_key_replay` | **DONE** |
+| **FR-1.3** | Query notification status & `deliveryAttempts` by ID | `internal/api/handlers_notifications.go`, `internal/repository/repository.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/a_single_notification_end_to_end` | **DONE** |
+| **FR-1.4** | Query batch status summary (`countsByStatus`) & paginated items by batch ID | `internal/api/handlers_batches.go`, `internal/repository/repository.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/c_batch_1000_and_batch_key_replay` | **DONE** |
+| **FR-1.5** | Cancel pending notifications (`pending`/`retrying`/`scheduled` -> `cancelled`, `409 Conflict`) | `internal/api/handlers_notifications.go`, `internal/api/handlers_batches.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/d_cancel_race_no_cancelled_notification_reaches_provider` | **DONE** |
+| **FR-1.6** | List notifications with filtering (`status`, `channel`, `priority`, `from`/`to`) & keyset pagination | `internal/api/handlers_notifications.go`, `internal/api/cursor.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/i_list_filters_and_three_page_keyset_pagination` | **DONE** |
+| **FR-2.1** | Process notifications asynchronously via queue workers with atomic `Claim` & fencing | `internal/worker/worker.go`, `internal/queue/queue.go`, `cmd/worker/main.go` | `internal/worker/worker_test.go`, `TestCoreIntegration/a_single_notification_end_to_end` | **DONE** |
+| **FR-2.2** | Distributed rate limiting: max `100` messages/sec per channel (`Burst=1`) | `internal/ratelimit/limiter.go` | `internal/ratelimit/limiter_test.go`, `TestCoreIntegration/g_distributed_rate_limit_500_sms_across_two_workers` | **DONE** |
+| **FR-2.3** | Priority queue support (`high`, `normal`, `low`, 6:3:1 weighted anti-starvation) | `internal/queue/queue.go`, `internal/queue/lua/dequeue.lua` | `internal/queue/queue_test.go`, `TestCoreIntegration/f_priority_high_completes_ahead_of_low` | **DONE** |
+| **FR-2.4** | Content & recipient validation (E.164, GSM-7/UCS-2 SMS segments, Email, Push) | `internal/domain/validation.go`, `internal/domain/sms.go` | `internal/domain/validation_test.go`, `internal/domain/sms_test.go`, `internal/api/handlers_test.go` | **DONE** |
+| **FR-2.5** | Idempotency support (API `idempotency_keys` + SHA-256 canonical hash; provider `Idempotency-Key`) | `internal/domain/hash.go`, `internal/api/handlers_notifications.go`, `internal/provider/client.go` | `internal/domain/hash_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/b_idempotent_create_replay_and_conflict` | **DONE** |
+| **FR-3** | Delivery & retry logic (outcome classification, full-jitter exponential backoff, `Retry-After`) | `internal/worker/retry.go`, `internal/worker/worker.go`, `internal/provider/client.go` | `internal/worker/retry_test.go`, `internal/worker/worker_phase5_test.go`, `TestCoreIntegration/e_retry_500_500_202_and_permanent_400_to_dlq` | **DONE** |
+| **FR-4.1** | Real-time metrics (`/metrics` Prometheus custom registry + `/api/v1/metrics` 2s cached JSON) | `internal/observability/metrics.go`, `internal/api/handlers_metrics.go`, `internal/api/middleware/metrics.go` | `internal/observability/metrics_test.go`, `internal/api/observability_test.go` | **DONE** |
+| **FR-4.2** | Structured JSON logging (`log/slog`) with `correlation_id` propagation & PII masking | `internal/observability/logger.go`, `internal/api/middleware/correlation.go`, `internal/api/middleware/logger.go` | `internal/observability/logger_test.go`, `internal/api/middleware/middleware_test.go`, `internal/worker/observability_hooks_test.go` | **DONE** |
+| **FR-4.3** | Health check endpoints (`/health/live`, `/health/ready`, `/health` with 1s DB/Redis timeout & `503`) | `internal/api/handlers_system.go`, `cmd/worker/main.go`, `cmd/healthcheck/main.go` | `internal/api/observability_test.go`, `cmd/healthcheck/main_test.go`, `scripts/smoke.sh` | **DONE** |
+| **EXT-1** | External provider HTTP contract (`POST {to,channel,content}` -> `202 {messageId,status,timestamp}`) | `internal/provider/client.go`, `cmd/mockprovider/main.go` | `internal/provider/client_test.go`, `cmd/mockprovider/main_test.go`, `TestCoreIntegration/a_single_notification_end_to_end` | **DONE** |
+| **B-1** | Failure handling (per-channel `gobreaker/v2`, DLQ, 5-step Reconciler, Inflight Sweeper, manual `/retry`) | `internal/worker/breaker.go`, `internal/worker/reconciler.go`, `internal/worker/worker.go` | `internal/worker/breaker_test.go`, `internal/worker/reconciler_test.go`, `internal/worker/stranded_repair_test.go`, `TestCoreIntegration/h_reconciler_repairs_untracked_pending_and_simulated_redis_loss` | **DONE** |
+| **D-1** | GitHub repository with clean Conventional Commits history | Git repository | `git log`, `.gitignore` | **DONE** |
+| **D-2** | `README.md` with setup instructions, architecture overview, Mermaid diagrams, and API examples | `README.md` | `scripts/smoke.sh` | **DONE** |
+| **D-3** | One-command zero-config Docker Compose (`docker compose up` & `docker-compose up`) | `docker-compose.yml`, `Dockerfile`, `.env.example` | Live Docker Compose build + `scripts/smoke.sh` | **DONE** |
+| **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
+| **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service | **DONE** |
+| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go` | `go test -race ./...` + `go test -race -tags=integration ./...` | **DONE** |
+
 
