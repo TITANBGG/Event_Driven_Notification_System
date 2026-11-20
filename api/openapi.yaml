@@ -1,0 +1,39 @@
+# WHAT: Initial OpenAPI 3.0.3 contract served to Swagger UI (Phase 1 baseline).
+# WHY: Keeping api/openapi.yaml valid and synchronized from Phase 1 lets Swagger UI validate
+#      spec rendering early before notification endpoints are added in Phase 3+.
+# EXPECTED OUTPUT EXAMPLE:
+#   GET http://localhost:8081 -> Swagger UI renders `GET /health/live` with 200 {"status":"ok"}
+
+openapi: 3.0.3
+info:
+  title: Event-Driven Notification System API
+  version: 0.1.0
+  description: Scalable multi-channel notification management and delivery service.
+servers:
+  - url: http://localhost:8080
+    description: Local API server
+paths:
+  /health/live:
+    get:
+      summary: Liveness probe
+      description: Returns 200 OK when the API process is running and able to serve HTTP requests.
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveStatus"
+              example:
+                status: ok
+components:
+  schemas:
+    LiveStatus:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: ok
+
