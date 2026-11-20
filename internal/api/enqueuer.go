@@ -7,7 +7,14 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/TITANBGG/notification-system/internal/domain"
+	"github.com/TITANBGG/notification-system/internal/queue"
 )
+
+// QueueInspector exposes Redis health and live queue depth snapshots for API probes and metrics.
+type QueueInspector interface {
+	Ping(ctx context.Context) error
+	Depths(ctx context.Context) (queue.MetricsDepths, error)
+}
 
 // QueueItem carries the minimal scheduling metadata pushed to Redis after Postgres commit.
 type QueueItem struct {

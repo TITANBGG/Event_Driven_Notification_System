@@ -32,6 +32,9 @@ type Store interface {
 	InsertIdempotencyKey(ctx context.Context, k domain.IdempotencyKey) (*domain.IdempotencyKey, bool, error)
 	GetIdempotencyKey(ctx context.Context, key string) (*domain.IdempotencyKey, error)
 	GetIdempotencyKeysByKeys(ctx context.Context, keys []string) ([]domain.IdempotencyKey, error)
+
+	MetricsWindowCounts(ctx context.Context) ([]repository.MetricsWindowRow, error)
+	LatencyPercentiles(ctx context.Context) (repository.LatencyStats, error)
 }
 
 type repoStoreAdapter struct {

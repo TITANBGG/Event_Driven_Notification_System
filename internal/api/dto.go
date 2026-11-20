@@ -45,6 +45,71 @@ type LiveStatusResponse struct {
 	Status string `json:"status"`
 }
 
+// DependencyCheck describes the health status and round-trip latency of one external dependency.
+type DependencyCheck struct {
+	Status    string `json:"status"`
+	LatencyMS int64  `json:"latencyMs"`
+}
+
+// ReadyChecksResponse holds individual Postgres and Redis readiness check results.
+type ReadyChecksResponse struct {
+	Postgres DependencyCheck `json:"postgres"`
+	Redis    DependencyCheck `json:"redis"`
+}
+
+// ReadyStatusResponse is returned by GET /health and GET /health/ready.
+type ReadyStatusResponse struct {
+	Status string              `json:"status"`
+	Checks ReadyChecksResponse `json:"checks"`
+}
+
+// ChannelQueueDepthsResponse holds per-priority ready list lengths for one notification channel.
+type ChannelQueueDepthsResponse struct {
+	High   int64 `json:"high"`
+	Normal int64 `json:"normal"`
+	Low    int64 `json:"low"`
+}
+
+// QueuesSnapshotResponse holds live Redis queue, delayed, DLQ, and inflight list depths.
+type QueuesSnapshotResponse struct {
+	SMS      ChannelQueueDepthsResponse `json:"sms"`
+	Email    ChannelQueueDepthsResponse `json:"email"`
+	Push     ChannelQueueDepthsResponse `json:"push"`
+	Delayed  int64                      `json:"delayed"`
+	DLQ      int64                      `json:"dlq"`
+	Inflight int64                      `json:"inflight"`
+}
+
+// WindowChannelStatsResponse holds outcome counts and rates for a channel in a trailing time window.
+type WindowChannelStatsResponse struct {
+	Sent        int64   `json:"sent"`
+	Failed      int64   `json:"failed"`
+	Retrying    int64   `json:"retrying"`
+	SuccessRate float64 `json:"successRate"`
+	FailureRate float64 `json:"failureRate"`
+}
+
+// PercentilesResponse holds p50/p95/p99 latency percentiles in milliseconds.
+type PercentilesResponse struct {
+	P50 float64 `json:"p50"`
+	P95 float64 `json:"p95"`
+	P99 float64 `json:"p99"`
+}
+
+// LatencyMetricsResponse groups trailing 15-minute end-to-end and provider-call latency percentiles.
+type LatencyMetricsResponse struct {
+	EndToEnd     PercentilesResponse `json:"endToEnd"`
+	ProviderCall PercentilesResponse `json:"providerCall"`
+}
+
+// MetricsSnapshotResponse is the JSON body returned by GET /api/v1/metrics.
+type MetricsSnapshotResponse struct {
+	GeneratedAt time.Time                                        `json:"generatedAt"`
+	Queues      QueuesSnapshotResponse                           `json:"queues"`
+	Windows     map[string]map[string]WindowChannelStatsResponse `json:"windows"`
+	LatencyMS   LatencyMetricsResponse                           `json:"latencyMs"`
+}
+
 // NotificationResponse is the public HTTP representation of a notification.
 // It intentionally excludes internal persistence fields such as processingStartedAt,
 // traceparent, idempotencyKey, and deferrals.

@@ -374,6 +374,84 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /health:
+    get:
+      tags: [System]
+      summary: Dependency readiness alias
+      description: Alias for /health/ready checking PostgreSQL and Redis connectivity (1s timeout each).
+      responses:
+        "200":
+          description: Dependencies healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyStatus"
+        "503":
+          description: One or more dependencies unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyStatus"
+
+  /health/ready:
+    get:
+      tags: [System]
+      summary: Readiness probe
+      description: Pings PostgreSQL and Redis with a 1s timeout each and returns 503 if any fails.
+      responses:
+        "200":
+          description: Dependencies healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyStatus"
+              example:
+                status: ok
+                checks:
+                  postgres: {status: ok, latencyMs: 2}
+                  redis: {status: ok, latencyMs: 1}
+        "503":
+          description: One or more dependencies unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyStatus"
+
+  /metrics:
+    get:
+      tags: [System]
+      summary: Prometheus metrics exposition
+      description: Exposes Prometheus text exposition format metrics registered on a dedicated custom Registry.
+      responses:
+        "200":
+          description: Prometheus metrics scrape output
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /api/v1/metrics:
+    get:
+      tags: [System]
+      summary: Real-time JSON observability snapshot
+      description: Returns live Redis queue depths, 1m/5m/15m per-channel delivery counts and rates, and 15m p50/p95/p99 latency percentiles (2s cache).
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+      responses:
+        "200":
+          description: Metrics snapshot
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/CorrelationIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricsSnapshot"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
 components:
   parameters:
     CorrelationIDHeader:
@@ -422,6 +500,128 @@ components:
         status:
           type: string
           example: ok
+
+    DependencyCheck:
+      type: object
+      required: [status, latencyMs]
+      properties:
+        status:
+          type: string
+          enum: [ok, down]
+        latencyMs:
+          type: integer
+          format: int64
+
+    ReadyStatus:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        checks:
+          type: object
+          required: [postgres, redis]
+          properties:
+            postgres:
+              $ref: "#/components/schemas/DependencyCheck"
+            redis:
+              $ref: "#/components/schemas/DependencyCheck"
+
+    ChannelQueueDepths:
+      type: object
+      required: [high, normal, low]
+      properties:
+        high:
+          type: integer
+          format: int64
+        normal:
+          type: integer
+          format: int64
+        low:
+          type: integer
+          format: int64
+
+    QueuesSnapshot:
+      type: object
+      required: [sms, email, push, delayed, dlq, inflight]
+      properties:
+        sms:
+          $ref: "#/components/schemas/ChannelQueueDepths"
+        email:
+          $ref: "#/components/schemas/ChannelQueueDepths"
+        push:
+          $ref: "#/components/schemas/ChannelQueueDepths"
+        delayed:
+          type: integer
+          format: int64
+        dlq:
+          type: integer
+          format: int64
+        inflight:
+          type: integer
+          format: int64
+
+    WindowChannelMetrics:
+      type: object
+      required: [sent, failed, retrying, successRate, failureRate]
+      properties:
+        sent:
+          type: integer
+          format: int64
+        failed:
+          type: integer
+          format: int64
+        retrying:
+          type: integer
+          format: int64
+        successRate:
+          type: number
+          format: double
+        failureRate:
+          type: number
+          format: double
+
+    LatencyPercentiles:
+      type: object
+      required: [p50, p95, p99]
+      properties:
+        p50:
+          type: number
+          format: double
+        p95:
+          type: number
+          format: double
+        p99:
+          type: number
+          format: double
+
+    LatencyMetrics:
+      type: object
+      required: [endToEnd, providerCall]
+      properties:
+        endToEnd:
+          $ref: "#/components/schemas/LatencyPercentiles"
+        providerCall:
+          $ref: "#/components/schemas/LatencyPercentiles"
+
+    MetricsSnapshot:
+      type: object
+      required: [generatedAt, queues, windows, latencyMs]
+      properties:
+        generatedAt:
+          type: string
+          format: date-time
+        queues:
+          $ref: "#/components/schemas/QueuesSnapshot"
+        windows:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              $ref: "#/components/schemas/WindowChannelMetrics"
+        latencyMs:
+          $ref: "#/components/schemas/LatencyMetrics"
 
     CreateNotificationRequest:
       type: object

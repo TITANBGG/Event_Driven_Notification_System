@@ -53,18 +53,32 @@ func (s *fakeDBState) clone() *fakeDBState {
 // fakeStore is an in-memory transactional Store implementing Postgres semantics
 // (atomic rollback in WithTx, expired idempotency key reclaim, fenced transitions, keyset pagination).
 type fakeStore struct {
-	txMu      sync.Mutex
-	mu        sync.RWMutex
-	now       func() time.Time
-	seq       time.Time
-	forcedErr error
-	st        *fakeDBState
+	txMu         sync.Mutex
+	mu           sync.RWMutex
+	now          func() time.Time
+	seq          time.Time
+	forcedErr    error
+	pingErr      error
+	metricsCalls int
+	st           *fakeDBState
 }
 
 func (f *fakeStore) SetForcedError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.forcedErr = err
+}
+
+func (f *fakeStore) SetPingError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pingErr = err
+}
+
+func (f *fakeStore) MetricsCalls() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.metricsCalls
 }
 
 func newFakeStore() *fakeStore {
@@ -77,7 +91,9 @@ func newFakeStore() *fakeStore {
 }
 
 func (f *fakeStore) Ping(_ context.Context) error {
-	return nil
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.pingErr
 }
 
 func (f *fakeStore) WithTx(ctx context.Context, fn func(ctx context.Context, tx api.Store) error) error {
@@ -207,6 +223,25 @@ func (f *fakeStore) GetIdempotencyKeysByKeys(_ context.Context, keys []string) (
 	return (&fakeTxStore{root: f, st: f.st}).getIdempotencyKeysByKeysLocked(keys)
 }
 
+func (f *fakeStore) MetricsWindowCounts(_ context.Context) ([]repository.MetricsWindowRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.forcedErr != nil {
+		return nil, f.forcedErr
+	}
+	f.metricsCalls++
+	return (&fakeTxStore{root: f, st: f.st}).metricsWindowCountsLocked()
+}
+
+func (f *fakeStore) LatencyPercentiles(_ context.Context) (repository.LatencyStats, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	if f.forcedErr != nil {
+		return repository.LatencyStats{}, f.forcedErr
+	}
+	return (&fakeTxStore{root: f, st: f.st}).latencyPercentilesLocked()
+}
+
 // SeedNotification inserts or overwrites a notification row directly for test setup.
 func (f *fakeStore) SeedNotification(n domain.Notification) {
 	f.mu.Lock()
@@ -292,6 +327,12 @@ func (t *fakeTxStore) GetIdempotencyKey(_ context.Context, key string) (*domain.
 }
 func (t *fakeTxStore) GetIdempotencyKeysByKeys(_ context.Context, keys []string) ([]domain.IdempotencyKey, error) {
 	return t.getIdempotencyKeysByKeysLocked(keys)
+}
+func (t *fakeTxStore) MetricsWindowCounts(_ context.Context) ([]repository.MetricsWindowRow, error) {
+	return t.metricsWindowCountsLocked()
+}
+func (t *fakeTxStore) LatencyPercentiles(_ context.Context) (repository.LatencyStats, error) {
+	return t.latencyPercentilesLocked()
 }
 
 func (t *fakeTxStore) insertBatchLocked(b domain.Batch) (*domain.Batch, error) {
@@ -527,6 +568,91 @@ func sortNotificationsDesc(items []domain.Notification) {
 		}
 		return bytes.Compare(items[i].ID[:], items[j].ID[:]) > 0
 	})
+}
+
+func (t *fakeTxStore) metricsWindowCountsLocked() ([]repository.MetricsWindowRow, error) {
+	now := t.root.now().UTC()
+	windows := []struct {
+		name   string
+		cutoff time.Time
+	}{
+		{name: "1m", cutoff: now.Add(-time.Minute)},
+		{name: "5m", cutoff: now.Add(-5 * time.Minute)},
+		{name: "15m", cutoff: now.Add(-15 * time.Minute)},
+	}
+	channels := []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}
+	out := make([]repository.MetricsWindowRow, 0, len(windows)*len(channels))
+	for _, w := range windows {
+		for _, ch := range channels {
+			row := repository.MetricsWindowRow{Window: w.name, Channel: ch}
+			for _, n := range t.st.notifications {
+				if n.Channel != ch {
+					continue
+				}
+				switch n.Status {
+				case domain.StatusSent:
+					if n.SentAt != nil && !n.SentAt.Before(w.cutoff) {
+						row.SentCount++
+					}
+				case domain.StatusFailed:
+					if n.FailedAt != nil && !n.FailedAt.Before(w.cutoff) {
+						row.FailedCount++
+					}
+				case domain.StatusRetrying:
+					row.RetryingCount++
+				}
+			}
+			out = append(out, row)
+		}
+	}
+	return out, nil
+}
+
+func (t *fakeTxStore) latencyPercentilesLocked() (repository.LatencyStats, error) {
+	cutoff := t.root.now().UTC().Add(-15 * time.Minute)
+	var e2e []float64
+	for _, n := range t.st.notifications {
+		if n.Status == domain.StatusSent && n.SentAt != nil && !n.SentAt.Before(cutoff) {
+			ms := n.SentAt.Sub(n.CreatedAt).Seconds() * 1000.0
+			if ms < 0 {
+				ms = 0
+			}
+			e2e = append(e2e, ms)
+		}
+	}
+	var prov []float64
+	for _, attempts := range t.st.attempts {
+		for _, a := range attempts {
+			if a.Counted && !a.StartedAt.Before(cutoff) {
+				prov = append(prov, float64(a.DurationMS))
+			}
+		}
+	}
+	return repository.LatencyStats{
+		EndToEndP50MS: percentileFloat(e2e, 0.50),
+		EndToEndP95MS: percentileFloat(e2e, 0.95),
+		EndToEndP99MS: percentileFloat(e2e, 0.99),
+		ProviderP50MS: percentileFloat(prov, 0.50),
+		ProviderP95MS: percentileFloat(prov, 0.95),
+		ProviderP99MS: percentileFloat(prov, 0.99),
+	}, nil
+}
+
+func percentileFloat(samples []float64, p float64) float64 {
+	if len(samples) == 0 {
+		return 0
+	}
+	sorted := make([]float64, len(samples))
+	copy(sorted, samples)
+	sort.Float64s(sorted)
+	pos := p * float64(len(sorted)-1)
+	lo := int(pos)
+	hi := lo + 1
+	if hi >= len(sorted) {
+		return sorted[lo]
+	}
+	frac := pos - float64(lo)
+	return sorted[lo] + frac*(sorted[hi]-sorted[lo])
 }
 
 func beforeCursor(n domain.Notification, c repository.Cursor) bool {

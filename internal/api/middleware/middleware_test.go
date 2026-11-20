@@ -280,3 +280,50 @@ func TestTimeoutSetsContextDeadline(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	assert.Equal(t, http.StatusOK, rec.Code)
 }
+
+type recordedHTTPCall struct {
+	route  string
+	method string
+	status int
+}
+
+type fakeHTTPObserver struct {
+	calls []recordedHTTPCall
+}
+
+func (f *fakeHTTPObserver) ObserveHTTPRequest(route, method string, status int, _ time.Duration) {
+	f.calls = append(f.calls, recordedHTTPCall{route: route, method: method, status: status})
+}
+
+func TestRequestLoggerCorrelationIDAndMetricsRoutePattern(t *testing.T) {
+	t.Parallel()
+
+	var logBuf bytes.Buffer
+	logger := observability.NewLogger("info", &logBuf)
+	obs := &fakeHTTPObserver{}
+
+	r := chi.NewRouter()
+	r.Use(middleware.CorrelationID(logger))
+	r.Use(middleware.RequestLogger(logger))
+	r.Use(middleware.Metrics(obs))
+	r.Get("/api/v1/notifications/{id}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/notifications/01936f7e-0001-7000-8000-000000000001", nil)
+	req.Header.Set("X-Correlation-ID", "cid-trace-42")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, obs.calls, 1)
+	assert.Equal(t, "/api/v1/notifications/{id}", obs.calls[0].route)
+	assert.Equal(t, http.MethodGet, obs.calls[0].method)
+	assert.Equal(t, http.StatusOK, obs.calls[0].status)
+
+	var entry map[string]any
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(logBuf.Bytes()), &entry))
+	assert.Equal(t, "cid-trace-42", entry["correlation_id"])
+	assert.Equal(t, "/api/v1/notifications/{id}", entry["route"])
+	assert.Equal(t, float64(http.StatusOK), entry["status"])
+}

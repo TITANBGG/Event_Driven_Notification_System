@@ -139,7 +139,7 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "/app/healthcheck", "http://localhost:8080/health/live"]
+      test: ["CMD", "/app/healthcheck", "http://localhost:8080/health/ready"]
       interval: 5s
       timeout: 3s
       retries: 10

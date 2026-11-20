@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,10 +16,13 @@ import (
 
 	"github.com/TITANBGG/notification-system/internal/api"
 	"github.com/TITANBGG/notification-system/internal/config"
+	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/queue"
 	"github.com/TITANBGG/notification-system/internal/repository"
 )
+
+const queueDepthSampleInterval = 5 * time.Second
 
 type redisEnqueuer struct {
 	q *queue.Queue
@@ -104,13 +108,25 @@ func run() error {
 	cancelRedisPing()
 
 	store := api.NewRepositoryStore(repository.New(pool))
+	metrics := observability.NewAPIMetrics()
 
 	router := api.NewRouter(api.Deps{
-		Config:   cfg,
-		Logger:   logger,
-		Store:    store,
-		Enqueuer: redisEnqueuer{q: q},
+		Config:         cfg,
+		Logger:         logger,
+		Store:          store,
+		Enqueuer:       redisEnqueuer{q: q},
+		QueueInspector: q,
+		Metrics:        metrics,
 	})
+
+	samplerCtx, stopSampler := context.WithCancel(context.Background())
+	defer stopSampler()
+	var samplerWg sync.WaitGroup
+	samplerWg.Add(1)
+	go func() {
+		defer samplerWg.Done()
+		runQueueDepthSampler(samplerCtx, logger, q, metrics)
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
@@ -133,6 +149,8 @@ func run() error {
 
 	select {
 	case serveErr := <-errCh:
+		stopSampler()
+		samplerWg.Wait()
 		if serveErr != nil {
 			logger.Error("api server exited with error", slog.String("error", serveErr.Error()))
 		}
@@ -141,17 +159,58 @@ func run() error {
 		logger.Info("shutdown signal received", slog.Duration("timeout", cfg.ShutdownTimeout))
 	}
 
+	stopSampler()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
 
 	if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
+		samplerWg.Wait()
 		logger.Error("graceful shutdown failed", slog.String("error", shutdownErr.Error()))
 		return shutdownErr
 	}
 	if serveErr := <-errCh; serveErr != nil {
+		samplerWg.Wait()
 		return serveErr
 	}
+	samplerWg.Wait()
 
 	logger.Info("api server stopped cleanly")
 	return nil
+}
+
+func runQueueDepthSampler(ctx context.Context, logger *slog.Logger, q *queue.Queue, metrics *observability.Metrics) {
+	sample := func() {
+		sCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		depths, err := q.Depths(sCtx)
+		cancel()
+		if err != nil {
+			if ctx.Err() == nil {
+				logger.Warn("failed sampling redis queue depths", slog.String("error", err.Error()))
+			}
+			return
+		}
+		channels := []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}
+		priorities := []domain.Priority{domain.PriorityHigh, domain.PriorityNormal, domain.PriorityLow}
+		for _, ch := range channels {
+			for _, pr := range priorities {
+				metrics.SetQueueDepth(ch.String(), pr.String(), depths.ByChannel[ch][pr])
+			}
+		}
+		metrics.SetDelayedDepth(depths.Delayed)
+		metrics.SetDLQDepth(depths.DLQ)
+		metrics.SetInflightDepth(depths.Inflight)
+	}
+
+	sample()
+	ticker := time.NewTicker(queueDepthSampleInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sample()
+		}
+	}
 }

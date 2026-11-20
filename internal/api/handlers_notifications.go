@@ -106,6 +106,8 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	h.metrics.IncNotificationCreated(created.Channel.String(), created.Priority.String())
+
 	// Commit to PostgreSQL completed before pushing queue hint to Redis so reconciler repairs enqueue failures.
 	if enqErr := h.enqueuer.Enqueue(r.Context(), []QueueItem{{
 		ID:            created.ID,
@@ -324,6 +326,10 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Idempotent-Replayed", "true")
 		writeJSON(w, h.logger, replayStatus, resp)
 		return
+	}
+
+	for _, n := range notifications {
+		h.metrics.IncNotificationCreated(n.Channel.String(), n.Priority.String())
 	}
 
 	queueItems := make([]QueueItem, len(notifications))
@@ -654,6 +660,7 @@ func (h *handler) handleCancelNotification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	h.metrics.IncNotificationProcessed(updated.Channel.String(), domain.StatusCancelled.String())
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
 }
 
