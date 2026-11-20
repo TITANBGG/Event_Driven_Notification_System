@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -11,8 +12,15 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/observability"
+	"github.com/TITANBGG/notification-system/internal/provider"
+	"github.com/TITANBGG/notification-system/internal/queue"
+	"github.com/TITANBGG/notification-system/internal/ratelimit"
+	"github.com/TITANBGG/notification-system/internal/repository"
+	"github.com/TITANBGG/notification-system/internal/worker"
 )
 
 func main() {
@@ -34,14 +42,77 @@ func run() error {
 	)
 	logger.Info("config loaded", slog.Any("config", cfg))
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to parse database URL",
+			slog.String("database_url", observability.MaskDatabaseURL(cfg.DatabaseURL)),
+		)
+		return errors.New("invalid DATABASE_URL configuration")
+	}
+	poolCfg.MaxConns = 35
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 30 * time.Second
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		logger.Error("failed to create postgres pool", slog.String("error", err.Error()))
+		return err
+	}
+	defer pool.Close()
+
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
+	pingErr := pool.Ping(pingCtx)
+	cancelPing()
+	if pingErr != nil {
+		logger.Error("failed to ping postgres at startup", slog.String("error", pingErr.Error()))
+		return pingErr
+	}
+
+	rdb := queue.NewClient(cfg.RedisAddr, cfg.RedisPoolSize)
+	defer func() {
+		if closeErr := rdb.Close(); closeErr != nil {
+			logger.Warn("failed closing redis client", slog.String("error", closeErr.Error()))
+		}
+	}()
+
+	store := repository.New(pool)
+	q := queue.New(rdb)
+	limiter := ratelimit.New(rdb, cfg.RateLimitPerSec, cfg.RateLimitBurst)
+	client := provider.NewClient(provider.ClientConfig{
+		URL:            cfg.ProviderURL,
+		Timeout:        cfg.ProviderTimeout,
+		ExtendedFields: cfg.ProviderExtended,
+		MaxIdleConns:   max(3*cfg.WorkerConcurrency, 100),
+		Logger:         logger,
+	})
+
+	w, err := worker.New(worker.Deps{
+		Config:      cfg,
+		Logger:      logger,
+		Store:       store,
+		Queue:       q,
+		RateLimiter: limiter,
+		Sender:      client,
+	})
+	if err != nil {
+		logger.Error("failed to initialize worker engine", slog.String("error", err.Error()))
+		return err
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if _, writeErr := w.Write([]byte(`{"status":"ok"}` + "\n")); writeErr != nil {
-			logger.Warn("failed to write worker health response", slog.String("error", writeErr.Error()))
-		}
+		writeProbeJSON(w, logger, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	readyHandler := func(w http.ResponseWriter, r *http.Request) {
+		checkReady(r.Context(), w, logger, store, q)
+	}
+	mux.HandleFunc("GET /health/ready", readyHandler)
+	mux.HandleFunc("GET /health", readyHandler)
 
 	srv := &http.Server{
 		Addr:              cfg.WorkerMetricsAddr,
@@ -52,40 +123,107 @@ func run() error {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	errCh := make(chan error, 1)
+	httpErrCh := make(chan error, 1)
 	go func() {
 		logger.Info("worker metrics/health server listening", slog.String("addr", cfg.WorkerMetricsAddr))
 		if serveErr := srv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
-			errCh <- serveErr
+			httpErrCh <- serveErr
 			return
 		}
-		errCh <- nil
+		httpErrCh <- nil
+	}()
+
+	workerErrCh := make(chan error, 1)
+	go func() {
+		workerErrCh <- w.Run(ctx)
 	}()
 
 	select {
-	case serveErr := <-errCh:
-		if serveErr != nil {
-			logger.Error("worker server exited with error", slog.String("error", serveErr.Error()))
+	case serveErr := <-httpErrCh:
+		stop()
+		if wErr := <-workerErrCh; wErr != nil {
+			logger.Error("worker exited with error during http failure drain", slog.String("error", wErr.Error()))
 		}
 		return serveErr
+	case wErr := <-workerErrCh:
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+		defer cancel()
+		_ = srv.Shutdown(shutdownCtx)
+		if serveErr := <-httpErrCh; serveErr != nil {
+			logger.Error("worker http server error during worker drain", slog.String("error", serveErr.Error()))
+		}
+		return wErr
 	case <-ctx.Done():
 		logger.Info("worker shutdown signal received", slog.Duration("timeout", cfg.ShutdownTimeout))
 	}
 
+	wErr := <-workerErrCh
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 	defer cancel()
-
 	if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
-		logger.Error("worker graceful shutdown failed", slog.String("error", shutdownErr.Error()))
+		logger.Error("worker http server shutdown failed", slog.String("error", shutdownErr.Error()))
 		return shutdownErr
 	}
-	if serveErr := <-errCh; serveErr != nil {
+	if serveErr := <-httpErrCh; serveErr != nil {
 		return serveErr
+	}
+	if wErr != nil {
+		return wErr
 	}
 
 	logger.Info("worker stopped cleanly")
 	return nil
+}
+
+func checkReady(ctx context.Context, w http.ResponseWriter, logger *slog.Logger, store *repository.Store, q *queue.Queue) {
+	type depStatus struct {
+		Status    string `json:"status"`
+		LatencyMS int64  `json:"latencyMs"`
+	}
+
+	overall := "ok"
+	code := http.StatusOK
+
+	pgStart := time.Now()
+	pgCtx, cancelPG := context.WithTimeout(ctx, time.Second)
+	pgErr := store.Ping(pgCtx)
+	cancelPG()
+	pgStatus := depStatus{Status: "ok", LatencyMS: time.Since(pgStart).Milliseconds()}
+	if pgErr != nil {
+		pgStatus.Status = "down"
+		overall = "degraded"
+		code = http.StatusServiceUnavailable
+	}
+
+	rdStart := time.Now()
+	rdCtx, cancelRD := context.WithTimeout(ctx, time.Second)
+	rdErr := q.Ping(rdCtx)
+	cancelRD()
+	rdStatus := depStatus{Status: "ok", LatencyMS: time.Since(rdStart).Milliseconds()}
+	if rdErr != nil {
+		rdStatus.Status = "down"
+		overall = "degraded"
+		code = http.StatusServiceUnavailable
+	}
+
+	writeProbeJSON(w, logger, code, map[string]any{
+		"status": overall,
+		"checks": map[string]depStatus{
+			"postgres": pgStatus,
+			"redis":    rdStatus,
+		},
+	})
+}
+
+func writeProbeJSON(w http.ResponseWriter, logger *slog.Logger, status int, payload any) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if _, err := w.Write(raw); err != nil {
+		logger.Warn("failed writing probe response", slog.String("error", err.Error()))
+	}
 }

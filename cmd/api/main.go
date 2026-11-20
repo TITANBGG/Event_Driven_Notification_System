@@ -16,8 +16,27 @@ import (
 	"github.com/TITANBGG/notification-system/internal/api"
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/observability"
+	"github.com/TITANBGG/notification-system/internal/queue"
 	"github.com/TITANBGG/notification-system/internal/repository"
 )
+
+type redisEnqueuer struct {
+	q *queue.Queue
+}
+
+func (e redisEnqueuer) Enqueue(ctx context.Context, items []api.QueueItem) error {
+	metas := make([]queue.Meta, len(items))
+	for i, item := range items {
+		metas[i] = queue.Meta{
+			ID:            item.ID,
+			Channel:       item.Channel,
+			Priority:      item.Priority,
+			CorrelationID: item.CorrelationID,
+			TraceParent:   item.TraceParent,
+		}
+	}
+	return e.q.Enqueue(ctx, metas...)
+}
 
 func main() {
 	if err := run(); err != nil {
@@ -47,7 +66,7 @@ func run() error {
 		)
 		return errors.New("invalid DATABASE_URL configuration")
 	}
-	poolCfg.MaxConns = 25
+	poolCfg.MaxConns = 20
 	poolCfg.MinConns = 2
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
@@ -68,14 +87,29 @@ func run() error {
 		return pingErr
 	}
 
+	rdb := queue.NewClient(cfg.RedisAddr, cfg.RedisPoolSize)
+	defer func() {
+		if closeErr := rdb.Close(); closeErr != nil {
+			logger.Warn("failed closing redis client", slog.String("error", closeErr.Error()))
+		}
+	}()
+	q := queue.New(rdb)
+
+	redisPingCtx, cancelRedisPing := context.WithTimeout(ctx, 2*time.Second)
+	if rErr := q.Ping(redisPingCtx); rErr != nil {
+		logger.Warn("redis not reachable at api startup; DB-first requests remain durable for reconciler",
+			slog.String("error", rErr.Error()),
+		)
+	}
+	cancelRedisPing()
+
 	store := api.NewRepositoryStore(repository.New(pool))
-	enqueuer := api.NewMemoryEnqueuer()
 
 	router := api.NewRouter(api.Deps{
 		Config:   cfg,
 		Logger:   logger,
 		Store:    store,
-		Enqueuer: enqueuer,
+		Enqueuer: redisEnqueuer{q: q},
 	})
 
 	srv := &http.Server{
