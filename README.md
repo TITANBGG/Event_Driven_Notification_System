@@ -4,203 +4,275 @@
 [![Release](https://github.com/TITANBGG/Event_Driven_Notification_System/actions/workflows/release.yml/badge.svg)](https://github.com/TITANBGG/Event_Driven_Notification_System/actions/workflows/release.yml)
 ![Go](https://img.shields.io/badge/Go-1.27.4-00ADD8?logo=go)
 
-A production-grade, horizontally scalable multi-channel notification management and delivery service (**SMS**, **Email**, **Push**) written in **Go 1.27.4**, backed by **PostgreSQL 16** (authoritative system of record) and **Redis 7** (weighted priority queues, delayed retry/schedule set, distributed GCRA rate limiter, and reconciler lease).
+A notification service that accepts SMS, email and push requests over HTTP, stores them in PostgreSQL and delivers them asynchronously through an external provider. It caps sends at 100 messages per second per channel, delivers high-priority messages first without starving low-priority ones, retries failures, and reports delivery status through a REST API, a WebSocket stream, Prometheus metrics, structured logs and OpenTelemetry traces.
+
+It was written in Go 1.27.4 for the Insider One Software Engineer Assessment 2026. Every functional requirement (`FR-1`…`FR-4`), the provider contract (`EXT-1`), all deliverables (`D-1`…`D-6`) and all six bonus features (`B-1`…`B-6`) are implemented and tested. Section 13, the [requirement checklist](#13-requirement-checklist), maps each one to its code and tests.
+
+## Contents
+
+1. [Quick start](#1-quick-start)
+2. [Architecture](#2-architecture)
+3. [Notification lifecycle and state machine](#3-notification-lifecycle-and-state-machine)
+4. [Design decisions](#4-design-decisions)
+5. [Failure scenarios](#5-failure-scenarios)
+6. [Alternatives and scaling to 100M/day](#6-alternatives-and-scaling-to-100mday)
+7. [API examples](#7-api-examples)
+8. [Observability](#8-observability)
+9. [Configuration](#9-configuration)
+10. [Testing](#10-testing)
+11. [Mock provider vs. webhook.site](#11-mock-provider-vs-webhooksite)
+12. [Known limitations and next steps](#12-known-limitations-and-next-steps)
+13. [Requirement checklist](#13-requirement-checklist)
+14. [How this was built](#14-how-this-was-built)
 
 ---
 
-## Table of Contents
+## 1. Quick start
 
-1. [Features & Core Capabilities](#1-features--core-capabilities)
-2. [Quick Start (One Command)](#2-quick-start-one-command)
-3. [Service URLs & Ports](#3-service-urls--ports)
-4. [Architecture Overview](#4-architecture-overview)
-5. [Notification State Machine & Fencing](#5-notification-state-machine--fencing)
-6. [Design Decisions & Architecture Trade-Offs](#6-design-decisions--architecture-trade-offs)
-7. [Failure Scenarios & Recovery Matrix](#7-failure-scenarios--recovery-matrix)
-8. [HTTP API Reference & `curl` Examples](#8-http-api-reference--curl-examples)
-9. [Configuration Reference](#9-configuration-reference)
-10. [Testing & Load Generation](#10-testing--load-generation)
-11. [Live `webhook.site` (`EXT-1`) Setup](#11-live-webhooksite-ext-1-setup)
-12. [Known Limitations](#12-known-limitations)
-13. [Requirement Traceability Matrix (`FR-1.1` … `D-6`)](#13-requirement-traceability-matrix-fr-11--d-6)
-
----
-
-## 1. Features & Core Capabilities
-
-- **Multi-Channel Validation & Delivery (`FR-1.1`, `FR-2.4`, `EXT-1`):**
-  - **SMS:** E.164 recipient validation (`^\+[1-9]\d{7,14}$`), automatic **GSM-7** (including 2-septet extension table characters `^ { } \ [ ~ ] | €`) vs **UCS-2** (UTF-16 code unit counting for non-GSM runes and emojis) detection, and segment limit enforcement (single-part `160` GSM-7 / `70` UCS-2; multi-part `153` GSM-7 / `67` UCS-2; max `10` segments).
-  - **Email:** Strict `net/mail.ParseAddress` validation (no display-name wrapping, max `254` chars), optional subject (`<= 200` chars, CR/LF header-injection guard), content up to `100 KB`.
-  - **Push:** Device token (`1..4096` chars, no whitespace), optional title (`<= 100` chars), content up to `2000` chars, serialized provider JSON payload capped at `4096` bytes.
-- **High-Throughput Batch Submission (`FR-1.2`):** Atomic all-or-nothing validation (returning every field error with dot/bracket paths such as `notifications[3].recipient`) and single-transaction persistence up to `1000` notifications per request via `pgx.CopyFrom`.
-- **End-to-End Idempotency (`FR-2.5`):**
-  - **API Layer:** Canonical SHA-256 request hashing stored in `idempotency_keys` (`24h` TTL) inside the same PostgreSQL transaction as notification/batch creation. Matching replays return the original resource with `Idempotent-Replayed: true`; payload mismatches return `409 idempotency_conflict`.
-  - **Provider Layer:** Every delivery attempt sends `Idempotency-Key: <notification.id>` and `X-Correlation-ID`.
-- **Weighted Priority Queues with Anti-Starvation (`FR-2.3`):** Per-channel Redis queues (`high`, `normal`, `low`) popped via an atomic Lua `LMOVE` script following a deterministic **6:3:1** 10-slot schedule (`[h,h,h,h,h,h,n,n,n,l]`) with fall-through, guaranteeing `low` priority receives `>= 10%` of capacity under sustained `high`/`normal` load and `100%` when higher queues are empty.
-- **Distributed Per-Channel Rate Limiting (`FR-2.2`):** Shared Redis GCRA limiter (`go-redis/redis_rate/v10`, `Rate=100/s`, `Burst=1` = strict `10ms` spacing) enforced across all worker replicas **before** claiming a row in PostgreSQL, failing closed if Redis is unreachable.
-- **Resilient Retry, Per-Channel Circuit Breaker & 5-Step Reconciler (`FR-3`, `B-1`):**
-  - Full-jitter exponential backoff honoring provider `Retry-After` headers (`429`/`503`).
-  - Per-channel `sony/gobreaker/v2` circuit breaker (trips on `10` consecutive transient failures or `> 50%` failure ratio over `>= 20` requests; permanent `4xx` responses count as breaker successes; open-circuit deferrals decrement `attempts` and record `counted=false, outcome='circuit_open'` so outages never burn retry budgets).
-  - Lock-guarded 5-step distributed reconciler + live worker inflight sweeper automatically repairing Redis data loss, API crashes after DB commit, and worker crashes (`SIGKILL`).
-- **Full Observability (`FR-4`):** Custom-registry Prometheus `/metrics` on API (`:8080`) and workers (`:9091`), real-time cached JSON snapshot (`GET /api/v1/metrics`), readiness probes (`GET /health/ready`, `/health`), liveness probes (`GET /health/live`), structured JSON logs (`log/slog`) with `correlation_id` and PII masking, and embedded OpenAPI 3.0.3 + Swagger UI.
-
----
-
-## 2. Quick Start (One Command)
-
-No `.env` file or manual migration step is required. Both `docker compose` (v2) and `docker-compose` (v1) work out of the box:
+Requirements: Docker with Compose. Nothing else is needed: there is no `.env` file to create, no image to pull by hand and no migration to run.
 
 ```bash
-docker compose up --build -d
-# or:
-docker-compose up --build -d
+git clone https://github.com/TITANBGG/Event_Driven_Notification_System.git
+cd Event_Driven_Notification_System
+docker compose up --build        # Compose v2
+# or
+docker-compose up --build        # legacy Compose v1
 ```
 
-Run the end-to-end smoke test suite once containers are healthy:
+The first build takes a few minutes. The `migrate` service applies `migrations/*.up.sql` and exits; `api`, `worker-1` and `worker-2` start only after it has succeeded. When every container is healthy, run the smoke test (one request per endpoint, each with an expected status code):
 
 ```bash
 ./scripts/smoke.sh
 ```
 
-Generate a 2,000-notification load test and watch completion:
+| What | URL |
+|---|---|
+| REST API | http://localhost:8080 (`/api/v1/...`, `/health`, `/metrics`, `/openapi.yaml`) |
+| Swagger UI | http://localhost:8081 ("Try it out" works; CORS allows this origin) |
+| Live demo page (WebSocket) | http://localhost:8080/demo |
+| Jaeger (traces) | http://localhost:16686 |
+| Prometheus | http://localhost:9090 (scrapes the API and both workers every 5s) |
+| Mock provider | http://localhost:8090 (`GET /stats`, `POST /reset`) |
 
-```bash
-make load
-# or directly with Go:
-go run ./cmd/loadgen -n 2000 -batch 100 -concurrency 4
-```
-
----
-
-## 3. Service URLs & Ports
-
-| Service | URL | Purpose |
-|---|---|---|
-| **HTTP API** | http://localhost:8080 | REST API, `/health/ready`, `/metrics`, `/api/v1/metrics`, `/openapi.yaml` |
-| **Swagger UI** | http://localhost:8081 | Interactive OpenAPI 3.0.3 documentation (**"Try it out"** enabled via CORS) |
-| **Mock Provider** | http://localhost:8090 | Configurable `EXT-1` provider (`/stats`, `/reset`, `/health/live`) |
-| **Prometheus** | http://localhost:9090 | Scrapes `api:8080`, `worker-1:9091`, and `worker-2:9091` every `5s` |
-| **Jaeger UI** | http://localhost:16686 | Distributed tracing UI (`:4318` OTLP HTTP collector) |
-| **PostgreSQL 16** | `localhost:5432` | `postgres://notif:notif@localhost:5432/notif?sslmode=disable` |
-| **Redis 7** | `localhost:6379` | AOF persistence (`--appendonly yes --appendfsync everysec`) |
+PostgreSQL, Redis and the workers' `:9091` health/metrics port are reachable only inside the Compose network; they are not published on the host. Use `docker compose exec postgres psql -U notif notif` or `docker compose exec redis redis-cli` to inspect them.
 
 ---
 
-## 4. Architecture Overview
+## 2. Architecture
 
 ```mermaid
 flowchart LR
-    Client["API Client / Swagger UI / loadgen"] -->|"HTTP REST + Idempotency-Key"| API["cmd/api (:8080)"]
-    API -->|"1. Atomic Tx / CopyFrom (Source of Truth)"| PG[("PostgreSQL 16\nnotifications, batches,\ndelivery_attempts,\nidempotency_keys")]
-    API -->|"2. Best-Effort Pipelined enqueue.lua"| Redis[("Redis 7 ({notif})\nPriority Lists, Delayed ZSET,\nInflight Lists, DLQ, GCRA")]
-
-    subgraph Workers["Horizontally Scaled Stateless Workers (worker-1, worker-2)"]
-        Dequeue["6:3:1 Weighted Dequeue\n(dequeue.lua LMOVE)"]
-        Limiter["Distributed GCRA Limiter\n(100 msg/s/ch, Burst=1)"]
-        Claim["Atomic DB Claim & Fencing\n(attempts = attempts + 1)"]
-        Breaker["Per-Channel Circuit Breaker\n(sony/gobreaker/v2)"]
-        Mover["Delayed Mover (500ms)\n(move_due.lua ZSET -> LIST)"]
-        Reconciler["5-Step Reconciler (15s)\n+ Inflight Sweeper"]
-    end
-
-    Redis --> Dequeue --> Limiter --> Claim
-    Claim <-->|"Fenced UPDATE (WHERE attempts=$claimed)"| PG
-    Claim --> Breaker -->|"POST + Idempotency-Key + X-Correlation-ID"| Provider["External Provider\n(mockprovider:8090 / webhook.site)"]
-    Mover <--> Redis
-    Reconciler <-->|"Repair untracked / abandoned"| PG
-    Reconciler <-->|"unlock.lua / force_enqueue.lua"| Redis
-    Prom["Prometheus (:9090)"] -->|"Scrape /metrics (5s)"| API
-    Prom -->|"Scrape :9091/metrics (5s)"| Workers
+    Client["Client / Swagger UI / loadgen"] -->|"REST + Idempotency-Key"| API["api :8080"]
+    Browser["Browser /demo"] <-->|"WebSocket /api/v1/ws"| API
+    API -->|"1. commit (source of truth)"| PG[("PostgreSQL 16")]
+    API -->|"2. enqueue (hint)"| R[("Redis 7")]
+    R -->|"LMOVE into inflight list"| W["worker-1 / worker-2"]
+    W -->|"GCRA token per channel"| R
+    W -->|"claim + fenced updates"| PG
+    W -->|"POST {to, channel, content}<br/>Idempotency-Key, X-Correlation-ID, traceparent"| P["Provider<br/>(mockprovider or webhook.site)"]
+    W -->|"publish status event"| R
+    R -->|"pub/sub notif:events"| API
+    W -. "reconciler: repair Redis from PostgreSQL" .-> R
+    API & W -->|"OTLP"| J["Jaeger"]
+    Prom["Prometheus"] -->|"scrape /metrics"| API & W
 ```
 
-### Write Ordering & Source of Truth
+| Binary | Responsibility |
+|---|---|
+| `cmd/api` | REST API, WebSocket hub, `/metrics`, queue-depth sampler (every 5s), `/openapi.yaml`, `/demo` |
+| `cmd/worker` | Per-channel consumers, delayed-set mover, reconciler, inflight sweeper, heartbeat, `/metrics` and health on `:9091` |
+| `cmd/mockprovider` | Provider that follows the `EXT-1` contract, with configurable latency, failure, 429 and permanent-error rates, plus `/stats` |
+| `cmd/healthcheck` | Static HTTP probe used by Compose healthchecks (the distroless image has no curl) |
+| `cmd/loadgen` | Load generator (section 10) |
 
-1. **PostgreSQL First, Always:** Every create, batch create, cancel, manual retry, claim, retry schedule, circuit deferral, and terminal status update commits to PostgreSQL **before** touching Redis.
-2. **Redis as an Ephemeral Hint:** Redis holds only compact tracking metadata (`{notif}:msg` hash: `id`, `channel`, `priority`, `correlationId`, `traceparent`) and 36-byte UUIDs in queue lists. If Redis restarts, loses its last 1 second of AOF, or an API replica crashes after DB commit before `enqueue.lua`, the **Distributed Reconciler** repairs Redis state from PostgreSQL within `PENDING_STALE_AFTER + RECONCILE_INTERVAL` (`<= 45s`).
+All binaries are built by one multi-stage `Dockerfile` into a `distroless/static:nonroot` image.
+
+**Path of one notification:**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant A as API
+    participant DB as PostgreSQL
+    participant R as Redis
+    participant W as Worker
+    participant P as Provider
+    C->>A: POST /api/v1/notifications (Idempotency-Key)
+    A->>DB: BEGIN; INSERT idempotency_keys + notifications (status=pending); COMMIT
+    A->>R: enqueue.lua (HSET {notif}:msg, LPUSH {notif}:q:sms:high)
+    A-->>C: 202 Accepted {id, status: pending}
+    W->>R: dequeue.lua (LMOVE queue -> {notif}:inflight:worker-1)
+    W->>R: GCRA rate limiter (wait for a token on {notif}:rl:sms)
+    W->>DB: Claim: UPDATE ... SET status=processing, attempts=attempts+1 WHERE status IN (...)
+    W->>P: POST {to, channel, content} + Idempotency-Key: <id>
+    P-->>W: 202 {messageId, status: accepted}
+    W->>DB: INSERT delivery_attempts; UPDATE status=sent WHERE status=processing AND attempts=$claimed
+    W->>R: ack.lua (LREM inflight, HDEL msg) + PUBLISH notif:events
+    R-->>A: notif:events
+    A-->>C: WebSocket frame {type: event, status: sent}
+```
 
 ---
 
-## 5. Notification State Machine & Fencing
+## 3. Notification lifecycle and state machine
+
+The allowed transitions are defined in one place, `internal/domain/statemachine.go`. Each SQL `UPDATE` repeats the same set as its `WHERE status = ANY(...)` guard.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending : POST /notifications (immediate)
-    [*] --> scheduled : POST /notifications (scheduledAt)
-    scheduled --> processing : Worker Claim (scheduled_at <= now + skew)
-    scheduled --> cancelled : POST /cancel
-    pending --> processing : Worker Claim
-    pending --> cancelled : POST /cancel
-    retrying --> processing : Worker Claim (next_attempt_at <= now + skew)
-    retrying --> cancelled : POST /cancel
-    processing --> sent : Fenced MarkSent (2xx)
-    processing --> retrying : Fenced ScheduleRetry / DeferCircuitOpen
-    processing --> failed : Fenced MarkFailed (Permanent 4xx or max_attempts)
-    processing --> pending : Reconciler RequeueAbandoned (> VISIBILITY_TIMEOUT)
-    failed --> pending : POST /retry (resets attempts=0, deferrals=0)
+    [*] --> pending : POST (no scheduledAt)
+    [*] --> scheduled : POST (scheduledAt in the future)
+    scheduled --> processing : worker claim (scheduled_at <= now + skew)
+    scheduled --> cancelled : API cancel
+    pending --> processing : worker claim
+    pending --> cancelled : API cancel
+    retrying --> processing : worker claim (next_attempt_at <= now + skew)
+    retrying --> cancelled : API cancel
+    processing --> sent : provider accepted
+    processing --> retrying : transient failure / circuit open
+    processing --> failed : permanent failure or attempts exhausted
+    processing --> pending : reconciler, after VISIBILITY_TIMEOUT
+    failed --> pending : manual retry (attempts = 0)
     sent --> [*]
     cancelled --> [*]
 ```
 
-### Atomic Claim & Fencing Token Contract
+`scheduled`, `pending` and `retrying` can be cancelled. Cancelling a notification in any other status returns `409` and names the current status.
 
-- **Claim (`attempts` increments here and only here):**
-  ```sql
-  UPDATE notifications
-  SET status = 'processing', attempts = attempts + 1, processing_started_at = now(), updated_at = now()
-  WHERE id = $1 AND (
-        status = 'pending'
-     OR (status = 'retrying'  AND next_attempt_at <= now() + $skew)
-     OR (status = 'scheduled' AND scheduled_at    <= now() + $skew))
-  RETURNING *;
-  ```
-  If a notification was concurrently cancelled or already claimed by another worker, `Claim` updates `0` rows; the worker immediately runs `ack.lua` and moves on.
-- **Fenced Post-Send Transitions:**
-  Every subsequent worker update (`MarkSent`, `ScheduleRetry`, `DeferCircuitOpen`, `MarkFailed`) and reconciler recovery (`RequeueAbandoned`, `FailAbandoned`) fences on:
-  ```sql
-  WHERE id = $1 AND status = 'processing' AND attempts = $claimedAttempts
-  ```
-  If a slow worker returns after `VISIBILITY_TIMEOUT` (`60s`) when the reconciler has already reclaimed the row, its fenced update affects `0` rows (`ErrLeaseLost`), increments `lease_lost_total`, logs a warning, and never clobbers the newer state.
+**Claim** is the only way a worker takes ownership, and the only place `attempts` is incremented:
+
+```sql
+UPDATE notifications
+SET status='processing', attempts=attempts+1, processing_started_at=now(), updated_at=now()
+WHERE id=$1 AND (
+      status='pending'
+   OR (status='retrying'  AND next_attempt_at <= now() + $skew)
+   OR (status='scheduled' AND scheduled_at    <= now() + $skew))
+RETURNING *;
+```
+
+**Fencing.** Every later write a worker makes (sent, retrying, failed, circuit deferral) adds `AND status='processing' AND attempts=$claimedAttempts`. Suppose a slow worker comes back after the reconciler has already reclaimed its row. Its update matches 0 rows, the worker logs `lease lost`, increments `lease_lost_total` and drops the item. The newer state is never overwritten.
 
 ---
 
-## 6. Design Decisions & Architecture Trade-Offs
+## 4. Design decisions
 
-### A. Delivery Guarantee: At-Least-Once (Effectively-Once)
-Distributed systems that communicate over HTTP with external providers cannot guarantee strict mathematical **exactly-once** delivery (for example, if the provider accepts a request with `202` but the TCP connection drops before the worker receives the response bytes, or a worker suffers `SIGKILL` after the HTTP call completes but before `MarkSent` commits).
-We achieve **at-least-once** delivery that behaves as **effectively-once** via three layers:
-1. Transactionally persisted API `idempotency_keys` (`24h` TTL) with canonical request SHA-256 hashing.
-2. Atomic PostgreSQL `Claim` and fenced `attempts = $claimedAttempts` transitions.
-3. Sending a deterministic `Idempotency-Key: <notification.id>` header on every provider HTTP attempt so providers supporting idempotency deduplicate retries. *(Note: `webhook.site` does not deduplicate by `Idempotency-Key`, so timeouts against `webhook.site` can produce duplicate deliveries.)*
+### PostgreSQL is the source of truth; write it first
 
-### B. Reconciler vs. Transactional Outbox
-| Approach | Pros | Trade-Offs |
+Every notification, batch, attempt, idempotency key and template lives in PostgreSQL. Every code path commits to PostgreSQL before it touches Redis. Redis is treated as a hint about which work is ready. If Redis loses an ID (a crash between commit and enqueue, AOF `everysec` losing the last second, a flushed instance), the reconciler rebuilds the Redis state from PostgreSQL. That repair is bounded by `PENDING_STALE_AFTER + RECONCILE_INTERVAL` (45s by default).
+
+### What Redis is used for
+
+All keys share the hash tag `{notif}`, so every multi-key Lua script touches a single Redis Cluster slot.
+
+| Key | Type | Purpose |
 |---|---|---|
-| **PostgreSQL State + Periodic Reconciler (Chosen)** | No extra `outbox` table write amplification; normal happy path has sub-millisecond direct Redis pipelined `enqueue.lua` latency; single 5-step reconciler repairs API crashes, Redis AOF loss, and dead workers alike. | If Redis is unreachable during `POST`, delivery is delayed until the reconciler scans stale rows (`PENDING_STALE_AFTER + RECONCILE_INTERVAL <= 45s`). |
-| **Transactional Outbox + Relay** | Strict ordering from an append-only `outbox` table without waiting for a staleness threshold. | Doubles DB writes on every notification (`INSERT notifications` + `INSERT outbox` + `DELETE/UPDATE outbox`), and still requires a separate visibility-timeout reconciler for crashed workers. |
+| `{notif}:q:{channel}:{priority}` | LIST | Ready queue of notification IDs (`LPUSH` in, `LMOVE` out = FIFO) |
+| `{notif}:msg` | HASH | `id -> {channel, priority, correlationId, traceparent}`. An ID present here is "tracked". |
+| `{notif}:inflight:{workerId}` | LIST | IDs a worker has dequeued and not yet acknowledged |
+| `{notif}:hb:{workerId}` | STRING | Worker heartbeat, TTL 15s, refreshed every 5s |
+| `{notif}:delayed` | ZSET | Retries and scheduled sends; score = due time in Unix ms |
+| `{notif}:dlq` | LIST | IDs of failed notifications (capped at 100k; PostgreSQL has the full history) |
+| `{notif}:reconciler:lock` | STRING | `SET NX PX 30000` lease so only one reconciler cycle runs at a time |
+| `{notif}:rl:{channel}` | GCRA | Distributed rate limiter state (`go-redis/redis_rate`) |
+| `notif:events` | PUB/SUB | Status events fanned out to every API replica's WebSocket hub |
 
-### C. Queue & Broker Alternatives Comparison
-| Option | Architecture | Pros | Cons / Why Not Chosen for This Scope |
-|---|---|---|---|
-| **Option A (Chosen)** | **PostgreSQL 16 + Redis 7 (Lua + ZSET + GCRA)** | Atomic 6:3:1 weighted dequeue, sub-ms pipelined batch enqueue, built-in distributed GCRA rate limiting and delayed `ZSET` in one dependency, simple local Compose footprint. | Redis is ephemeral (mitigated by PostgreSQL source-of-truth + reconciler); Lua scripts use `{notif}` hash tag (single hash slot in Redis Cluster). |
-| **Option B** | **PostgreSQL + RabbitMQ** | Native consumer acknowledgements, Dead Letter Exchanges (DLX), priority queues (`x-max-priority`). | No native distributed GCRA rate limiter (still needs Redis or token coordinator); per-message TTL in RabbitMQ only expires at queue head unless delayed-exchange plugins are added. |
-| **Option C** | **PostgreSQL-only (`SELECT ... FOR UPDATE SKIP LOCKED`)** | Zero extra infrastructure dependencies; single transactional boundary. | Polling contention and index bloat under high concurrency (`50+` workers polling across `3` channels × `3` priorities + rate-limit pacing). |
-| **Option D** | **PostgreSQL + Apache Kafka** | Massive horizontal throughput (`100M+/day`), durable segmented log replay, consumer group partitioning. | Heavy operational footprint (KRaft/brokers); no native priority queues or arbitrary per-message backoff timers without multi-topic retry tiers. |
+### Reliable queue: `LMOVE` + inflight list + heartbeat
 
-#### How We Would Scale to 100M+ Notifications/Day (Kafka Migration Path)
-To scale from millions/day (`~300 msg/s`) to `100M+/day` (`~1,200–5,000 msg/s` sustained, `25,000+ msg/s` bursts):
-1. Replace Redis dispatch lists with partitioned **Kafka topics per `(channel, priority)`** (e.g. `notif.sms.high`, `notif.sms.normal`, `notif.sms.low`) and tiered backoff retry topics (`notif.retry.5s`, `notif.retry.30s`, `notif.retry.5m`) plus `notif.dlq`.
-2. Partition `notifications` and `delivery_attempts` in PostgreSQL by daily/weekly range on `created_at` (using `pg_partman`), and batch status updates or move cold attempt audit logs to ClickHouse / BigQuery.
-3. Partition rate limiting by provider sub-account / shard using local token buckets synchronized with Redis GCRA leases (`burst` reservation batches of e.g. 10 tokens per replica).
+`dequeue.lua` moves an ID atomically from the ready queue into the worker's own inflight list. If the worker dies, the ID is not lost: it stays in `{notif}:inflight:{workerId}`. Once the worker's heartbeat key expires, reconciler step (d) moves the orphaned list back to the ready queues.
 
-### D. Other Key Architectural Trade-Offs
-- **Batch All-or-Nothing (`202` / `422`) vs. `207 Multi-Status`:** Batch creation validates all items upfront and inserts the entire batch in one transaction with `pgx.CopyFrom`. If any item is invalid or collides with an existing `idempotencyKey`, the whole request is rejected with per-index errors (`notifications[i].field`). This makes whole-batch retries via the batch-level `Idempotency-Key` header deterministic and race-free, whereas `207 Multi-Status` partial success forces clients to parse mixed results and stitch partial retries.
-- **Per-Replica In-Memory Circuit Breaker vs. Shared Redis Breaker:** Each worker replica maintains an in-memory `sony/gobreaker/v2` instance per channel (`sms`, `email`, `push`). Because all worker replicas dispatch to the same external provider endpoint, they observe provider outages simultaneously without adding an extra Redis round-trip to every send or failing when Redis itself is degraded.
-- **Redis `{notif}` Hash Tag & Cluster Caveat:** All Redis keys (`{notif}:msg`, `{notif}:q:<ch>:<pr>`, `{notif}:delayed`, `{notif}:inflight:<workerId>`, `{notif}:dlq`, `{notif}:reconciler:lock`, `{notif}:rl:<ch>`) share the `{notif}` hash tag so multi-key Lua scripts execute atomically within a single Redis Cluster hash slot. In a multi-shard Redis Cluster, pinning all `{notif}` keys to one slot means queue memory/CPU is bound to one primary shard (to shard across slots, use `{notif:sms}`, `{notif:email}`, `{notif:push}` per channel).
-- **Queue-Depth Sampler in API Only & 2s Cached `/api/v1/metrics`:** Only `cmd/api` samples Redis queue depths into Prometheus gauges (`queue_depth`, `delayed_depth`, `dlq_depth`, `inflight_depth`) every `5s`, preventing duplicate gauge series from multiple worker replicas. `GET /api/v1/metrics` pairs live sub-millisecond Redis queue lengths with a **2-second in-memory cache** over PostgreSQL window aggregations and `percentile_cont` queries so frequent dashboard polling cannot overload PostgreSQL.
+A second safety net covers a live worker. If a PostgreSQL transition succeeds but the follow-up Redis write (`ack`, `schedule` or `deadletter`) fails, the ID is stuck in that worker's inflight list. The worker's inflight sweeper requeues any ID it has not been actively handling for two consecutive sweeps.
+
+### Idempotent enqueue
+
+`enqueue.lua` and `schedule.lua` do nothing for IDs that are already tracked in `{notif}:msg`. The reconciler can therefore re-enqueue anything it suspects is missing without creating duplicate queue entries.
+
+### At-least-once delivery, made effectively-once where possible
+
+Exactly-once delivery is not possible here. If the provider accepts a request but the response is lost (a timeout, or the worker is killed after the HTTP call), the worker has to send again. Three layers keep duplicates to that unavoidable case:
+
+1. **API idempotency.** `Idempotency-Key` is stored in `idempotency_keys` in the same transaction as the notification, together with a SHA-256 hash of the canonical request body (sorted keys, normalized channel and priority, defaults applied). The primary key serializes concurrent duplicates: the integration test sends 20 simultaneous POSTs with one key and gets exactly one row. Keys expire after 24h; an expired key is atomically reclaimed on its next use.
+2. **Atomic claim and fencing.** Two workers can never process the same row at the same time, and a stale worker can never overwrite a newer state.
+3. **Provider idempotency.** Every attempt sends `Idempotency-Key: <notification id>`, which stays the same across retries, so a provider that deduplicates will drop the repeat. `webhook.site` does not deduplicate, so a timeout against it can produce a duplicate. Integration test `o` shows that duplicates are bounded by the number of sends in flight when a worker crashes.
+
+### Atomic transitions resolve cancel races
+
+Cancel is a conditional update: `UPDATE ... WHERE id=$1 AND status = ANY('{scheduled,pending,retrying}')`. If the cancel commits first, the worker's claim matches 0 rows and the worker acknowledges and drops the item. If the claim commits first, the cancel returns `409` with `current_status: processing`. Integration test `d` runs 100 concurrent cancels against live workers and checks that no cancelled ID reaches the provider.
+
+### Weighted priority without starvation (6:3:1)
+
+Each consumer goroutine cycles through a fixed 10-slot schedule `[h,h,h,h,h,h,n,n,n,l]`. For each slot, `dequeue.lua` tries that slot's priority first and then falls through the others in `high > normal > low` order. As a result, `low` gets at least 10% of the slots while higher-priority queues are busy, and all of the capacity when they are empty.
+
+### Rate limit: distributed GCRA with `Burst = 1`
+
+Workers acquire a token from `{notif}:rl:{channel}` before they claim a row, so time spent waiting for a token does not count against the visibility timeout. The limiter is `Rate = 100/s, Burst = 1`, which spaces consecutive sends at least 10ms apart. Any one-second window therefore contains at most 100 sends, or 101 at an exact boundary. Integration test `g` measured a maximum of 97 sends in any one-second window over 1000 SMS across two workers. If Redis is unavailable, the limiter fails closed: no sends rather than unlimited sends. Concurrency is sized with Little's law: 100 msg/s × 0.3s p99 latency ≈ 30 concurrent sends per channel. Each replica runs 25 goroutines per channel × 2 replicas, which leaves headroom.
+
+### Retry classification
+
+| Provider result | Outcome |
+|---|---|
+| `202` (also `200`, `201`) | **Sent** (`messageId` stored; a non-202 2xx or a missing body is logged as a warning) |
+| `408`, `425`, `429` | **Transient**; `Retry-After` is honored |
+| `500`–`599` | **Transient**; `Retry-After` is honored on `503` |
+| Timeout, connection refused or reset, DNS error, EOF | **Transient** (the provider may have accepted the request, see above) |
+| Other `4xx`, any `3xx` (redirects are not followed) | **Permanent**: the same payload cannot succeed |
+| Invalid URL, TLS error | **Permanent**: a configuration error |
+
+### Exponential backoff with full jitter
+
+`delay = max(RETRY_MIN, random[0, min(RETRY_CAP, RETRY_BASE × 2^(attempt-1))))`. If the provider sends `Retry-After`, the delay becomes `max(delay, retryAfter)`, capped at 15 minutes.
+
+| Attempt that failed | Upper bound of the next delay |
+|---|---|
+| 1 | 2s |
+| 2 | 4s |
+| 3 | 8s |
+| 4 | 16s |
+| 5 | none: `MAX_ATTEMPTS=5` reached, the notification is marked `failed` |
+
+Full jitter spreads out the retries of a burst that failed at the same moment, so they do not all return together and hit a recovering provider in lockstep.
+
+### Circuit breaker, per channel and per worker replica
+
+`sony/gobreaker/v2` opens after 10 consecutive transient failures, or when more than 50% of at least 20 requests fail. It stays open for 30s and then allows 3 half-open probe requests. Permanent `4xx` responses count as successes, because they mean bad input, not an unhealthy provider. Only the worker's own shutdown aborts are excluded; provider timeouts count as failures.
+
+When the breaker is open, nothing is sent. The row goes back to `retrying` with `attempts - 1` and `deferrals + 1`, and the attempt is recorded as `outcome=circuit_open, counted=false`, so an outage does not use up the retry budget. After 120 deferrals (about an hour) the notification fails.
+
+Breaker state is kept in memory in each replica rather than shared in Redis. Every replica calls the same provider, so they all see the same outage independently. This avoids a Redis round trip per send, and the breaker keeps working when Redis is the component in trouble.
+
+### Dead-letter queue and manual retry
+
+Failed notifications (permanent error, attempts exhausted, or the circuit open too long) go to `{notif}:dlq`; their full attempt history stays in `delivery_attempts`. `POST /api/v1/notifications/{id}/retry` moves a `failed` notification back to `pending` with `attempts=0`, clears `lastError` and enqueues it again.
+
+### Reconciler instead of a transactional outbox
+
+| | Transactional outbox | Reconciler (chosen) |
+|---|---|---|
+| How Redis learns about new work | A relay process tails an `outbox` table | The API enqueues directly after commit; a periodic scan repairs anything missed |
+| Cost | An extra insert and delete per notification, plus a separate relay process | No extra writes on the happy path |
+| Repair delay after a lost enqueue | Near zero | At most `PENDING_STALE_AFTER + RECONCILE_INTERVAL` (45s) |
+| Crashed workers | Still need a visibility-timeout reclaimer | Handled by the same component |
+
+The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Each step handles at most 1000 rows per cycle, and its keyset cursor is kept between cycles. The steps, in execution order:
+
+- **(d)** Requeue the inflight lists of workers whose heartbeat has expired.
+- **(a)** Re-enqueue `pending` rows that are untracked and older than 30s.
+- **(b)** Reschedule `retrying` and `scheduled` rows that are untracked and due within 5 minutes.
+- **(c)** Reset `processing` rows older than `VISIBILITY_TIMEOUT` (60s) back to `pending`, or to `failed` if their attempts are exhausted, and record an `abandoned` attempt.
+- **(e)** Delete expired idempotency keys.
+
+### Other decisions
+
+- **Templates are rendered at create time.** The stored notification contains the exact text that was sent, and later template edits never change notifications already in flight. Templates are soft-deleted. The renderer is a small regex-based `{{variable}}` substitution, not `text/template`: it has no logic and no injection surface, and a missing variable is a `422`.
+- **Keyset pagination.** Lists are ordered by `(created_at DESC, id DESC)` and use an opaque base64url cursor. Pages stay stable under concurrent inserts and cost the same at any depth, unlike `OFFSET`.
+- **Batches are all-or-nothing.** All items are validated first, then inserted with one `pgx.CopyFrom` in one transaction. One invalid item rejects the whole batch with per-index errors (`notifications[3].recipient`). The alternative, `207 Multi-Status` with partial success, forces every client to reconcile mixed results; here a client simply retries the whole batch with the same batch-level `Idempotency-Key`.
+- **`text` + `CHECK` instead of PostgreSQL `ENUM`.** Adding a channel such as `whatsapp` is a single, ordinary migration, with none of the transaction restrictions of `ALTER TYPE ... ADD VALUE`.
+- **`updated_at` is maintained by a trigger.** The invariant holds even for manual SQL, and ordering never relies on the application's clock.
 
 ---
 
-## 7. Failure Scenarios & Recovery Matrix
+## 5. Failure scenarios
 
 | Scenario | System Behavior | Automatic Recovery |
 |---|---|---|
@@ -218,27 +290,106 @@ To scale from millions/day (`~300 msg/s`) to `100M+/day` (`~1,200–5,000 msg/s`
 
 ---
 
-## 8. HTTP API Reference & `curl` Examples
+## 6. Alternatives and scaling to 100M/day
 
-### 1. Create a Single Notification (`POST /api/v1/notifications`)
+| Option | Strengths | Why not chosen for this scope |
+|---|---|---|
+| **A. PostgreSQL + Redis (chosen)** | Weighted priority, delayed set, distributed rate limiter and pub/sub in one fast dependency; simple Compose setup | Redis is not durable on its own (handled by the reconciler); single hash slot in Redis Cluster |
+| **B. PostgreSQL + RabbitMQ** | Native acknowledgements, priority queues (`x-max-priority`), dead-letter exchanges, per-message TTL | Still needs Redis (or similar) for a distributed rate limiter; arbitrary per-message delays need the delayed-message plugin |
+| **C. PostgreSQL only (`FOR UPDATE SKIP LOCKED`)** | No extra infrastructure, one transactional boundary | Polling 9 queues (3 channels × 3 priorities) at hundreds of messages per second makes the database the bottleneck (index churn, vacuum pressure) |
+| **D. Kafka** | Very high throughput, durable replayable log, consumer groups | No native priority (one topic per priority), no per-message delay (retry topics instead), heavier operations |
+
+**How I would scale to 100M notifications/day** (~1,200/s on average, 10–25k/s in bursts):
+
+1. **Move dispatch to Kafka.** Use topics per `(channel, priority)` partitioned by tenant or recipient hash, tiered retry topics (`retry.5s`, `retry.1m`, `retry.10m`) and a `dlq` topic. Consumers read the high-priority topics more often to keep the weighted fairness. The API keeps writing PostgreSQL first, and a transactional outbox, possibly via Debezium CDC, replaces the reconciler's enqueue repair, because at this volume a 45s repair window is too coarse.
+2. **Use provider-specific worker pools.** Each provider gets its own consumers, concurrency, rate limit and breaker, so one slow SMS vendor cannot hold capacity that email needs.
+3. **Raise rate limits per provider account.** Real providers allow far more than 100/s. Keep GCRA but lease tokens in blocks (for example 10 per round trip) to cut Redis calls.
+4. **Partition PostgreSQL.** Partition `notifications` and `delivery_attempts` by month on `created_at` (`pg_partman`) and drop or archive old partitions. Move `delivery_attempts` history to cheap storage (S3/Parquet, or ClickHouse for analytics) after N days.
+5. **Use read replicas.** Serve list, batch status and the metrics snapshot from replicas so the primary only handles writes.
+6. **Use Redis Cluster** with per-channel hash tags (`{notif:sms}`, `{notif:email}`, `{notif:push}`) instead of a single `{notif}` slot, so queue load spreads across shards.
+7. **Add multi-tenancy.** Make `tenant_id` part of idempotency keys, rate-limit keys, partitions and authorization.
+
+---
+
+## 7. API examples
+
+These examples were run exactly as written against a fresh `docker compose up --build`, and the outputs below are the real responses (JSON pretty-printed here; IDs and timestamps will differ on your machine). Run them in order in one shell: later blocks reuse `$SMS_ID`, `$BATCH_ID` and `$TPL_ID`. They need only `bash`, `curl`, `grep`, `cut` and GNU `date`.
+
+Request bodies that contain non-ASCII characters (Turkish text) are passed on stdin with `--data-binary @- <<'JSON'`. On Windows, the native `curl.exe` re-encodes command-line arguments with the ANSI code page, which corrupts `ş`/`ğ`. Stdin bytes are sent unchanged on every platform.
+
+The complete contract, with every status code and error example, is in [`api/openapi.yaml`](api/openapi.yaml) (served at `/openapi.yaml` and rendered by Swagger UI at http://localhost:8081). All errors use the same envelope:
+
+```json
+{"error": {"code": "validation_failed", "message": "...", "details": [{"field": "notifications[3].recipient", "code": "invalid_e164", "message": "..."}]}, "correlationId": "..."}
+```
+
+### Shell setup used by every example
 
 ```bash
-curl -i -X POST http://localhost:8080/api/v1/notifications \
+BASE=http://localhost:8080
+# Tiny helper so the examples need only curl, grep and cut (no jq).
+json_get() { grep -o "\"$1\":\"[^\"]*\"" | head -n1 | cut -d'"' -f4; }
+```
+
+### Health probes (`GET /health/live`, `/health/ready`, `/health`) — `FR-4.3`
+
+```bash
+curl -s $BASE/health/live; echo
+curl -s $BASE/health/ready; echo
+curl -s -o /dev/null -w 'GET /health -> %{http_code}\n' $BASE/health
+```
+
+Output:
+
+```text
+{
+  "status": "ok"
+}
+
+{
+  "status": "ok",
+  "checks": {
+    "postgres": {
+      "status": "ok",
+      "latencyMs": 0
+    },
+    "redis": {
+      "status": "ok",
+      "latencyMs": 0
+    }
+  }
+}
+
+GET /health -> 200
+```
+
+### Create a notification (`POST /api/v1/notifications`) — `FR-1.1, FR-2.5`
+
+```bash
+RESP=$(curl -s -D - -X POST "$BASE/api/v1/notifications" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: order-42-shipped" \
   -H "X-Correlation-ID: corr-order-42" \
-  -d '{
-    "recipient": "+905551234567",
-    "channel": "sms",
-    "priority": "high",
-    "content": "Siparişiniz kargoya verildi"
-  }'
+  --data-binary @- <<'JSON'
+{"recipient":"+905551234567","channel":"sms","priority":"high","content":"Siparişiniz kargoya verildi"}
+JSON
+)
+echo "$RESP"
+SMS_ID=$(echo "$RESP" | json_get id)
 ```
 
-**Response (`202 Accepted`):**
-```json
+Output:
+
+```text
+HTTP/1.1 202 Accepted
+Content-Type: application/json; charset=utf-8
+Vary: Origin
+X-Correlation-Id: corr-order-42
+Date: Fri, 20 Nov 2026 21:54:31 GMT
+Content-Length: 425
+
 {
-  "id": "01936f7e-8a1b-7c20-9d3e-4f5a6b7c8d9e",
+  "id": "01a1faf4-3868-7dbc-aa9c-d83d51f2ca26",
   "batchId": null,
   "recipient": "+905551234567",
   "channel": "sms",
@@ -251,52 +402,165 @@ curl -i -X POST http://localhost:8080/api/v1/notifications \
   "nextAttemptAt": null,
   "providerMessageId": null,
   "lastError": null,
-  "createdAt": "2026-11-20T19:00:00Z",
-  "updatedAt": "2026-11-20T19:00:00Z",
+  "createdAt": "2026-11-20T21:54:31.65704Z",
+  "updatedAt": "2026-11-20T21:54:31.65704Z",
   "sentAt": null,
   "failedAt": null,
   "cancelledAt": null
 }
 ```
 
-### 2. Create a Batch (`POST /api/v1/notifications/batch`)
+### Retry the same request: idempotent replay — `FR-2.5`
 
 ```bash
-curl -i -X POST http://localhost:8080/api/v1/notifications/batch \
+curl -s -i -X POST "$BASE/api/v1/notifications" \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: flash-sale-batch-1" \
-  -d '{
-    "notifications": [
-      {"recipient": "+905551234501", "channel": "sms", "priority": "high", "content": "Flash sale started!"},
-      {"recipient": "user@example.com", "channel": "email", "priority": "normal", "subject": "Flash Sale", "content": "50% off today."},
-      {"recipient": "fcm-device-token-12345", "channel": "push", "priority": "low", "title": "Sale", "content": "Tap to view."}
-    ]
-  }'
+  -H "Idempotency-Key: order-42-shipped" \
+  --data-binary @- <<'JSON' | grep -iE '^(HTTP/|Idempotent-Replayed|\{)' | cut -c1-120
+{"recipient":"+905551234567","channel":"sms","priority":"high","content":"Siparişiniz kargoya verildi"}
+JSON
 ```
 
-**Response (`202 Accepted`):**
-```json
-{
-  "batchId": "01936f7f-1122-7334-8445-556677889900",
-  "count": 3,
-  "notificationIds": [
-    "01936f7f-1122-7334-8445-556677889901",
-    "01936f7f-1122-7334-8445-556677889902",
-    "01936f7f-1122-7334-8445-556677889903"
-  ]
-}
+Output:
+
+```text
+HTTP/1.1 202 Accepted
+Idempotent-Replayed: true
+{"id":"01a1faf4-3868-7dbc-aa9c-d83d51f2ca26","batchId":null,"recipient":"+905551234567","channel":"sms","priority":"high
 ```
 
-### 3. Get Notification & Delivery Attempts (`GET /api/v1/notifications/{id}`)
+### Same key, different body: `409 idempotency_conflict` — `FR-2.5`
 
 ```bash
-curl -s http://localhost:8080/api/v1/notifications/01936f7e-8a1b-7c20-9d3e-4f5a6b7c8d9e | jq .
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/notifications" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: order-42-shipped" \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"A different message"}' 
 ```
 
-**Response (`200 OK`):**
-```json
+Output:
+
+```text
 {
-  "id": "01936f7e-8a1b-7c20-9d3e-4f5a6b7c8d9e",
+  "error": {
+    "code": "idempotency_conflict",
+    "message": "idempotency key was previously used with a different request payload"
+  },
+  "correlationId": "01a1faf4-391a-715f-80c0-af12449eb0ce"
+}
+
+HTTP 409
+```
+
+### Validation errors are returned together (`422`) — `FR-2.4`
+
+```bash
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/notifications" \
+  -H "Content-Type: application/json" \
+  -d '{"recipient":"05551234567","channel":"sms","subject":"not allowed on sms","content":"   "}' 
+```
+
+Output:
+
+```text
+{
+  "error": {
+    "code": "validation_failed",
+    "message": "request has 3 invalid fields",
+    "details": [
+      {
+        "field": "content",
+        "code": "required",
+        "message": "content is required"
+      },
+      {
+        "field": "recipient",
+        "code": "invalid_e164",
+        "message": "must match ^\\+[1-9]\\d{7,14}$"
+      },
+      {
+        "field": "subject",
+        "code": "unsupported_field",
+        "message": "subject is only supported for email channel"
+      }
+    ]
+  },
+  "correlationId": "01a1faf4-393b-70b9-a2c0-5ffa0848709a"
+}
+
+HTTP 422
+```
+
+### Email and push — `FR-1.1`
+
+```bash
+curl -s -X POST "$BASE/api/v1/notifications" -H "Content-Type: application/json" \
+  -d '{"recipient":"customer@example.com","channel":"email","subject":"Order #42 shipped","content":"Your order has left our warehouse."}'; echo
+curl -s -X POST "$BASE/api/v1/notifications" -H "Content-Type: application/json" \
+  -d '{"recipient":"fcm-token-9b7a2c1e","channel":"push","title":"Package delivered","content":"Your delivery has arrived.","priority":"low"}'; echo
+```
+
+Output:
+
+```text
+{
+  "id": "01a1faf4-395b-78de-8708-7a601b40e5bb",
+  "batchId": null,
+  "recipient": "customer@example.com",
+  "channel": "email",
+  "priority": "normal",
+  "status": "pending",
+  "subject": "Order #42 shipped",
+  "content": "Your order has left our warehouse.",
+  "attempts": 0,
+  "maxAttempts": 5,
+  "scheduledAt": null,
+  "nextAttemptAt": null,
+  "providerMessageId": null,
+  "lastError": null,
+  "createdAt": "2026-11-20T21:54:31.899732Z",
+  "updatedAt": "2026-11-20T21:54:31.899732Z",
+  "sentAt": null,
+  "failedAt": null,
+  "cancelledAt": null
+}
+
+{
+  "id": "01a1faf4-398c-77a5-bf25-415c08261a7c",
+  "batchId": null,
+  "recipient": "fcm-token-9b7a2c1e",
+  "channel": "push",
+  "priority": "low",
+  "status": "pending",
+  "title": "Package delivered",
+  "content": "Your delivery has arrived.",
+  "attempts": 0,
+  "maxAttempts": 5,
+  "scheduledAt": null,
+  "nextAttemptAt": null,
+  "providerMessageId": null,
+  "lastError": null,
+  "createdAt": "2026-11-20T21:54:31.948617Z",
+  "updatedAt": "2026-11-20T21:54:31.948617Z",
+  "sentAt": null,
+  "failedAt": null,
+  "cancelledAt": null
+}
+
+```
+
+### Get status and delivery attempts (`GET /api/v1/notifications/{id}`) — `FR-1.3`
+
+```bash
+sleep 2   # give a worker time to deliver it
+curl -s "$BASE/api/v1/notifications/$SMS_ID"
+```
+
+Output:
+
+```text
+{
+  "id": "01a1faf4-3868-7dbc-aa9c-d83d51f2ca26",
   "batchId": null,
   "recipient": "+905551234567",
   "channel": "sms",
@@ -307,11 +571,11 @@ curl -s http://localhost:8080/api/v1/notifications/01936f7e-8a1b-7c20-9d3e-4f5a6
   "maxAttempts": 5,
   "scheduledAt": null,
   "nextAttemptAt": null,
-  "providerMessageId": "mock-01936f7e-...",
+  "providerMessageId": "4cb0eabb-b4f1-42a9-b56a-28bd6e44b861",
   "lastError": null,
-  "createdAt": "2026-11-20T19:00:00Z",
-  "updatedAt": "2026-11-20T19:00:00.045Z",
-  "sentAt": "2026-11-20T19:00:00.045Z",
+  "createdAt": "2026-11-20T21:54:31.65704Z",
+  "updatedAt": "2026-11-20T21:54:31.928201Z",
+  "sentAt": "2026-11-20T21:54:31.928201Z",
   "failedAt": null,
   "cancelledAt": null,
   "deliveryAttempts": [
@@ -319,57 +583,543 @@ curl -s http://localhost:8080/api/v1/notifications/01936f7e-8a1b-7c20-9d3e-4f5a6
       "id": 1,
       "attemptNo": 1,
       "counted": true,
-      "startedAt": "2026-11-20T19:00:00.012Z",
-      "durationMs": 31,
+      "startedAt": "2026-11-20T21:54:31.922326Z",
+      "durationMs": 1,
       "httpStatus": 202,
       "outcome": "sent",
       "error": null,
-      "providerMessageId": "mock-01936f7e-...",
+      "providerMessageId": "4cb0eabb-b4f1-42a9-b56a-28bd6e44b861",
       "workerId": "worker-1"
     }
   ]
 }
 ```
 
-### 4. List Notifications with Filters & Keyset Cursor (`GET /api/v1/notifications`)
+### Schedule for later, then cancel (`POST /api/v1/notifications/{id}/cancel`) — `B-2, FR-1.5`
 
 ```bash
-curl -s "http://localhost:8080/api/v1/notifications?status=sent,failed&channel=sms&priority=high&from=2026-11-20T00:00:00Z&to=2026-11-21T00:00:00Z&limit=50" | jq .
+SCHEDULED_AT=$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)   # GNU date; on macOS: date -u -v+1H +%Y-%m-%dT%H:%M:%SZ
+SCHED_ID=$(curl -s -X POST "$BASE/api/v1/notifications" -H "Content-Type: application/json" \
+  -d "{\"recipient\":\"+905551234568\",\"channel\":\"sms\",\"content\":\"Flash sale starts now\",\"scheduledAt\":\"$SCHEDULED_AT\"}" | json_get id)
+curl -s "$BASE/api/v1/notifications/$SCHED_ID" | grep -o '"status":"[a-z]*","content[^,]*\|"scheduledAt":"[^"]*"'
+curl -s -X POST "$BASE/api/v1/notifications/$SCHED_ID/cancel" | grep -o '"status":"[a-z]*"\|"cancelledAt":"[^"]*"'
+# Cancelling again (or cancelling a sent notification) is a 409 that reports the current status:
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/notifications/$SCHED_ID/cancel"
 ```
 
-### 5. Cancel a Pending Notification (`POST /api/v1/notifications/{id}/cancel`)
+Output:
 
-```bash
-curl -i -X POST http://localhost:8080/api/v1/notifications/01936f7e-8a1b-7c20-9d3e-4f5a6b7c8d9e/cancel
+```text
+"status":"scheduled","content":"Flash sale starts now"
+"scheduledAt":"2026-11-20T22:54:34Z"
+"status":"cancelled"
+"cancelledAt":"2026-11-20T21:54:34.228852Z"
+{
+  "error": {
+    "code": "not_cancellable",
+    "message": "notification cannot be cancelled in status \"cancelled\"",
+    "details": [
+      {
+        "field": "status",
+        "code": "current_status",
+        "message": "cancelled"
+      }
+    ]
+  },
+  "correlationId": "01a1faf4-429f-701b-b12d-8e9363162e15"
+}
+
+HTTP 409
 ```
 
-### 6. Manually Retry a Failed Notification (`POST /api/v1/notifications/{id}/retry`)
+### Batch create, query and cancel (`/api/v1/notifications/batch`, `/api/v1/batches/{id}`) — `FR-1.2, FR-1.4`
 
 ```bash
-curl -i -X POST http://localhost:8080/api/v1/notifications/01936f7e-8a1b-7c20-9d3e-4f5a6b7c8d9e/retry
+BATCH=$(curl -s -X POST "$BASE/api/v1/notifications/batch" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: flash-sale-2026-11-21" \
+  --data-binary @- <<'JSON'
+{"notifications":[
+  {"recipient":"+905551234501","channel":"sms","priority":"high","content":"Flaş indirim başladı!"},
+  {"recipient":"user@example.com","channel":"email","subject":"Flash sale","content":"50% off today."},
+  {"recipient":"fcm-device-token-12345","channel":"push","priority":"low","title":"Sale","content":"Tap to view."}
+]}
+JSON
+)
+echo "$BATCH"
+BATCH_ID=$(echo "$BATCH" | json_get batchId)
+sleep 2
+curl -s "$BASE/api/v1/batches/$BATCH_ID?limit=1"; echo
+curl -s -X POST "$BASE/api/v1/batches/$BATCH_ID/cancel"; echo
 ```
 
-### 7. Query & Cancel a Batch (`GET /api/v1/batches/{id}`, `POST /api/v1/batches/{id}/cancel`)
+Output:
 
-```bash
-curl -s "http://localhost:8080/api/v1/batches/01936f7f-1122-7334-8445-556677889900?limit=20" | jq .
-curl -i -X POST http://localhost:8080/api/v1/batches/01936f7f-1122-7334-8445-556677889900/cancel
+```text
+{
+  "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+  "count": 3,
+  "notificationIds": [
+    "01a1faf4-42d6-7a53-8adf-b6fad225b7b0",
+    "01a1faf4-42d6-7a56-bbfe-e6596d5f5d37",
+    "01a1faf4-42d6-7a58-9387-7dd97756f1fb"
+  ]
+}
+{
+  "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+  "total": 3,
+  "countsByStatus": {
+    "sent": 3
+  },
+  "createdAt": "2026-11-20T21:54:34.326822Z",
+  "items": [
+    {
+      "id": "01a1faf4-42d6-7a58-9387-7dd97756f1fb",
+      "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+      "recipient": "fcm-device-token-12345",
+      "channel": "push",
+      "priority": "low",
+      "status": "sent",
+      "title": "Sale",
+      "content": "Tap to view.",
+      "attempts": 1,
+      "maxAttempts": 5,
+      "scheduledAt": null,
+      "nextAttemptAt": null,
+      "providerMessageId": "ec43c4c7-991d-4294-975a-57ed7e5c5f76",
+      "lastError": null,
+      "createdAt": "2026-11-20T21:54:34.326822Z",
+      "updatedAt": "2026-11-20T21:54:34.612212Z",
+      "sentAt": "2026-11-20T21:54:34.612212Z",
+      "failedAt": null,
+      "cancelledAt": null
+    }
+  ],
+  "nextCursor": "eyJ0IjoiMjAyNi0xMS0yMFQyMTo1NDozNC4zMjY4MjJaIiwiaWQiOiIwMWExZmFmNC00MmQ2LTdhNTgtOTM4Ny03ZGQ5Nzc1NmYxZmIifQ"
+}
+
+{
+  "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+  "cancelled": 0,
+  "notCancellable": 3
+}
+
 ```
 
-### 8. Real-Time Metrics, Prometheus & Health Probes
+### Templates: create, read, list, update, preview, use in a batch, delete (`/api/v1/templates`) — `B-3`
 
 ```bash
-curl -s http://localhost:8080/api/v1/metrics | jq .
-curl -s http://localhost:8080/health/ready | jq .
-curl -s http://localhost:8080/health/live | jq .
-curl -s http://localhost:8080/metrics | head -n 30
+TPL=$(curl -s -X POST "$BASE/api/v1/templates" -H "Content-Type: application/json" --data-binary @- <<'JSON'
+{"name":"otp_sms_tr","channel":"sms","body":"Merhaba {{name}}, doğrulama kodunuz: {{code}}","variables":["name","code"]}
+JSON
+)
+echo "$TPL"
+TPL_ID=$(echo "$TPL" | json_get id)
+curl -s "$BASE/api/v1/templates/$TPL_ID" | grep -o '"name":"[^"]*"\|"variables":\[[^]]*\]'
+curl -s "$BASE/api/v1/templates?channel=sms&limit=10" | grep -o '"name":"[^"]*"\|"nextCursor":[a-z]*'
+curl -s -X PUT "$BASE/api/v1/templates/$TPL_ID" -H "Content-Type: application/json" --data-binary @- <<'JSON' | grep -o '"body":"[^"]*"'
+{"name":"otp_sms_tr","channel":"sms","body":"Merhaba {{name}}, kodunuz: {{code}} (5 dk geçerli)","variables":["name","code"]}
+JSON
+curl -s -X POST "$BASE/api/v1/templates/$TPL_ID/preview" -H "Content-Type: application/json" --data-binary @- <<'JSON'; echo
+{"variables":{"name":"Ayşe","code":"4821"}}
+JSON
+curl -s -X POST "$BASE/api/v1/notifications/batch" -H "Content-Type: application/json" --data-binary @- <<JSON; echo
+{"notifications":[
+  {"recipient":"+905551230001","channel":"sms","templateId":"$TPL_ID","templateVariables":{"name":"Ayşe","code":"4821"}},
+  {"recipient":"+905551230002","channel":"sms","templateId":"$TPL_ID","templateVariables":{"name":"Mehmet","code":"9037"}}
+]}
+JSON
+curl -s -o /dev/null -w 'DELETE -> %{http_code}\n' -X DELETE "$BASE/api/v1/templates/$TPL_ID"
+curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/templates/$TPL_ID"
+```
+
+Output:
+
+```text
+{
+  "id": "01a1faf4-4bb9-7109-9347-c4334eb86e6a",
+  "name": "otp_sms_tr",
+  "channel": "sms",
+  "body": "Merhaba {{name}}, doğrulama kodunuz: {{code}}",
+  "variables": [
+    "name",
+    "code"
+  ],
+  "createdAt": "2026-11-20T21:54:36.601744Z",
+  "updatedAt": "2026-11-20T21:54:36.601744Z"
+}
+"name":"otp_sms_tr"
+"variables":["name","code"]
+"name":"otp_sms_tr"
+"nextCursor":null
+"body":"Merhaba {{name}}, kodunuz: {{code}} (5 dk geçerli)"
+{
+  "subject": null,
+  "title": null,
+  "content": "Merhaba Ayşe, kodunuz: 4821 (5 dk geçerli)",
+  "sms": {
+    "encoding": "UCS-2",
+    "units": 42,
+    "segments": 1
+  },
+  "unusedVariables": []
+}
+
+{
+  "batchId": "01a1faf4-4cef-7d70-b9c4-3392a4e83200",
+  "count": 2,
+  "notificationIds": [
+    "01a1faf4-4cef-7d8e-8799-cfdccbbb23d7",
+    "01a1faf4-4cef-7d92-b991-196e811d3ab6"
+  ]
+}
+
+DELETE -> 204
+{
+  "error": {
+    "code": "not_found",
+    "message": "requested resource was not found"
+  },
+  "correlationId": "01a1faf4-4d3b-76e2-a331-b79a8086aa56"
+}
+
+HTTP 404
+```
+
+### List with filters and keyset pagination (`GET /api/v1/notifications`) — `FR-1.6`
+
+```bash
+sleep 1
+PAGE1=$(curl -s "$BASE/api/v1/notifications?channel=sms&status=sent&from=2026-01-01T00:00:00Z&limit=2")
+echo "$PAGE1" | grep -o '"id":"[^"]*","batchId[^,]*\|"nextCursor":[^}]*'
+CURSOR=$(echo "$PAGE1" | json_get nextCursor)
+curl -s "$BASE/api/v1/notifications?channel=sms&status=sent&from=2026-01-01T00:00:00Z&limit=2&cursor=$CURSOR" \
+  | grep -o '"id":"[^"]*","batchId[^,]*\|"nextCursor":[^}]*'
+curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/notifications?cursor=not-a-cursor"
+```
+
+Output:
+
+```text
+"id":"01a1faf4-4cef-7d92-b991-196e811d3ab6","batchId":"01a1faf4-4cef-7d70-b9c4-3392a4e83200"
+"id":"01a1faf4-4cef-7d8e-8799-cfdccbbb23d7","batchId":"01a1faf4-4cef-7d70-b9c4-3392a4e83200"
+"nextCursor":"eyJ0IjoiMjAyNi0xMS0yMFQyMTo1NDozNi45MTE5NDlaIiwiaWQiOiIwMWExZmFmNC00Y2VmLTdkOGUtODc5OS1jZmRjY2JiYjIzZDcifQ"
+"id":"01a1faf4-42d6-7a53-8adf-b6fad225b7b0","batchId":"01a1faf4-42d6-7a03-86ae-2033d08103f4"
+"id":"01a1faf4-3868-7dbc-aa9c-d83d51f2ca26","batchId":null
+"nextCursor":null
+{
+  "error": {
+    "code": "invalid_cursor",
+    "message": "cursor parameter is malformed"
+  },
+  "correlationId": "01a1faf4-524d-7787-a983-5393497a90a1"
+}
+
+HTTP 400
+```
+
+### Dead-letter and manual retry (`POST /api/v1/notifications/{id}/retry`) — `B-1`
+
+```bash
+# Make the mock provider reject everything with a permanent 400 (run from the repository root).
+MOCK_PERMANENT_RATE=1 docker compose up -d --wait mockprovider 2>/dev/null
+FAIL_ID=$(curl -s -X POST "$BASE/api/v1/notifications" -H "Content-Type: application/json" \
+  -d '{"recipient":"+905551234569","channel":"sms","content":"This one will be dead-lettered"}' | json_get id)
+sleep 2
+curl -s "$BASE/api/v1/notifications/$FAIL_ID" | grep -o '"status":"[a-z]*"\|"attempts":[0-9]*\|"lastError":"[^"]*"'
+# Restore the provider and replay the notification from the DLQ.
+docker compose up -d --wait mockprovider 2>/dev/null
+curl -s -X POST "$BASE/api/v1/notifications/$FAIL_ID/retry" | grep -o '"status":"[a-z]*"\|"attempts":[0-9]*'
+sleep 2
+curl -s "$BASE/api/v1/notifications/$FAIL_ID" | grep -o '"status":"[a-z]*"\|"attempts":[0-9]*\|"outcome":"[a-z_]*"'
+curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/notifications/$FAIL_ID/retry"
+```
+
+Output:
+
+```text
+"status":"failed"
+"attempts":1
+"lastError":"provider rejected request with HTTP 400"
+"status":"pending"
+"attempts":0
+"status":"sent"
+"attempts":1
+"outcome":"permanent"
+"outcome":"sent"
+{
+  "error": {
+    "code": "not_retryable",
+    "message": "notification cannot be retried in status \"sent\"",
+    "details": [
+      {
+        "field": "status",
+        "code": "current_status",
+        "message": "sent"
+      }
+    ]
+  },
+  "correlationId": "01a1faf4-98d9-7916-9658-3f3ea710ad95"
+}
+
+HTTP 409
+```
+
+### Real-time updates over WebSocket (`GET /api/v1/ws`) — `B-4`
+
+```bash
+# Browser: open http://localhost:8080/demo. From a shell, curl can show the handshake and the first frame:
+curl -s -i -N --max-time 2 \
+  -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  "$BASE/api/v1/ws?notificationId=$SMS_ID" | head -c 400 | tr -d '\r' | tr -c '[:print:]\n' '.'; echo
+curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/ws"
+```
+
+Output:
+
+```text
+HTTP/1.1 101 Switching Protocols
+Connection: Upgrade
+Sec-Websocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
+Upgrade: websocket
+Vary: Origin
+X-Correlation-Id: 01a1faf4-98ff-7ead-ae8d-ab36c49f5152
+Date: Fri, 20 Nov 2026 21:54:56 GMT
+
+.~..{"type":"snapshot","notification":{"id":"01a1faf4-3868-7dbc-aa9c-d83d51f2ca26","batchId":null,"recipient":"+905551234567","channel":"sms","priority":"high","sta
+{
+  "error": {
+    "code": "missing_ws_filter",
+    "message": "at least one filter query parameter (notificationId, batchId, or channel) is required"
+  },
+  "correlationId": "01a1faf4-a110-7252-8cf2-c767b84c615b"
+}
+
+HTTP 400
+```
+
+### Metrics (`GET /api/v1/metrics`, `GET /metrics`) — `FR-4.1`
+
+```bash
+curl -s "$BASE/api/v1/metrics"; echo
+curl -s "$BASE/metrics" | grep -E '^notifications_created_total'
+curl -s "$BASE/metrics" | grep -E '^http_requests_total\{code="202"' 
+```
+
+Output:
+
+```text
+{
+  "generatedAt": "2026-11-20T21:54:58.481644842Z",
+  "queues": {
+    "sms": {
+      "high": 0,
+      "normal": 0,
+      "low": 0
+    },
+    "email": {
+      "high": 0,
+      "normal": 0,
+      "low": 0
+    },
+    "push": {
+      "high": 0,
+      "normal": 0,
+      "low": 0
+    },
+    "delayed": 0,
+    "dlq": 1,
+    "inflight": 0
+  },
+  "windows": {
+    "15m": {
+      "email": {
+        "sent": 2,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "push": {
+        "sent": 2,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "sms": {
+        "sent": 5,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      }
+    },
+    "1m": {
+      "email": {
+        "sent": 2,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "push": {
+        "sent": 2,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "sms": {
+        "sent": 5,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      }
+    },
+    "5m": {
+      "email": {
+        "sent": 2,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "push": {
+        "sent": 2,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "sms": {
+        "sent": 5,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      }
+    }
+  },
+  "latencyMs": {
+    "endToEnd": {
+      "p50": 174.07,
+      "p95": 5820.12,
+      "p99": 8563.92
+    },
+    "providerCall": {
+      "p50": 0,
+      "p95": 1,
+      "p99": 1
+    }
+  }
+}
+
+notifications_created_total{channel="email",priority="normal"} 2
+notifications_created_total{channel="push",priority="low"} 2
+notifications_created_total{channel="sms",priority="high"} 2
+notifications_created_total{channel="sms",priority="normal"} 4
+http_requests_total{code="202",method="POST",route="/api/v1/notifications"} 6
+http_requests_total{code="202",method="POST",route="/api/v1/notifications/batch"} 2
+```
+
+### OpenAPI spec and demo page (`GET /openapi.yaml`, `GET /demo`) — `D-4, B-4`
+
+```bash
+curl -s "$BASE/openapi.yaml" | head -n 4
+curl -s -o /dev/null -w 'GET /demo -> %{http_code} %{content_type}\n' "$BASE/demo"
+```
+
+Output:
+
+```text
+openapi: 3.0.3
+info:
+  title: Event-Driven Notification System API
+  version: 1.0.0
+GET /demo -> 200 text/html; charset=utf-8
 ```
 
 ---
 
-## 9. Configuration Reference
+## 8. Observability
 
-Every variable carries a production-safe default; `.env` is optional (see `.env.example`):
+### Prometheus metrics
+
+The API exposes them on `:8080/metrics` and each worker on `:9091/metrics`. Each process uses its own registry, and the Go and process collectors are included.
+
+| Metric | Type | Labels | Emitted by |
+|---|---|---|---|
+| `notifications_created_total` | counter | `channel, priority` | api |
+| `notifications_processed_total` | counter | `channel, status` (`sent`, `failed`, `retrying`) | worker |
+| `provider_requests_total` | counter | `channel, code` | worker |
+| `delivery_duration_seconds` | histogram | `channel` | worker (provider HTTP call) |
+| `end_to_end_latency_seconds` | histogram | `channel` | worker (`created_at` → `sent_at`) |
+| `queue_depth` | gauge | `channel, priority` | api (sampled every 5s) |
+| `delayed_depth`, `dlq_depth`, `inflight_depth` | gauge | — | api (sampled every 5s) |
+| `rate_limited_total` | counter | `channel` | worker |
+| `rate_limit_wait_seconds` | histogram | `channel` | worker |
+| `circuit_breaker_state` | gauge | `channel` (`0` closed, `1` half-open, `2` open) | worker |
+| `retries_scheduled_total` | counter | `channel` | worker |
+| `lease_lost_total` | counter | — | worker |
+| `reconciler_actions_total` | counter | `action` | worker |
+| `worker_panics_total` | counter | — | worker |
+| `http_requests_total` | counter | `route, method, code` (`route` is the chi pattern, never the raw path) | api |
+| `http_request_duration_seconds` | histogram | `route, method` | api |
+
+No metric is labeled with a notification ID, batch ID, recipient or correlation ID, which keeps the number of series bounded. Queue depths are sampled only by the API process, so two worker replicas do not report duplicate gauge series.
+
+Useful queries (Prometheus UI at http://localhost:9090):
+
+```promql
+# Sends per second per channel; should stay <= 100
+sum by (channel) (rate(notifications_processed_total{status="sent"}[1m]))
+
+# p99 provider call latency per channel
+histogram_quantile(0.99, sum by (le, channel) (rate(delivery_duration_seconds_bucket[5m])))
+
+# Backlog per queue, and whether any breaker is open
+sum by (channel, priority) (queue_depth)
+max by (channel) (circuit_breaker_state)
+
+# Share of provider calls that failed, per channel
+sum by (channel) (rate(provider_requests_total{code!~"2.."}[5m])) / sum by (channel) (rate(provider_requests_total[5m]))
+```
+
+`GET /api/v1/metrics` returns a human-readable JSON snapshot, shown in the API examples above. It combines live Redis queue lengths with 1m/5m/15m counts and 15-minute latency percentiles computed in PostgreSQL (`percentile_cont` over partial indexes on `sent_at` and `failed_at`), behind a 2-second in-memory cache so dashboards cannot overload the database.
+
+### Structured logs
+
+Logs are JSON from `log/slog`, written to stdout. Every line carries `correlation_id`, plus `trace_id` and `span_id` when a span is active. Message content is never logged, and recipients are masked. This is a real line from `docker compose logs worker-1`:
+
+```json
+{"time":"2026-11-20T21:42:34.101265864Z","level":"INFO","msg":"notification sent","service":"notification-worker","worker_id":"worker-1","correlation_id":"corr-order-42","trace_id":"09d2ecbf25118793e9b2198108c26f54","span_id":"01b40b43cc72c10a","notification_id":"01a1fae9-4526-71b6-87c9-8179d430601b","channel":"sms","priority":"high","attempt":1,"recipient":"+90555***4567","outcome":"sent","duration_ms":1}
+```
+
+`correlation_id` is the business identifier: you can pass your own with `X-Correlation-ID`, it is stored on the row, carried through Redis and sent to the provider. `trace_id` is the technical identifier that links the spans in Jaeger. Both are kept because they answer different questions: "what happened to this order's message?" versus "where did this request spend its time?".
+
+### Distributed tracing
+
+OpenTelemetry spans cover the API request, every SQL query (`otelpgx`), the Redis enqueue, the worker's dequeue → rate-limit wait → claim → provider call → status update, and the provider side (mockprovider). The W3C `traceparent` is stored in the Redis metadata, so the worker continues the API's trace. Open http://localhost:16686, select service `notification-api` and open any `POST /api/v1/notifications` trace.
+
+![Trace waterfall of one notification: API insert and enqueue, worker claim, provider call, retry](docs/images/trace.png)
+
+*The waterfall above was rendered from a real Jaeger trace (80 spans across `notification-api`, `notification-worker` and `notification-mockprovider`) for a notification whose first attempt failed and was retried.*
+
+### Health checks
+
+- `GET /health/live`: the process is up.
+- `GET /health/ready` (and its alias `/health`): pings PostgreSQL and Redis with a 1s timeout each and returns `503` if either fails.
+
+Workers expose the same probes on `:9091`. The Compose healthchecks use `cmd/healthcheck`.
+
+---
+
+## 9. Configuration
+
+Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so no `.env` file is required. `.env.example` lists them all. Invalid combinations stop the process at startup; for example, `VISIBILITY_TIMEOUT` must be at least `2 × PROVIDER_TIMEOUT + 15s`.
 
 | Variable | Default | Description & Validation |
 |---|---|---|
@@ -413,41 +1163,26 @@ Every variable carries a production-safe default; `.env` is optional (see `.env.
 | `IDEMPOTENCY_TTL` | `24h` | TTL for API `idempotency_keys` (`> 0`) |
 | `SCHEDULE_MAX_AHEAD` | `720h` | Maximum future `scheduledAt` horizon (`30` days) |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8081` | Comma-separated allowed CORS origins |
+| `MAX_WS_CLIENTS` | `1000` | Maximum concurrent WebSocket clients per API replica (`>= 1`); more get `503 too_many_ws_clients` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | OpenTelemetry OTLP HTTP endpoint |
 | `OTEL_SAMPLER_RATIO` | `1.0` | Trace sampling ratio (`[0, 1]`) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
 
 ---
 
-## 10. Testing & Load Generation
-
-The test suite separates fast unit tests (using `miniredis` and in-memory fakes, zero Docker dependency) from full container-backed integration tests (`//go:build integration` using `testcontainers-go` PostgreSQL 16 + Redis 7 and `golang-migrate`):
+## 10. Testing
 
 ```bash
-# Run unit tests only (no Docker required):
-make test
-# or on native Windows without GCC/make:
-go test ./...
-
-# Run Testcontainers integration suite (PostgreSQL 16 + Redis 7):
-make test-integration
-# or:
-go test -v -tags=integration ./internal/integration/...
-
-# Single command to run ALL unit + integration tests with race detector (D-6):
-make test-all
-
-# Run static analysis & linter:
-make lint
-
-# Unit coverage -> coverage.html + per-package table (no Docker):
-make cover
-# Unit + integration coverage attributed to every internal package (-coverpkg):
-make cover-all
-
-# Run 2,000-notification batch load test against running stack:
-make load
+make test               # unit tests with -race (no Docker; miniredis + in-memory fakes)
+make test-integration   # adds the Testcontainers suite (PostgreSQL 16 + Redis 7), -race
+make test-all           # both
+make cover              # unit coverage -> coverage.html + per-package table
+make cover-all          # unit + integration coverage per internal package
+make lint               # gofmt, go vet, golangci-lint
+make load               # 2,000-notification load test against the running stack
 ```
+
+`make` and `-race` need Linux, macOS, WSL or CI. On native Windows without GCC, run `go test ./...` and `go test -tags=integration ./internal/integration/...`.
 
 ### Integration scenarios (`internal/integration`, one Testcontainers PostgreSQL + Redis per run)
 
@@ -540,31 +1275,58 @@ Actions are pinned to **major versions** (`actions/checkout@v7`): they receive s
 
 ---
 
-## 11. Live `webhook.site` (`EXT-1`) Setup
+## 11. Mock provider vs. webhook.site
 
-By default, `docker-compose.yml` points `PROVIDER_URL` at the in-cluster `http://mockprovider:8090/` service, which implements the exact `EXT-1` contract (`202 Accepted` with `{"messageId":"...","status":"accepted","timestamp":"..."}`). To test against a live `webhook.site` URL:
+By default the workers send to `cmd/mockprovider` (`PROVIDER_URL=http://mockprovider:8090/`). It follows the same contract as the assignment's provider: `POST {"to","channel","content"}` → `202 {"messageId","status":"accepted","timestamp"}`. It is deterministic enough for tests and adjustable without code changes:
 
-1. Open https://webhook.site and copy your unique endpoint URL.
-2. Configure `webhook.site` response status to `202` and response body to:
-   ```json
-   {"messageId":"webhook-site-live-1","status":"accepted","timestamp":"2026-11-20T19:00:00Z"}
-   ```
-3. Restart the workers with your `PROVIDER_URL`:
+| Variable | Default | Effect |
+|---|---|---|
+| `MOCK_LATENCY_MS` / `MOCK_LATENCY_JITTER_MS` | `0` / `0` | Added response latency |
+| `MOCK_FAILURE_RATE` | `0` | Probability of a `500` (transient) |
+| `MOCK_429_RATE` | `0` | Probability of a `429` with `Retry-After: 1` |
+| `MOCK_PERMANENT_RATE` | `0` | Probability of a `400` (permanent) |
+| `MOCK_SEED` | `0` | Fixed random seed (`0` = random) |
+
+```bash
+MOCK_LATENCY_MS=50 MOCK_FAILURE_RATE=0.2 docker compose up -d mockprovider   # slow, flaky provider
+curl -s http://localhost:8090/stats | head -c 300; echo                       # requests received per Idempotency-Key
+docker compose up -d mockprovider                                             # back to defaults
+```
+
+To send to the real external provider used in the assignment, `webhook.site`:
+
+1. Open https://webhook.site and copy your unique URL (`https://webhook.site/<uuid>`).
+2. Under **Edit**, set the default response status to `202`, content type to `application/json`, and the body to `{"messageId":"webhook-site-1","status":"accepted","timestamp":"2026-11-21T10:00:00Z"}`. Any 2xx response counts as sent. A body missing `messageId` is logged as a warning and the message is still marked sent.
+3. Restart the workers with that URL. The API does not call the provider, so it does not need restarting:
    ```bash
-   PROVIDER_URL="https://webhook.site/<your-uuid>" docker compose up -d worker-1 worker-2
+   PROVIDER_URL="https://webhook.site/<uuid>" docker compose up -d worker-1 worker-2
    ```
+4. Create a notification (section 7). The request appears on webhook.site with the JSON body and the `Idempotency-Key`, `X-Correlation-ID` and `traceparent` headers.
+
+webhook.site's free tier limits the number of requests, so use the mock provider for load tests. webhook.site does not deduplicate on `Idempotency-Key`, so a provider timeout followed by a retry can produce two requests there (see section 4).
 
 ---
 
-## 12. Known Limitations
+## 12. Known limitations and next steps
 
-1. **SMS Turkish National Language Shift Table:** GSM 03.38 basic/extension tables include `ö ü Ö Ü Ç`, whereas `ç ğ Ğ ı İ ş Ş` require the 3GPP TS 23.038 Turkish Locking/Single Shift table. When those characters appear, our segmenter automatically switches the message to `UCS-2` (`70`/`67` code units per segment), matching conservative carrier gateway behavior.
-2. **Global Idempotency Key Namespace:** `idempotency_keys.key` is currently a global primary key (single-tenant model). In a multi-tenant deployment, the primary key would be composite `(tenant_id, key)`.
-3. **In-Memory Per-Replica Circuit Breaker:** Circuit breaker state is tracked per channel in memory on each worker replica rather than shared in Redis, trading a small per-replica detection warm-up (`10` failures per replica) for zero Redis overhead and resilience during Redis outages.
+What is deliberately missing or simplified, and what I would do with more time:
+
+- **No authentication, authorization or multi-tenancy.** Idempotency keys are global. Next steps: API keys or OAuth2 client credentials, a `tenant_id` on every table and key, and per-tenant rate limits.
+- **Duplicates on provider timeouts.** At-least-once is the honest guarantee. Exactly-once would need a provider that deduplicates on `Idempotency-Key`.
+- **The circuit breaker is per replica.** With N replicas, a provider outage costs up to N × 10 failed calls before every breaker is open. A shared breaker in Redis is possible but adds a round trip per send and fails when Redis does.
+- **No Turkish national language shift table for SMS.** `ç ğ ı İ ş Ş` force UCS-2 (70/67 characters per segment) instead of the 3GPP TS 23.038 Turkish single-shift table that some carriers support.
+- **The DLQ list is capped at 100,000 IDs,** and a manual retry does not remove the ID from it, so `dlq_depth` counts every notification that has ever been dead-lettered rather than the ones currently failed. PostgreSQL (`status='failed'`) is the authoritative view.
+- **Invalid UTF-8 in request bodies is not rejected.** Go's JSON decoder replaces it with U+FFFD, so a client that sends Latin-5 bytes gets mangled text instead of a `400`.
+- **The reconciler repair delay of up to 45s** is fine for this scale; at 100M/day I would switch to an outbox or CDC (section 6).
+- **One Redis instance.** Redis Sentinel or Cluster with per-channel hash tags would be next.
+- **Metrics windows are computed from PostgreSQL** (cached for 2s). At higher volume they should come from Prometheus recording rules instead.
+- **Templates have no versioning or localization.** Rendering at create time keeps that safe for in-flight messages, but a template history table would help auditing.
 
 ---
 
-## 13. Requirement Traceability Matrix (`FR-1.1` … `D-6`)
+## 13. Requirement checklist
+
+Every item from the assignment, where it is implemented, and how it is tested. "Integration" refers to subtests of `TestCoreIntegration` in `internal/integration`.
 
 | ID | Requirement | Implementation File(s) | Automated Test(s) | Status |
 |---|---|---|---|---|
@@ -597,4 +1359,10 @@ By default, `docker-compose.yml` points `PROVIDER_URL` at the in-cluster `http:/
 | **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
 | **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (17 scenarios), `make cover`, 10k load test | **DONE** |
 
+---
 
+## 14. How this was built
+
+I built this project with an AI pair programmer (Claude Code). The shared specification was [`CLAUDE.md`](CLAUDE.md): the architecture, domain rules, state machine, Redis data model, failure handling and coding conventions were written down there first, and every phase was implemented, reviewed and verified against it, with `gofmt`, `go vet`, `golangci-lint`, `-race` unit tests and the integration suite run after each phase.
+
+The design decisions in this README are mine, and I can explain and defend each of them, including the trade-offs I chose not to take.
