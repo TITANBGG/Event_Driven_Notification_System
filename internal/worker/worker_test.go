@@ -54,21 +54,81 @@ func (s *memWorkerStore) attemptList() []domain.DeliveryAttempt {
 	return out
 }
 
-func (s *memWorkerStore) Claim(_ context.Context, id uuid.UUID, _ time.Duration) (*domain.Notification, bool, error) {
+func (s *memWorkerStore) Claim(_ context.Context, id uuid.UUID, skew time.Duration) (*domain.Notification, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.claimErr != nil {
 		return nil, false, s.claimErr
 	}
 	n, ok := s.rows[id]
-	if !ok || n.Status != domain.StatusPending {
+	if !ok {
+		return nil, false, nil
+	}
+	horizon := time.Now().UTC().Add(skew)
+	switch n.Status {
+	case domain.StatusPending:
+	case domain.StatusRetrying:
+		if n.NextAttemptAt == nil || n.NextAttemptAt.After(horizon) {
+			return nil, false, nil
+		}
+	case domain.StatusScheduled:
+		if n.ScheduledAt == nil || n.ScheduledAt.After(horizon) {
+			return nil, false, nil
+		}
+	default:
 		return nil, false, nil
 	}
 	n.Status = domain.StatusProcessing
 	n.Attempts++
+	now := time.Now().UTC()
+	n.ProcessingStartedAt = &now
 	s.rows[id] = n
 	cp := n
 	return &cp, true, nil
+}
+
+func (s *memWorkerStore) ScheduleRetry(_ context.Context, id uuid.UUID, claimedAttempts int, nextAttemptAt time.Time, lastError string) (*domain.Notification, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leaseLos {
+		return nil, domain.ErrLeaseLost
+	}
+	n, ok := s.rows[id]
+	if !ok || n.Status != domain.StatusProcessing || n.Attempts != claimedAttempts {
+		return nil, domain.ErrLeaseLost
+	}
+	n.Status = domain.StatusRetrying
+	ts := nextAttemptAt.UTC()
+	n.NextAttemptAt = &ts
+	n.LastError = &lastError
+	n.ProcessingStartedAt = nil
+	s.rows[id] = n
+	cp := n
+	return &cp, nil
+}
+
+func (s *memWorkerStore) DeferCircuitOpen(_ context.Context, id uuid.UUID, claimedAttempts int, nextAttemptAt time.Time, lastError string) (*domain.Notification, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.leaseLos {
+		return nil, domain.ErrLeaseLost
+	}
+	n, ok := s.rows[id]
+	if !ok || n.Status != domain.StatusProcessing || n.Attempts != claimedAttempts {
+		return nil, domain.ErrLeaseLost
+	}
+	n.Status = domain.StatusRetrying
+	if n.Attempts > 0 {
+		n.Attempts--
+	}
+	n.Deferrals++
+	ts := nextAttemptAt.UTC()
+	n.NextAttemptAt = &ts
+	n.LastError = &lastError
+	n.ProcessingStartedAt = nil
+	s.rows[id] = n
+	cp := n
+	return &cp, nil
 }
 
 func (s *memWorkerStore) MarkSent(_ context.Context, id uuid.UUID, claimedAttempts int, providerMsgID *string) (*domain.Notification, error) {

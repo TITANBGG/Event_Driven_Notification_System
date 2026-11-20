@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,10 +12,15 @@ import (
 	"github.com/TITANBGG/notification-system/internal/queue"
 )
 
+// ErrCircuitOpen signals that a channel's circuit breaker rejected a call without invoking the provider.
+var ErrCircuitOpen = errors.New("circuit breaker is open")
+
 // Store defines the PostgreSQL operations consumed by the worker loop.
 type Store interface {
 	Claim(ctx context.Context, id uuid.UUID, skew time.Duration) (*domain.Notification, bool, error)
 	MarkSent(ctx context.Context, id uuid.UUID, claimedAttempts int, providerMessageID *string) (*domain.Notification, error)
+	ScheduleRetry(ctx context.Context, id uuid.UUID, claimedAttempts int, nextAttemptAt time.Time, lastError string) (*domain.Notification, error)
+	DeferCircuitOpen(ctx context.Context, id uuid.UUID, claimedAttempts int, nextAttemptAt time.Time, lastError string) (*domain.Notification, error)
 	MarkFailed(ctx context.Context, id uuid.UUID, claimedAttempts int, lastError string) (*domain.Notification, error)
 	InsertAttempt(ctx context.Context, a domain.DeliveryAttempt) (*domain.DeliveryAttempt, error)
 }
@@ -26,6 +32,8 @@ type Queue interface {
 	Schedule(ctx context.Context, meta queue.Meta, dueAt time.Time, workerID string) error
 	DeadLetter(ctx context.Context, workerID string, id uuid.UUID) error
 	RequeueInflight(ctx context.Context, workerID string) (int64, error)
+	InflightIDs(ctx context.Context, workerID string) ([]uuid.UUID, error)
+	RequeueInflightIDs(ctx context.Context, workerID string, ids []uuid.UUID) (int64, error)
 	MoveDue(ctx context.Context, now time.Time, limit int) (int64, error)
 	Heartbeat(ctx context.Context, workerID string, ttl time.Duration) error
 	DeleteHeartbeat(ctx context.Context, workerID string) error
@@ -67,9 +75,18 @@ func (NoopBreaker) Execute(_ domain.Channel, fn func() (provider.Result, error))
 	return fn()
 }
 
+// Reconciler repairs divergences between PostgreSQL and Redis and expires stale leases/keys.
+type Reconciler interface {
+	RunCycle(ctx context.Context) error
+}
+
 // Hooks exposes optional instrumentation callbacks wired to Prometheus in Phase 6.
 type Hooks struct {
-	OnPanic     func()
-	OnLeaseLost func()
-	OnProcessed func(ch domain.Channel, status domain.Status)
+	OnPanic              func()
+	OnLeaseLost          func()
+	OnProcessed          func(ch domain.Channel, status domain.Status)
+	OnRetryScheduled     func(ch domain.Channel)
+	OnBreakerStateChange func(ch domain.Channel, from, to string)
+	OnReconcilerAction   func(step string, count int)
+	OnInflightSwept      func(count int)
 }

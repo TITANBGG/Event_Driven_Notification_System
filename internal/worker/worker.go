@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"runtime/debug"
 	"sync"
@@ -25,6 +26,8 @@ const (
 	limiterErrorBackoff  = 200 * time.Millisecond
 	delayedMoverBatchMax = 500
 	shutdownCleanupWait  = 5 * time.Second
+	circuitOpenJitterMax = 5 * time.Second
+	defaultSweepInterval = 15 * time.Second
 )
 
 // Deps supplies all dependencies required to construct a Worker.
@@ -37,11 +40,13 @@ type Deps struct {
 	Sender      Sender
 	RetryPolicy RetryPolicy
 	Breaker     Breaker
+	Reconciler  Reconciler
 	Hooks       Hooks
 	Now         func() time.Time
+	Jitter      func(maxJitter time.Duration) time.Duration
 }
 
-// Worker runs channel consumer pools, the delayed-set mover, and worker heartbeats.
+// Worker runs channel consumer pools, heartbeat, delayed-set mover, and optional reconciler loops.
 type Worker struct {
 	cfg         config.Config
 	logger      *slog.Logger
@@ -51,8 +56,15 @@ type Worker struct {
 	sender      Sender
 	retryPolicy RetryPolicy
 	breaker     Breaker
+	reconciler  Reconciler
 	hooks       Hooks
 	nowFn       func() time.Time
+	jitterFn    func(maxJitter time.Duration) time.Duration
+
+	// active counts IDs this process is currently handling, so the inflight sweeper can tell a
+	// live item from one stranded in Redis after a failed post-transition write.
+	activeMu sync.Mutex
+	active   map[uuid.UUID]int
 }
 
 // New constructs a Worker with safe defaults for optional dependencies.
@@ -86,6 +98,21 @@ func New(deps Deps) (*Worker, error) {
 	if nowFn == nil {
 		nowFn = func() time.Time { return time.Now().UTC() }
 	}
+	jitterFn := deps.Jitter
+	if jitterFn == nil {
+		if js, ok := retryPolicy.(interface {
+			Jitter(time.Duration) time.Duration
+		}); ok {
+			jitterFn = js.Jitter
+		} else {
+			jitterFn = func(maxJitter time.Duration) time.Duration {
+				if maxJitter <= 0 {
+					return 0
+				}
+				return rand.N(maxJitter)
+			}
+		}
+	}
 
 	return &Worker{
 		cfg:         deps.Config,
@@ -96,14 +123,17 @@ func New(deps Deps) (*Worker, error) {
 		sender:      deps.Sender,
 		retryPolicy: retryPolicy,
 		breaker:     breaker,
+		reconciler:  deps.Reconciler,
 		hooks:       deps.Hooks,
 		nowFn:       nowFn,
+		jitterFn:    jitterFn,
+		active:      make(map[uuid.UUID]int),
 	}, nil
 }
 
-// Run starts channel consumer goroutines, heartbeat, and delayed-set mover loops and shuts down
-// gracefully on ctx cancellation: stops dequeuing, lets in-flight work finish within ShutdownTimeout,
-// requeues unstarted inflight items, and removes the worker heartbeat key.
+// Run starts channel consumer goroutines, heartbeat, delayed-set mover, and reconciler loops and
+// shuts down gracefully on ctx cancellation: stops dequeuing, lets in-flight work finish within
+// ShutdownTimeout, requeues unstarted inflight items, and removes the worker heartbeat key.
 func (w *Worker) Run(ctx context.Context) error {
 	// Separate drainCtx keeps in-flight claims/provider calls/fenced writes alive during ShutdownTimeout
 	// even after loop ctx cancels on SIGTERM.
@@ -123,7 +153,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 
 	var bgWg sync.WaitGroup
-	bgWg.Add(2)
+	bgWg.Add(3)
 	go func() {
 		defer bgWg.Done()
 		w.heartbeatLoop(ctx)
@@ -132,6 +162,17 @@ func (w *Worker) Run(ctx context.Context) error {
 		defer bgWg.Done()
 		w.delayedMoverLoop(ctx)
 	}()
+	go func() {
+		defer bgWg.Done()
+		w.inflightSweepLoop(ctx)
+	}()
+	if w.reconciler != nil && w.cfg.ReconcileInterval > 0 {
+		bgWg.Add(1)
+		go func() {
+			defer bgWg.Done()
+			w.reconcilerLoop(ctx)
+		}()
+	}
 
 	<-ctx.Done()
 	w.logger.Info("worker stopping dequeue loops", slog.Duration("shutdown_timeout", w.cfg.ShutdownTimeout))
@@ -200,6 +241,8 @@ func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, 
 			}
 
 			didWork = true
+			w.markActive(meta.ID)
+			defer w.unmarkActive(meta.ID)
 			w.processDequeuedItem(ctx, drainCtx, ch, meta)
 		}, func() {
 			panicked = true
@@ -265,6 +308,10 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 	res, sendErr := w.breaker.Execute(ch, func() (provider.Result, error) {
 		return w.sender.Send(itemDrainCtx, *n)
 	})
+	if errors.Is(sendErr, ErrCircuitOpen) {
+		w.handleCircuitOpen(itemDrainCtx, attemptLogger, ch, n, meta, startedAt)
+		return
+	}
 	if sendErr != nil {
 		attemptLogger.Warn("provider execution aborted by context cancellation", slog.String("error", sendErr.Error()))
 		return
@@ -299,22 +346,117 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 		w.emitProcessed(ch, domain.StatusSent)
 		attemptLogger.Info("notification sent", slog.Int("duration_ms", durationMS))
 
+	case provider.OutcomeTransient:
+		w.handleTransientOutcome(itemDrainCtx, attemptLogger, ch, n, meta, res, attemptErr)
+
 	default:
-		// Phase 4 handles both Permanent and Transient as terminal failure; Phase 5 enables exponential retries.
-		errText := "delivery failed"
-		if attemptErr != nil {
-			errText = *attemptErr
-		}
-		if _, err := w.store.MarkFailed(itemDrainCtx, n.ID, n.Attempts, errText); err != nil {
-			w.handleFencedError(itemDrainCtx, attemptLogger, n.ID, "MarkFailed", err)
+		w.failNotification(
+			itemDrainCtx,
+			attemptLogger,
+			ch,
+			n.ID,
+			n.Attempts,
+			errorStringValue(attemptErr, "delivery failed"),
+			"permanent_failure",
+		)
+	}
+}
+
+func (w *Worker) handleCircuitOpen(
+	drainCtx context.Context,
+	logger *slog.Logger,
+	ch domain.Channel,
+	n *domain.Notification,
+	meta *queue.Meta,
+	startedAt time.Time,
+) {
+	errMsg := ErrCircuitOpen.Error()
+	if _, insErr := w.store.InsertAttempt(drainCtx, domain.DeliveryAttempt{
+		NotificationID: n.ID,
+		AttemptNo:      n.Attempts,
+		Counted:        false,
+		StartedAt:      startedAt,
+		DurationMS:     0,
+		Outcome:        domain.OutcomeCircuitOpen,
+		Error:          &errMsg,
+		WorkerID:       &w.cfg.WorkerID,
+	}); insErr != nil {
+		logger.Warn("failed recording circuit-open deferral attempt row", slog.String("error", insErr.Error()))
+	}
+
+	if n.Deferrals+1 > w.cfg.MaxCircuitDeferral {
+		w.failNotification(drainCtx, logger, ch, n.ID, n.Attempts, "circuit open too long", "circuit_open_exhausted")
+		return
+	}
+
+	nextAt := w.nowFn().Add(w.cfg.CBOpenTimeout + w.jitterFn(circuitOpenJitterMax))
+	updated, err := w.store.DeferCircuitOpen(drainCtx, n.ID, n.Attempts, nextAt, errMsg)
+	if err != nil {
+		w.handleFencedError(drainCtx, logger, n.ID, "DeferCircuitOpen", err)
+		return
+	}
+	if schedErr := w.queue.Schedule(drainCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
+		logger.Warn("failed scheduling circuit-open deferral", slog.String("error", schedErr.Error()))
+	}
+	logger.Warn("notification deferred while circuit breaker is open",
+		slog.Int("deferrals", updated.Deferrals),
+		slog.Time("next_attempt_at", nextAt),
+	)
+}
+
+func (w *Worker) handleTransientOutcome(
+	drainCtx context.Context,
+	logger *slog.Logger,
+	ch domain.Channel,
+	n *domain.Notification,
+	meta *queue.Meta,
+	res provider.Result,
+	attemptErr *string,
+) {
+	errText := errorStringValue(attemptErr, "transient delivery failure")
+	if n.Attempts < n.MaxAttempts {
+		delay := w.retryPolicy.NextDelay(n.Attempts, res.RetryAfter)
+		nextAt := w.nowFn().Add(delay)
+		updated, err := w.store.ScheduleRetry(drainCtx, n.ID, n.Attempts, nextAt, errText)
+		if err != nil {
+			w.handleFencedError(drainCtx, logger, n.ID, "ScheduleRetry", err)
 			return
 		}
-		if dlqErr := w.queue.DeadLetter(itemDrainCtx, w.cfg.WorkerID, n.ID); dlqErr != nil {
-			attemptLogger.Warn("failed deadlettering failed notification", slog.String("error", dlqErr.Error()))
+		if schedErr := w.queue.Schedule(drainCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
+			logger.Warn("failed scheduling notification retry", slog.String("error", schedErr.Error()))
 		}
-		w.emitProcessed(ch, domain.StatusFailed)
-		attemptLogger.Warn("notification failed permanently", slog.String("outcome", string(res.Outcome)), slog.String("error", errText))
+		if w.hooks.OnRetryScheduled != nil {
+			w.hooks.OnRetryScheduled(ch)
+		}
+		logger.Warn("notification scheduled for retry",
+			slog.Duration("delay", delay),
+			slog.Time("next_attempt_at", nextAt),
+			slog.String("error", errText),
+		)
+		return
 	}
+
+	w.failNotification(drainCtx, logger, ch, n.ID, n.Attempts, "max attempts reached: "+errText, "max_attempts_exhausted")
+}
+
+func (w *Worker) failNotification(
+	drainCtx context.Context,
+	logger *slog.Logger,
+	ch domain.Channel,
+	id uuid.UUID,
+	claimedAttempts int,
+	lastError string,
+	reason string,
+) {
+	if _, err := w.store.MarkFailed(drainCtx, id, claimedAttempts, lastError); err != nil {
+		w.handleFencedError(drainCtx, logger, id, "MarkFailed", err)
+		return
+	}
+	if dlqErr := w.queue.DeadLetter(drainCtx, w.cfg.WorkerID, id); dlqErr != nil {
+		logger.Warn("failed deadlettering failed notification", slog.String("error", dlqErr.Error()))
+	}
+	w.emitProcessed(ch, domain.StatusFailed)
+	logger.Warn("notification failed permanently", slog.String("reason", reason), slog.String("error", lastError))
 }
 
 func (w *Worker) handleFencedError(ctx context.Context, logger *slog.Logger, id uuid.UUID, op string, err error) {
@@ -430,4 +572,150 @@ func errorStringPtr(err error) *string {
 	}
 	s := err.Error()
 	return &s
+}
+
+func errorStringValue(s *string, fallback string) string {
+	if s != nil && *s != "" {
+		return *s
+	}
+	return fallback
+}
+
+func metaFromNotification(n *domain.Notification, fallback *queue.Meta) queue.Meta {
+	if n == nil {
+		if fallback != nil {
+			return *fallback
+		}
+		return queue.Meta{}
+	}
+	meta := queue.Meta{
+		ID:       n.ID,
+		Channel:  n.Channel,
+		Priority: n.Priority,
+	}
+	if n.CorrelationID != nil {
+		meta.CorrelationID = *n.CorrelationID
+	} else if fallback != nil {
+		meta.CorrelationID = fallback.CorrelationID
+	}
+	if n.TraceParent != nil {
+		meta.TraceParent = *n.TraceParent
+	} else if fallback != nil {
+		meta.TraceParent = fallback.TraceParent
+	}
+	return meta
+}
+
+func (w *Worker) markActive(id uuid.UUID) {
+	w.activeMu.Lock()
+	w.active[id]++
+	w.activeMu.Unlock()
+}
+
+func (w *Worker) unmarkActive(id uuid.UUID) {
+	w.activeMu.Lock()
+	if w.active[id] <= 1 {
+		delete(w.active, id)
+	} else {
+		w.active[id]--
+	}
+	w.activeMu.Unlock()
+}
+
+func (w *Worker) isActive(id uuid.UUID) bool {
+	w.activeMu.Lock()
+	defer w.activeMu.Unlock()
+	return w.active[id] > 0
+}
+
+// inflightSweepLoop repairs IDs stranded in this live worker's inflight list. That happens when a DB
+// transition succeeded but the follow-up Redis write (Schedule/Ack/DeadLetter) failed, or after a
+// recovered panic: the ID stays "tracked" in {notif}:msg, so reconciler steps (a)/(b) skip it, and
+// step (d) skips it because this worker's heartbeat is alive. Moving it back to its queue lets the
+// normal Claim path converge: claim succeeds, or Claim refuses and Ack untracks it so the reconciler
+// repairs it from PostgreSQL.
+func (w *Worker) inflightSweepLoop(ctx context.Context) {
+	interval := w.cfg.ReconcileInterval
+	if interval <= 0 {
+		interval = defaultSweepInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	suspects := map[uuid.UUID]struct{}{}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.runGuarded(ctx, "inflight_sweeper", "", func() {
+				suspects = w.sweepInflightOnce(ctx, suspects)
+			}, nil)
+		}
+	}
+}
+
+// sweepInflightOnce requeues IDs that were idle in two consecutive sweeps. The two-sweep rule covers
+// the tiny window between LMOVE in Redis and markActive in this process.
+func (w *Worker) sweepInflightOnce(ctx context.Context, suspects map[uuid.UUID]struct{}) map[uuid.UUID]struct{} {
+	ids, err := w.queue.InflightIDs(ctx, w.cfg.WorkerID)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.logger.Warn("inflight sweep failed listing ids", slog.String("error", err.Error()))
+		}
+		return suspects
+	}
+
+	next := make(map[uuid.UUID]struct{})
+	var stranded []uuid.UUID
+	for _, id := range ids {
+		if w.isActive(id) {
+			continue
+		}
+		if _, seen := suspects[id]; seen {
+			stranded = append(stranded, id)
+			continue
+		}
+		next[id] = struct{}{}
+	}
+	if len(stranded) == 0 {
+		return next
+	}
+
+	moved, err := w.queue.RequeueInflightIDs(ctx, w.cfg.WorkerID, stranded)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.logger.Warn("inflight sweep failed requeueing stranded ids", slog.String("error", err.Error()))
+		}
+		for _, id := range stranded {
+			next[id] = struct{}{}
+		}
+		return next
+	}
+	w.logger.Warn("requeued stranded inflight items from live worker",
+		slog.Int("stranded", len(stranded)),
+		slog.Int64("moved", moved),
+	)
+	if w.hooks.OnInflightSwept != nil && moved > 0 {
+		w.hooks.OnInflightSwept(int(moved))
+	}
+	return next
+}
+
+func (w *Worker) reconcilerLoop(ctx context.Context) {
+	ticker := time.NewTicker(w.cfg.ReconcileInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.runGuarded(ctx, "reconciler", "", func() {
+				if err := w.reconciler.RunCycle(ctx); err != nil && ctx.Err() == nil {
+					w.logger.Warn("reconciler cycle completed with errors", slog.String("error", err.Error()))
+				}
+			}, nil)
+		}
+	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/TITANBGG/notification-system/internal/config"
+	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/provider"
 	"github.com/TITANBGG/notification-system/internal/queue"
@@ -91,6 +92,33 @@ func run() error {
 		Logger:         logger,
 	})
 
+	hooks := worker.Hooks{}
+	retryPolicy := worker.NewExponentialRetryPolicy(cfg.RetryBase, cfg.RetryCap, cfg.RetryMin, cfg.RetryAfterMax)
+	breaker := worker.NewChannelBreaker(worker.ChannelBreakerConfig{
+		Config: cfg,
+		Logger: logger,
+		OnStateChange: func(ch domain.Channel, from, to string) {
+			if hooks.OnBreakerStateChange != nil {
+				hooks.OnBreakerStateChange(ch, from, to)
+			}
+		},
+	})
+	reconciler, err := worker.NewReconciler(worker.ReconcilerDeps{
+		Config: cfg,
+		Logger: logger,
+		Store:  store,
+		Queue:  q,
+		OnAction: func(step string, count int) {
+			if hooks.OnReconcilerAction != nil {
+				hooks.OnReconcilerAction(step, count)
+			}
+		},
+	})
+	if err != nil {
+		logger.Error("failed to initialize worker reconciler", slog.String("error", err.Error()))
+		return err
+	}
+
 	w, err := worker.New(worker.Deps{
 		Config:      cfg,
 		Logger:      logger,
@@ -98,6 +126,10 @@ func run() error {
 		Queue:       q,
 		RateLimiter: limiter,
 		Sender:      client,
+		RetryPolicy: retryPolicy,
+		Breaker:     breaker,
+		Reconciler:  reconciler,
+		Hooks:       hooks,
 	})
 	if err != nil {
 		logger.Error("failed to initialize worker engine", slog.String("error", err.Error()))
