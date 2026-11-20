@@ -335,6 +335,9 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 5. `deadletter.lua(inflightKey, id)`: `LREM inflightKey 1 id`; `HDEL msg id`; `LPUSH dlq id`; `LTRIM dlq 0 99999`.
 6. `requeue.lua(inflightKey)`: move every ID in `inflightKey` back to its `{notif}:q:{channel}:{priority}` (parsed from `{notif}:msg` meta) — used on graceful shutdown and for orphaned workers.
 7. `move_due.lua(nowMs, limit=500)`: `ZRANGEBYSCORE delayed -inf nowMs LIMIT 0 limit`; for each ID: `ZREM delayed id`; `meta = HGET msg id`; if `meta == nil` → skip (cancelled & acked); `LPUSH` to its priority queue. Atomic in Lua, so safe with multiple worker replicas running the mover concurrently. **The mover does NOT touch PostgreSQL** (the worker `Claim` enforces the DB due time).
+8. `force_enqueue.lua(id, meta, queueKey)`: unconditional `HSET msg id meta` + `LPUSH queueKey id` — reconciler only: step `(a)` for rows already filtered as untracked, step `(c)` after `processing -> pending` (the ID may still be tracked inside a live worker's inflight list).
+9. `requeue_ids.lua(inflightKey, prefix, ids...)`: for each ID, only if `LREM inflightKey 1 id` removed it → `RPUSH` back to its queue (or `HDEL` on bad meta) — used by the live worker's inflight sweeper; an ID acked concurrently is never resurrected.
+10. `unlock.lua(lockKey, ownerToken)`: `DEL` only if `GET lockKey == ownerToken` — releases the reconciler lease at the end of a cycle without deleting another replica's lease.
 
 ### Weighted Priority with Fall-Through (`FR-2.3`, Anti-Starvation)
 
@@ -352,7 +355,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 2. `limiter.Wait(ctx, channel)` — acquire GCRA token **BEFORE** `Claim` so rate-limit wait time never counts against `VISIBILITY_TIMEOUT`.
 3. `n, ok := repo.Claim(ctx, id)` (atomically increments `attempts`).
    - If `!ok` (cancelled / already terminal / not due yet) → `queue.Ack` → `continue`.
-   - On DB error → `queue.Requeue`, backoff → `continue`.
+   - On DB error → `queue.Schedule(id, now+1s, inflight)` (moves the item out of the inflight list and retries it via the delayed mover) → `continue`.
 4. `outcome := breaker[channel].Execute(provider.Send(sendCtx, n))` (`sendCtx` timeout = `PROVIDER_TIMEOUT`).
 5. `repo.InsertAttempt(...)` — every attempt is recorded in `delivery_attempts`.
 6. Outcome dispatch (all DB updates **fenced** on `WHERE id=$1 AND status='processing' AND attempts=$claimedAttempts`):
@@ -378,6 +381,7 @@ Each loop iteration is wrapped in `recover()` so any panic logs stack + `correla
 | Request build failure (bad URL) / invalid TLS cert | **Permanent** | Configuration error |
 
 - **Breaker Success/Failure Rule:** Only **Transient** outcomes count as circuit-breaker failures. **Permanent** outcomes (`4xx`) count as breaker successes (`IsSuccessful` = true), because a `400` indicates bad client input while the provider itself is healthy.
+- **Breaker Exclusion Rule:** Only the worker's own drain/shutdown cancellation (`Send` returning a non-nil error) is excluded via `IsExcluded`. Provider HTTP timeouts are **Transient failures** even though they wrap `context.DeadlineExceeded` — excluding them would stop the breaker from ever opening on a slow provider (regression test: `TestChannelBreakerProviderTimeoutsTripButDrainAbortsDoNot`).
 
 ### Exponential Backoff with Full Jitter
 
@@ -400,15 +404,19 @@ Each loop iteration is wrapped in `recover()` so any panic logs stack + `correla
 
 ### Reconciler (Worker Binary, Every `RECONCILE_INTERVAL = 15s`)
 
-Guarded by distributed lock `{notif}:reconciler:lock` (`SET NX PX 30000`). Each step processes at most `1000` rows per cycle (keyset scan) to bound DB/Redis load; tracked checks use pipelined `HEXISTS`:
+Guarded by distributed lock `{notif}:reconciler:lock` (`SET NX PX 30000`). Each step processes at most `1000` rows per cycle (keyset scan, up to 5 pages) to bound DB/Redis load; tracked checks use pipelined `HEXISTS`. Keyset cursors **persist across cycles** (in memory, per replica) and wrap to the start after the last page, so a large tracked backlog cannot hide untracked rows beyond one cycle's budget. Execution order is `(d)` first (so requeued orphans are tracked again before `(a)` runs), then `(a)`, `(b)`, `(c)`, `(e)`; the lease is released with `unlock.lua` at the end of the cycle:
 
-- `(a)` `pending` rows with `updated_at < now - PENDING_STALE_AFTER` (`30s`) and **NOT tracked** in Redis → `enqueue.lua` (repairs DB-commit-ok / Redis-enqueue-failed or API crash).
+- `(a)` `pending` rows with `updated_at < now - PENDING_STALE_AFTER` (`30s`) and **NOT tracked** in Redis → `force_enqueue.lua` (repairs DB-commit-ok / Redis-enqueue-failed or API crash).
 - `(b)` `retrying` / `scheduled` rows due before `now + 5m`, `updated_at < now - 30s`, and **NOT tracked** → `schedule.lua` at their due timestamp (repairs Redis data loss).
 - `(c)` `processing` rows with `processing_started_at < now - VISIBILITY_TIMEOUT` (`60s`):
   - If `attempts >= max_attempts` → `failed` (`"visibility timeout; worker presumed dead"`) + `DeadLetter`.
-  - Else → transition `processing -> pending` + `enqueue.lua`.
+  - Else → transition `processing -> pending` + `force_enqueue.lua`.
   - Always insert `delivery_attempts` row with `outcome='abandoned'` and log `warn "worker likely crashed"`.
 - `(d)` Orphan inflight lists: `SCAN {notif}:inflight:*`; if matching `{notif}:hb:{workerId}` key is missing → `requeue.lua` then `DEL`.
+
+### Inflight Sweeper (Every Worker Replica, Every `RECONCILE_INTERVAL`)
+
+Covers the gap the reconciler cannot see: a DB transition succeeded but the follow-up Redis write (`Schedule` / `Ack` / `DeadLetter`) failed, or a panic was recovered mid-item. The ID is then **tracked** in `{notif}:msg` (so `(a)`/`(b)` skip it) and parked in a **live** worker's inflight list (so `(d)` skips it). Each worker keeps an in-memory set of IDs it is actively handling; IDs in its own inflight list that are not active in **two consecutive sweeps** (covers the `LMOVE` → mark-active window) are moved back with `requeue_ids.lua`. The normal path then converges: `Claim` succeeds, or `Claim` refuses → `Ack` untracks the ID → the reconciler repairs it from PostgreSQL.
 - `(e)` Delete expired `idempotency_keys` in batches of `10000`.
 - **Startup Config Guard:** `VISIBILITY_TIMEOUT >= 2*PROVIDER_TIMEOUT + 15s` — startup **fails** if violated (prevents reclaiming rows from slow-but-alive workers).
 
@@ -425,6 +433,7 @@ On `SIGINT` / `SIGTERM`: stop dequeuing immediately → allow in-flight provider
 | Redis loses last ~1s (`AOF everysec`) | Some IDs missing from queues / `delayed` ZSET | Reconciler `(a)` and `(b)` |
 | PostgreSQL down | API create → `503`; worker `Claim` errors → `requeue` + backoff | Automatic on DB recovery |
 | Worker crash mid-send | Row stays `processing`; ID stays in dead worker's inflight list | `(d)` requeues ID; `(c)` resets row to `pending` after `VISIBILITY_TIMEOUT`; possible duplicate send (at-least-once) |
+| Redis write fails after a DB transition (worker alive) | ID stays tracked and parked in the live worker's inflight list; reconciler `(a)`/`(b)`/`(d)` cannot see it | Inflight sweeper requeues it after two sweeps; `Claim` then delivers it or `Ack` untracks it for reconciler repair |
 | API crash after commit, before enqueue | Row stays `pending`, untracked in Redis | Reconciler `(a)` |
 | Provider slow / down | Timeouts → transient retries with backoff; breaker opens; no attempts burned while open | Half-open probes after `30s` |
 | Provider `202` lost (timeout) | Treated as transient → retried with identical `Idempotency-Key` | Provider-side dedupe; otherwise duplicate (documented) |
