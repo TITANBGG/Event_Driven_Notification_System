@@ -235,4 +235,8 @@ func TestConfigLogValueMasksDatabasePassword(t *testing.T) {
 	logged := buf.String()
 	assert.NotContains(t, logged, "topsecretpass", "database password must never appear in logs")
 	assert.Contains(t, logged, "postgres://notif:***@postgres:5432/notif?sslmode=disable")
+	assert.Contains(t, logged, `"provider_timeout":"10s"`)
+	assert.Contains(t, logged, `"visibility_timeout":"1m0s"`)
+	assert.Contains(t, logged, `"reconcile_interval":"15s"`)
+	assert.Contains(t, logged, `"shutdown_timeout":"15s"`)
 }
