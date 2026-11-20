@@ -48,13 +48,12 @@ func TestTimeAndDomainConversionsUTC(t *testing.T) {
 
 	loc := time.FixedZone("TRT", 3*3600)
 	localTime := time.Date(2026, 11, 20, 20, 30, 0, 0, loc)
-	utcPtr := toNullUTC(&localTime)
+	utcPtr := normalizeNullUTC(&localTime)
 	require.NotNil(t, utcPtr)
 	assert.Equal(t, time.UTC, utcPtr.Location())
 	assert.Equal(t, 17, utcPtr.Hour())
 
-	assert.Nil(t, toNullUTC(nil))
-	assert.Nil(t, fromNullUTC(nil))
+	assert.Nil(t, normalizeNullUTC(nil))
 
 	id := uuid.New()
 	httpCode := int32(202)

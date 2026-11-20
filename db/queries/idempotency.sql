@@ -34,6 +34,6 @@ DELETE FROM idempotency_keys
 WHERE key IN (
   SELECT key
   FROM idempotency_keys
-  WHERE expires_at < now()
+  WHERE expires_at <= now()
   LIMIT sqlc.arg(batch_limit)::int
 );

@@ -220,7 +220,7 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 		Content:        n.Content,
 		IdempotencyKey: n.IdempotencyKey,
 		MaxAttempts:    clampInt32(n.MaxAttempts),
-		ScheduledAt:    toNullUTC(n.ScheduledAt),
+		ScheduledAt:    normalizeNullUTC(n.ScheduledAt),
 		CorrelationID:  n.CorrelationID,
 		Traceparent:    n.TraceParent,
 	})
@@ -250,7 +250,7 @@ func (s *Store) CopyNotifications(ctx context.Context, items []domain.Notificati
 			Content:        n.Content,
 			IdempotencyKey: n.IdempotencyKey,
 			MaxAttempts:    clampInt32(n.MaxAttempts),
-			ScheduledAt:    toNullUTC(n.ScheduledAt),
+			ScheduledAt:    normalizeNullUTC(n.ScheduledAt),
 			CorrelationID:  n.CorrelationID,
 			Traceparent:    n.TraceParent,
 		})
@@ -308,8 +308,8 @@ func (s *Store) ListNotifications(ctx context.Context, f ListFilter) ([]domain.N
 		Statuses:        statuses,
 		Channel:         chPtr,
 		Priority:        prPtr,
-		FromTime:        toNullUTC(f.From),
-		ToTime:          toNullUTC(f.To),
+		FromTime:        normalizeNullUTC(f.From),
+		ToTime:          normalizeNullUTC(f.To),
 		CursorCreatedAt: cursorTS,
 		CursorID:        cursorID,
 		PageLimit:       clampInt32(f.Limit),
@@ -364,7 +364,7 @@ func (s *Store) ScheduleRetry(ctx context.Context, id uuid.UUID, claimedAttempts
 		return nil, errors.New("repository store is not initialized")
 	}
 	row, err := s.q.ScheduleRetry(ctx, sqlc.ScheduleRetryParams{
-		NextAttemptAt:   toNullUTC(&nextAttemptAt),
+		NextAttemptAt:   normalizeNullUTC(&nextAttemptAt),
 		LastError:       &lastError,
 		ID:              id,
 		ClaimedAttempts: clampInt32(claimedAttempts),
@@ -382,7 +382,7 @@ func (s *Store) DeferCircuitOpen(ctx context.Context, id uuid.UUID, claimedAttem
 		return nil, errors.New("repository store is not initialized")
 	}
 	row, err := s.q.DeferCircuitOpen(ctx, sqlc.DeferCircuitOpenParams{
-		NextAttemptAt:   toNullUTC(&nextAttemptAt),
+		NextAttemptAt:   normalizeNullUTC(&nextAttemptAt),
 		LastError:       &lastError,
 		ID:              id,
 		ClaimedAttempts: clampInt32(claimedAttempts),
@@ -722,18 +722,18 @@ func toDomainNotification(n sqlc.Notification) domain.Notification {
 		Attempts:            int(n.Attempts),
 		MaxAttempts:         int(n.MaxAttempts),
 		Deferrals:           int(n.Deferrals),
-		ScheduledAt:         fromNullUTC(n.ScheduledAt),
-		NextAttemptAt:       fromNullUTC(n.NextAttemptAt),
-		ProcessingStartedAt: fromNullUTC(n.ProcessingStartedAt),
+		ScheduledAt:         normalizeNullUTC(n.ScheduledAt),
+		NextAttemptAt:       normalizeNullUTC(n.NextAttemptAt),
+		ProcessingStartedAt: normalizeNullUTC(n.ProcessingStartedAt),
 		LastError:           n.LastError,
 		ProviderMessageID:   n.ProviderMessageID,
 		CorrelationID:       n.CorrelationID,
 		TraceParent:         n.Traceparent,
 		CreatedAt:           n.CreatedAt.UTC(),
 		UpdatedAt:           n.UpdatedAt.UTC(),
-		SentAt:              fromNullUTC(n.SentAt),
-		FailedAt:            fromNullUTC(n.FailedAt),
-		CancelledAt:         fromNullUTC(n.CancelledAt),
+		SentAt:              normalizeNullUTC(n.SentAt),
+		FailedAt:            normalizeNullUTC(n.FailedAt),
+		CancelledAt:         normalizeNullUTC(n.CancelledAt),
 	}
 }
 
@@ -770,15 +770,7 @@ func toDomainIdempotencyKey(k sqlc.IdempotencyKey) domain.IdempotencyKey {
 	}
 }
 
-func toNullUTC(t *time.Time) *time.Time {
-	if t == nil {
-		return nil
-	}
-	u := t.UTC()
-	return &u
-}
-
-func fromNullUTC(t *time.Time) *time.Time {
+func normalizeNullUTC(t *time.Time) *time.Time {
 	if t == nil {
 		return nil
 	}
