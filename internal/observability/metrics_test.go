@@ -78,10 +78,12 @@ func TestAPIVsWorkerMetricsSeparation(t *testing.T) {
 
 	apiM := observability.NewAPIMetrics()
 	apiM.SetQueueDepth("email", "normal", 5)
+	apiM.IncNotificationProcessed("email", "cancelled")
 	recAPI := httptest.NewRecorder()
 	apiM.Handler().ServeHTTP(recAPI, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
 	apiBody := recAPI.Body.String()
 	assert.Contains(t, apiBody, "queue_depth")
+	assert.Contains(t, apiBody, `notifications_processed_total{channel="email",status="cancelled"} 1`, "API counts cancellations")
 	assert.NotContains(t, apiBody, "circuit_breaker_state")
 
 	workerM := observability.NewWorkerMetrics()

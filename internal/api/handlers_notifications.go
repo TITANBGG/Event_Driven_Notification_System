@@ -718,6 +718,7 @@ func (h *handler) handleCancelNotification(w http.ResponseWriter, r *http.Reques
 			slog.String("error", cancelErr.Error()),
 		)
 	}
+	h.metrics.IncNotificationProcessed(updated.Channel.String(), domain.StatusCancelled.String())
 	h.publishStatusEvents(r.Context(), observability.CorrelationID(r.Context()), *updated)
 
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
@@ -772,6 +773,14 @@ func (h *handler) handleRetryNotification(w http.ResponseWriter, r *http.Request
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to enqueue manual retry; reconciler will recover",
 			slog.String("notification_id", updated.ID.String()),
 			slog.String("error", enqErr.Error()),
+		)
+	}
+	// The row left the DLQ in PostgreSQL; drop the ID from the informational Redis DLQ list too so
+	// dlq_depth reflects currently failed notifications. Best effort: PostgreSQL stays authoritative.
+	if dlqErr := h.enqueuer.ReleaseFromDLQ(r.Context(), updated.ID); dlqErr != nil {
+		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to remove manually retried notification from DLQ list",
+			slog.String("notification_id", updated.ID.String()),
+			slog.String("error", dlqErr.Error()),
 		)
 	}
 	h.publishStatusEvents(r.Context(), cid, *updated)

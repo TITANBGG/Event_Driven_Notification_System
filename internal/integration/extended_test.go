@@ -285,6 +285,9 @@ func runExtendedScenarios(t *testing.T, inf *testInfra) {
 		assert.Equal(t, "pending", string(retried.Status))
 		assert.Zero(t, retried.Attempts, "manual retry resets the attempt budget")
 		assert.Nil(t, retried.LastError)
+		dlq, err = inf.rdb.LRange(t.Context(), queue.DLQListKey, 0, -1).Result()
+		require.NoError(t, err)
+		assert.NotContains(t, dlq, created.ID.String(), "a replayed notification leaves the DLQ list")
 
 		require.Eventually(t, func() bool {
 			c, _ := doJSON(t, http.MethodGet, detailURL, nil, nil, &detail)

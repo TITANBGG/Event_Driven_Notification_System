@@ -70,6 +70,10 @@ func (e redisEnqueuer) CancelDelayed(ctx context.Context, ids ...uuid.UUID) erro
 	return e.q.CancelDelayed(ctx, ids...)
 }
 
+func (e redisEnqueuer) ReleaseFromDLQ(ctx context.Context, ids ...uuid.UUID) error {
+	return e.q.RemoveFromDLQ(ctx, ids...)
+}
+
 func main() {
 	if err := run(); err != nil {
 		os.Exit(1)

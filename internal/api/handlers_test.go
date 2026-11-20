@@ -707,13 +707,40 @@ func TestCancelGetAndRetryEndpoints(t *testing.T) {
 	assert.Nil(t, retried.LastError)
 	require.Len(t, enq.Items(), 1)
 	assert.Equal(t, failedID, enq.Items()[0].ID)
+	// Only the successful replay leaves the DLQ list; the rejected retry of a sent row must not.
+	assert.Equal(t, []uuid.UUID{failedID}, enq.ReleasedIDs())
 
-	// Cancel newly pending notification -> 200 cancelled.
+	// Cancel newly pending notification -> 200 cancelled, counted as a processed outcome.
 	cancelOKRec := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications/"+failedID.String()+"/cancel", "", nil)
 	require.Equal(t, http.StatusOK, cancelOKRec.Code)
 	var cancelled api.NotificationResponse
 	require.NoError(t, json.Unmarshal(cancelOKRec.Body.Bytes(), &cancelled))
 	assert.Equal(t, "cancelled", cancelled.Status)
+
+	metricsRec := doJSONRequest(t, h, http.MethodGet, "/metrics", "", nil)
+	require.Equal(t, http.StatusOK, metricsRec.Code)
+	assert.Contains(t, metricsRec.Body.String(), `notifications_processed_total{channel="email",status="cancelled"} 1`)
+}
+
+func TestCreateNotificationRejectsInvalidUTF8Body(t *testing.T) {
+	t.Parallel()
+	h, store, enq := newTestRouter(t)
+
+	// 0xDE is "Ş" in Windows-1254; as raw bytes it is invalid UTF-8 and must not be silently replaced.
+	body := "{\"recipient\":\"+905551234567\",\"channel\":\"sms\",\"content\":\"\xdeifreniz: 1234\"}"
+	rec := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications", body, nil)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	var errResp api.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
+	assert.Equal(t, "malformed_json", errResp.Error.Code)
+	assert.Contains(t, errResp.Error.Message, "UTF-8")
+	assert.Empty(t, enq.Items())
+	assert.Zero(t, store.NotificationCount())
+
+	ok := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"Şifreniz: 1234"}`, nil)
+	assert.Equal(t, http.StatusAccepted, ok.Code, "valid UTF-8 Turkish text is accepted")
 }
 
 func TestListNotificationsCursorPagination3PagesAndInvalidCursor(t *testing.T) {

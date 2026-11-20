@@ -227,6 +227,10 @@ func (e queueEnqueuer) CancelDelayed(ctx context.Context, ids ...uuid.UUID) erro
 	return e.q.CancelDelayed(ctx, ids...)
 }
 
+func (e queueEnqueuer) ReleaseFromDLQ(ctx context.Context, ids ...uuid.UUID) error {
+	return e.q.RemoveFromDLQ(ctx, ids...)
+}
+
 type testInfra struct {
 	dbURL     string
 	redisAddr string

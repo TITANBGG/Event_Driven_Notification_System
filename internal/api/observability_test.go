@@ -233,7 +233,9 @@ func TestPrometheusEndpointAndRequestCorrelationLogs(t *testing.T) {
 
 	body := scrapeRec.Body.String()
 	assert.Contains(t, body, `notifications_created_total{channel="sms",priority="high"} 1`)
-	assert.NotContains(t, body, "notifications_processed_total")
+	// The API decides cancellations, so it counts them; sent/retrying/failed come from workers only.
+	assert.Contains(t, body, `notifications_processed_total{channel="sms",status="cancelled"} 1`)
+	assert.NotContains(t, body, `status="sent"`)
 	assert.Contains(t, body, `http_requests_total{code="200",method="POST",route="/api/v1/notifications/{id}/cancel"}`)
 	assert.NotContains(t, body, created.ID.String(), "raw notification UUID must never appear in Prometheus labels")
 	assert.Contains(t, body, "go_goroutines")

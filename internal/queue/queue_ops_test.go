@@ -93,6 +93,25 @@ func TestQueueCancelDelayedUntracksScheduledItem(t *testing.T) {
 	assert.False(t, tracked[cancelled], "cancelled item must be untracked so the reconciler never resurrects it")
 }
 
+func TestQueueRemoveFromDLQDropsOnlyReplayedIDs(t *testing.T) {
+	t.Parallel()
+	mr, _, q := newTestQueue(t)
+	ctx := t.Context()
+
+	replayed := uuid.Must(uuid.NewV7())
+	stillFailed := uuid.Must(uuid.NewV7())
+	for _, id := range []uuid.UUID{replayed, stillFailed, replayed} {
+		require.NoError(t, q.DeadLetter(ctx, "", id))
+	}
+
+	require.NoError(t, q.RemoveFromDLQ(ctx))
+	require.NoError(t, q.RemoveFromDLQ(ctx, replayed))
+
+	got, err := mr.List(queue.DLQListKey)
+	require.NoError(t, err)
+	assert.Equal(t, []string{stillFailed.String()}, got, "every occurrence of the replayed ID is removed")
+}
+
 func TestQueueInflightIDsSkipsMalformedEntries(t *testing.T) {
 	t.Parallel()
 	mr, _, q := newTestQueue(t)
@@ -131,6 +150,7 @@ func TestQueueOperationsReturnErrorsWhenRedisUnavailable(t *testing.T) {
 		"DeleteHeartbeat": func(ctx context.Context, q *queue.Queue) error { return q.DeleteHeartbeat(ctx, "w1") },
 		"DeleteInflight":  func(ctx context.Context, q *queue.Queue) error { return q.DeleteInflightKey(ctx, "w1") },
 		"CancelDelayed":   func(ctx context.Context, q *queue.Queue) error { return q.CancelDelayed(ctx, id) },
+		"RemoveFromDLQ":   func(ctx context.Context, q *queue.Queue) error { return q.RemoveFromDLQ(ctx, id) },
 		"ScheduleBatch": func(ctx context.Context, q *queue.Queue) error {
 			return q.ScheduleBatch(ctx, []queue.Meta{meta}, []time.Time{time.Now()})
 		},

@@ -115,6 +115,8 @@ func (h *handler) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
 			for _, item := range cancelledItems {
 				if _, ok := cancelSet[item.ID.String()]; ok {
 					events = append(events, realtime.NewEvent(item, now, cid))
+					// Cancellation is a terminal outcome decided by the API, so the API (not a worker) counts it.
+					h.metrics.IncNotificationProcessed(item.Channel.String(), domain.StatusCancelled.String())
 				}
 			}
 			if len(events) > 0 && h.publisher != nil {

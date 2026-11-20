@@ -1,11 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"unicode/utf8"
 )
 
 // decodeJSON reads a single strict JSON value into dst, rejecting unknown fields and trailing data
@@ -19,7 +21,30 @@ func decodeJSON(r *http.Request, dst any) error {
 		}
 	}
 
-	dec := json.NewDecoder(r.Body)
+	// The body is already capped by the body-limit middleware, so buffering it is bounded.
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			return err
+		}
+		return &apiError{
+			status:  http.StatusBadRequest,
+			code:    "malformed_json",
+			message: "reading request body: " + err.Error(),
+		}
+	}
+	// encoding/json silently replaces invalid UTF-8 with U+FFFD; reject it instead so a client sending
+	// e.g. Windows-1254 bytes gets a clear 400 rather than a garbled SMS delivered to a customer.
+	if !utf8.Valid(raw) {
+		return &apiError{
+			status:  http.StatusBadRequest,
+			code:    "malformed_json",
+			message: "request body must be valid UTF-8",
+		}
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 
 	if err := dec.Decode(dst); err != nil {

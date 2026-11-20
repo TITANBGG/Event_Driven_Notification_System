@@ -28,10 +28,12 @@ type QueueItem struct {
 	ScheduledAt   *time.Time
 }
 
-// Enqueuer abstracts asynchronous queue dispatch and best-effort cancellation cleanup.
+// Enqueuer abstracts asynchronous queue dispatch plus best-effort Redis cleanup after
+// PostgreSQL transitions (cancellation and manual DLQ replay).
 type Enqueuer interface {
 	Enqueue(ctx context.Context, items []QueueItem) error
 	CancelDelayed(ctx context.Context, ids ...uuid.UUID) error
+	ReleaseFromDLQ(ctx context.Context, ids ...uuid.UUID) error
 }
 
 // MemoryEnqueuer is a thread-safe in-memory Enqueuer for unit tests and pre-Redis Phase 3 startup.
@@ -39,6 +41,7 @@ type MemoryEnqueuer struct {
 	mu           sync.Mutex
 	items        []QueueItem
 	cancelledIDs []uuid.UUID
+	releasedIDs  []uuid.UUID
 	err          error
 }
 
@@ -86,6 +89,34 @@ func (m *MemoryEnqueuer) CancelDelayed(ctx context.Context, ids ...uuid.UUID) er
 	return nil
 }
 
+// ReleaseFromDLQ records IDs removed from the DLQ list after a manual retry.
+func (m *MemoryEnqueuer) ReleaseFromDLQ(ctx context.Context, ids ...uuid.UUID) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.err != nil {
+		return m.err
+	}
+	m.releasedIDs = append(m.releasedIDs, ids...)
+	return nil
+}
+
+// ReleasedIDs returns a snapshot copy of all IDs passed to ReleaseFromDLQ.
+func (m *MemoryEnqueuer) ReleasedIDs() []uuid.UUID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]uuid.UUID, len(m.releasedIDs))
+	copy(out, m.releasedIDs)
+	return out
+}
+
 // CancelledIDs returns a snapshot copy of all IDs passed to CancelDelayed.
 func (m *MemoryEnqueuer) CancelledIDs() []uuid.UUID {
 	m.mu.Lock()
@@ -113,6 +144,7 @@ func (m *MemoryEnqueuer) Reset() {
 
 	m.items = nil
 	m.cancelledIDs = nil
+	m.releasedIDs = nil
 	m.err = nil
 }
 

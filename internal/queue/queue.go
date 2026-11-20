@@ -368,6 +368,25 @@ func (q *Queue) CancelDelayed(ctx context.Context, ids ...uuid.UUID) error {
 	return nil
 }
 
+// RemoveFromDLQ deletes every occurrence of the given IDs from the {notif}:dlq list in one pipelined
+// round trip. Used after a manual retry so the list (and dlq_depth) only holds currently failed IDs.
+func (q *Queue) RemoveFromDLQ(ctx context.Context, ids ...uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	pipe := q.rdb.Pipeline()
+	for _, id := range ids {
+		pipe.LRem(ctx, DLQListKey, 0, id.String())
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("removing notifications from DLQ list: %w", err)
+	}
+	return nil
+}
+
 // DeadLetter acknowledges the item and appends its ID to the bounded {notif}:dlq list.
 // When workerID is empty (e.g., reconciler expiry), only tracking cleanup and DLQ insertion run.
 func (q *Queue) DeadLetter(ctx context.Context, workerID string, id uuid.UUID) error {
