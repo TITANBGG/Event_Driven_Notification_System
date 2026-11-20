@@ -35,9 +35,8 @@ type SMSSegmentInfo struct {
 	Segments int         `json:"segments"`
 }
 
-// gsm7Basic holds the ETSI GSM 03.38 7-bit default alphabet (1 septet per character).
-// WHY: Notice Turkish characters ö, ü, Ö, Ü, Ç are present here while ç, ğ, Ğ, ı, İ, ş, Ş are absent,
-// forcing messages containing the latter characters to fall back to UCS-2 (documented limitation).
+// gsm7Basic holds the ETSI GSM 03.38 7-bit default alphabet (1 septet per rune).
+// Turkish ö, ü, Ö, Ü, Ç are included; ç, ğ, Ğ, ı, İ, ş, Ş are absent and trigger UCS-2.
 var gsm7Basic = map[rune]struct{}{
 	'@': {}, '£': {}, '$': {}, '¥': {}, 'è': {}, 'é': {}, 'ù': {}, 'ì': {}, 'ò': {}, 'Ç': {},
 	'\n': {}, 'Ø': {}, 'ø': {}, '\r': {}, 'Å': {}, 'å': {},

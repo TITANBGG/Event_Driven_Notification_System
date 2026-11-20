@@ -27,6 +27,8 @@ func TestValidateSMSRecipientAndSegments(t *testing.T) {
 	}{
 		{name: "valid Turkey E.164", recipient: "+905551234567", content: "hello", wantOK: true},
 		{name: "valid US E.164", recipient: "+14155552671", content: "hello", wantOK: true},
+		{name: "leading whitespace rejected", recipient: " +905551234567", content: "hello", wantCode: "invalid_e164"},
+		{name: "trailing whitespace rejected", recipient: "+905551234567 ", content: "hello", wantCode: "invalid_e164"},
 		{name: "missing leading plus", recipient: "905551234567", content: "hello", wantCode: "invalid_e164"},
 		{name: "local leading zero", recipient: "05551234567", content: "hello", wantCode: "invalid_e164"},
 		{name: "plus zero invalid", recipient: "+05551234567", content: "hello", wantCode: "invalid_e164"},
@@ -72,6 +74,11 @@ func TestValidateEmail(t *testing.T) {
 			name:   "valid email without subject",
 			in:     domain.CreateNotificationInput{Recipient: "ali@example.com", Channel: "email", Content: "Welcome"},
 			wantOK: true,
+		},
+		{
+			name:     "leading space rejected",
+			in:       domain.CreateNotificationInput{Recipient: " ali@example.com", Channel: "email", Content: "Welcome"},
+			wantCode: "invalid_email",
 		},
 		{
 			name:     "display name rejected",
@@ -120,6 +127,48 @@ func TestValidateEmail(t *testing.T) {
 			}
 			require.NotNil(t, ve)
 			assert.Equal(t, tc.wantCode, ve.Fields[0].Code)
+		})
+	}
+}
+
+func TestValidateChannelInappropriateFieldsRejected(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 20, 20, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name      string
+		in        domain.CreateNotificationInput
+		wantField string
+	}{
+		{
+			name:      "sms rejects subject",
+			in:        domain.CreateNotificationInput{Recipient: "+905551234567", Channel: "sms", Content: "hi", Subject: strPtr("S")},
+			wantField: "subject",
+		},
+		{
+			name:      "sms rejects title",
+			in:        domain.CreateNotificationInput{Recipient: "+905551234567", Channel: "sms", Content: "hi", Title: strPtr("T")},
+			wantField: "title",
+		},
+		{
+			name:      "email rejects title",
+			in:        domain.CreateNotificationInput{Recipient: "ali@example.com", Channel: "email", Content: "hi", Title: strPtr("T")},
+			wantField: "title",
+		},
+		{
+			name:      "push rejects subject",
+			in:        domain.CreateNotificationInput{Recipient: "device_tok_123", Channel: "push", Content: "hi", Subject: strPtr("S")},
+			wantField: "subject",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ve := domain.ValidateNotification(tc.in, now, domain.ValidationOptions{})
+			require.NotNil(t, ve)
+			assert.Equal(t, tc.wantField, ve.Fields[0].Field)
+			assert.Equal(t, "unsupported_field", ve.Fields[0].Code)
 		})
 	}
 }

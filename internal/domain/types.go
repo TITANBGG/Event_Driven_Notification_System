@@ -11,19 +11,14 @@ import (
 // Channel represents a supported notification delivery medium.
 type Channel string
 
-// Supported notification delivery channels.
+// Supported delivery channels.
 const (
 	ChannelSMS   Channel = "sms"
 	ChannelEmail Channel = "email"
 	ChannelPush  Channel = "push"
 )
 
-// ParseChannel validates and converts a raw string into a typed Channel.
-//
-// Expected output example:
-//
-//	ParseChannel("SMS") -> ChannelSMS ("sms"), nil
-//	ParseChannel("fax") -> "", error("unsupported channel \"fax\"")
+// ParseChannel normalizes and validates a raw channel string.
 func ParseChannel(raw string) (Channel, error) {
 	c := Channel(strings.ToLower(strings.TrimSpace(raw)))
 	if !c.Valid() {
@@ -50,7 +45,7 @@ func (c Channel) String() string {
 // Priority represents the dispatch scheduling tier for a notification.
 type Priority string
 
-// Supported dispatch priorities (weighted 6:3:1 by queue consumers).
+// Supported dispatch priority levels.
 const (
 	PriorityHigh   Priority = "high"
 	PriorityNormal Priority = "normal"
@@ -67,10 +62,6 @@ func ParsePriority(raw string) (Priority, error) {
 }
 
 // ParsePriorityOrDefault returns PriorityNormal when raw is blank, or validates raw otherwise.
-//
-// Expected output example:
-//
-//	ParsePriorityOrDefault("") -> PriorityNormal ("normal"), nil
 func ParsePriorityOrDefault(raw string) (Priority, error) {
 	if strings.TrimSpace(raw) == "" {
 		return PriorityNormal, nil
@@ -96,7 +87,7 @@ func (p Priority) String() string {
 // Status represents the authoritative lifecycle state of a notification in PostgreSQL.
 type Status string
 
-// Notification lifecycle statuses matching PostgreSQL CHECK constraints.
+// Supported notification lifecycle states matching PostgreSQL CHECK constraints.
 const (
 	StatusScheduled  Status = "scheduled"
 	StatusPending    Status = "pending"
@@ -120,7 +111,7 @@ func AllStatuses() []Status {
 	}
 }
 
-// ParseStatus validates and converts a raw string into a typed Status.
+// ParseStatus normalizes and validates a raw status string.
 func ParseStatus(raw string) (Status, error) {
 	s := Status(strings.ToLower(strings.TrimSpace(raw)))
 	if !s.Valid() {
@@ -174,76 +165,78 @@ func (o AttemptOutcome) String() string {
 // ResourceType identifies the entity backed by an idempotency key record.
 type ResourceType string
 
-// Supported idempotency resource types.
+// Supported idempotency resource categories.
 const (
 	ResourceNotification ResourceType = "notification"
 	ResourceBatch        ResourceType = "batch"
 )
 
-// Notification is the core domain aggregate persisted in the notifications table.
+// Notification is the persistence aggregate stored in PostgreSQL.
+// Intentionally omits JSON tags so HTTP handlers must map through explicit public DTOs
+// instead of exposing internal fields such as processingStartedAt, traceparent, or deferrals.
 type Notification struct {
-	ID                  uuid.UUID  `json:"id"`
-	BatchID             *uuid.UUID `json:"batchId"`
-	Channel             Channel    `json:"channel"`
-	Priority            Priority   `json:"priority"`
-	Status              Status     `json:"status"`
-	Recipient           string     `json:"recipient"`
-	Subject             *string    `json:"subject,omitempty"`
-	Title               *string    `json:"title,omitempty"`
-	Content             string     `json:"content"`
-	IdempotencyKey      *string    `json:"idempotencyKey,omitempty"`
-	Attempts            int        `json:"attempts"`
-	MaxAttempts         int        `json:"maxAttempts"`
-	Deferrals           int        `json:"deferrals"`
-	ScheduledAt         *time.Time `json:"scheduledAt"`
-	NextAttemptAt       *time.Time `json:"nextAttemptAt"`
-	ProcessingStartedAt *time.Time `json:"processingStartedAt,omitempty"`
-	LastError           *string    `json:"lastError"`
-	ProviderMessageID   *string    `json:"providerMessageId"`
-	CorrelationID       *string    `json:"correlationId,omitempty"`
-	TraceParent         *string    `json:"traceparent,omitempty"`
-	CreatedAt           time.Time  `json:"createdAt"`
-	UpdatedAt           time.Time  `json:"updatedAt"`
-	SentAt              *time.Time `json:"sentAt"`
-	FailedAt            *time.Time `json:"failedAt,omitempty"`
-	CancelledAt         *time.Time `json:"cancelledAt"`
+	ID                  uuid.UUID
+	BatchID             *uuid.UUID
+	Channel             Channel
+	Priority            Priority
+	Status              Status
+	Recipient           string
+	Subject             *string
+	Title               *string
+	Content             string
+	IdempotencyKey      *string
+	Attempts            int
+	MaxAttempts         int
+	Deferrals           int
+	ScheduledAt         *time.Time
+	NextAttemptAt       *time.Time
+	ProcessingStartedAt *time.Time
+	LastError           *string
+	ProviderMessageID   *string
+	CorrelationID       *string
+	TraceParent         *string
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+	SentAt              *time.Time
+	FailedAt            *time.Time
+	CancelledAt         *time.Time
 }
 
 // Batch represents a grouped submission of up to 1000 notifications.
 type Batch struct {
-	ID            uuid.UUID `json:"id"`
-	Total         int       `json:"total"`
-	CorrelationID *string   `json:"correlationId,omitempty"`
-	CreatedAt     time.Time `json:"createdAt"`
+	ID            uuid.UUID
+	Total         int
+	CorrelationID *string
+	CreatedAt     time.Time
 }
 
-// DeliveryAttempt represents a single immutable attempt row in delivery_attempts.
+// DeliveryAttempt represents an immutable attempt audit row in delivery_attempts.
 type DeliveryAttempt struct {
-	ID                int64          `json:"id"`
-	NotificationID    uuid.UUID      `json:"notificationId"`
-	AttemptNo         int            `json:"attemptNo"`
-	Counted           bool           `json:"counted"`
-	StartedAt         time.Time      `json:"startedAt"`
-	DurationMS        int            `json:"durationMs"`
-	HTTPStatus        *int           `json:"httpStatus"`
-	Outcome           AttemptOutcome `json:"outcome"`
-	Error             *string        `json:"error"`
-	ProviderMessageID *string        `json:"providerMessageId"`
-	WorkerID          *string        `json:"workerId"`
+	ID                int64
+	NotificationID    uuid.UUID
+	AttemptNo         int
+	Counted           bool
+	StartedAt         time.Time
+	DurationMS        int
+	HTTPStatus        *int
+	Outcome           AttemptOutcome
+	Error             *string
+	ProviderMessageID *string
+	WorkerID          *string
 }
 
 // IdempotencyKey represents an API-level deduplication record with TTL expiration.
 type IdempotencyKey struct {
-	Key            string       `json:"key"`
-	RequestHash    string       `json:"requestHash"`
-	ResourceType   ResourceType `json:"resourceType"`
-	ResourceID     uuid.UUID    `json:"resourceId"`
-	ResponseStatus int          `json:"responseStatus"`
-	CreatedAt      time.Time    `json:"createdAt"`
-	ExpiresAt      time.Time    `json:"expiresAt"`
+	Key            string
+	RequestHash    string
+	ResourceType   ResourceType
+	ResourceID     uuid.UUID
+	ResponseStatus int
+	CreatedAt      time.Time
+	ExpiresAt      time.Time
 }
 
-// CreateNotificationInput holds raw creation parameters validated before persistence.
+// CreateNotificationInput holds creation parameters validated before persistence.
 type CreateNotificationInput struct {
 	Recipient      string         `json:"recipient"`
 	Channel        string         `json:"channel"`
@@ -255,6 +248,53 @@ type CreateNotificationInput struct {
 	IdempotencyKey *string        `json:"idempotencyKey,omitempty"`
 	TemplateID     *uuid.UUID     `json:"templateId,omitempty"`
 	TemplateVars   map[string]any `json:"templateVariables,omitempty"`
+}
+
+// Normalize returns a copy with lowercase trimmed channel/priority (defaulting priority to normal)
+// and UTC-normalized scheduledAt so DB writes and idempotency hashing observe identical canonical values.
+// Recipient whitespace is preserved intentionally so channel validators enforce strict formatting.
+func (in CreateNotificationInput) Normalize() CreateNotificationInput {
+	out := in
+	out.Channel = strings.ToLower(strings.TrimSpace(in.Channel))
+	out.Priority = strings.ToLower(strings.TrimSpace(in.Priority))
+	if out.Priority == "" {
+		out.Priority = string(PriorityNormal)
+	}
+	if in.ScheduledAt != nil {
+		utc := in.ScheduledAt.UTC()
+		out.ScheduledAt = &utc
+	}
+	if in.IdempotencyKey != nil {
+		trimmed := strings.TrimSpace(*in.IdempotencyKey)
+		if trimmed == "" {
+			out.IdempotencyKey = nil
+		} else {
+			out.IdempotencyKey = &trimmed
+		}
+	}
+	return out
+}
+
+func (in CreateNotificationInput) canonicalize() any {
+	return in.Normalize()
+}
+
+// BatchCreateInput represents the POST /api/v1/notifications/batch request payload.
+type BatchCreateInput struct {
+	Notifications []CreateNotificationInput `json:"notifications"`
+}
+
+// Normalize returns a copy with every item normalized for canonical batch hashing and persistence.
+func (b BatchCreateInput) Normalize() BatchCreateInput {
+	items := make([]CreateNotificationInput, len(b.Notifications))
+	for i, item := range b.Notifications {
+		items[i] = item.Normalize()
+	}
+	return BatchCreateInput{Notifications: items}
+}
+
+func (b BatchCreateInput) canonicalize() any {
+	return b.Normalize()
 }
 
 // ValidationOptions controls channel and scheduling validation behavior.

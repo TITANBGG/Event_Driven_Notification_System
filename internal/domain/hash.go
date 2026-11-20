@@ -7,20 +7,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"strings"
 )
 
-// RequestHash computes the lowercase SHA-256 hex digest of canonical JSON (sorted keys, defaults applied).
-//
-// WHY: Idempotency keys must accept functionally identical requests regardless of JSON key ordering
-// or omitted default fields (such as missing priority vs explicit priority="normal") while catching
-// genuine payload conflicts (HTTP 409 idempotency_conflict).
-//
-// Expected output example:
-//
-//	h1, _ := RequestHash(CreateNotificationInput{Recipient: "+905551234567", Channel: "sms", Content: "hi"})
-//	h2, _ := RequestHash(map[string]any{"priority": "normal", "content": "hi", "channel": "sms", "recipient": "+905551234567"})
-//	// h1 == h2 (64-char SHA-256 hex string)
+type canonicalizer interface {
+	canonicalize() any
+}
+
+// RequestHash computes the lowercase SHA-256 hex digest of canonical JSON (sorted keys, normalized defaults, UTC timestamps).
+// Used by API idempotency checks so equivalent requests ("SMS" vs "sms", omitted priority vs "normal",
+// +03:00 vs Z) replay consistently rather than triggering spurious 409 conflicts.
 func RequestHash(v any) (string, error) {
 	normalized := applyDefaults(v)
 
@@ -47,27 +42,22 @@ func RequestHash(v any) (string, error) {
 
 func applyDefaults(v any) any {
 	switch typed := v.(type) {
-	case CreateNotificationInput:
-		if strings.TrimSpace(typed.Priority) == "" {
-			typed.Priority = string(PriorityNormal)
-		}
-		return typed
 	case *CreateNotificationInput:
 		if typed == nil {
 			return nil
 		}
-		cp := *typed
-		if strings.TrimSpace(cp.Priority) == "" {
-			cp.Priority = string(PriorityNormal)
+		return typed.Normalize()
+	case *BatchCreateInput:
+		if typed == nil {
+			return nil
 		}
-		return cp
+		return typed.Normalize()
+	case canonicalizer:
+		return typed.canonicalize()
 	case []CreateNotificationInput:
 		out := make([]CreateNotificationInput, len(typed))
 		for i, item := range typed {
-			if strings.TrimSpace(item.Priority) == "" {
-				item.Priority = string(PriorityNormal)
-			}
-			out[i] = item
+			out[i] = item.Normalize()
 		}
 		return out
 	default:

@@ -1,9 +1,7 @@
 package domain
 
-// transitionMap is the single authoritative state machine matching CLAUDE.md Section 3.
-//
-// WHY: Centralizing allowed transitions here and mirroring the exact same allowed_from sets in
-// PostgreSQL WHERE clauses guarantees cancel-vs-worker races and reconciler recoveries stay consistent.
+// transitionMap defines every legal status transition. SQL WHERE clauses mirror these exact
+// allowed-from sets so cancel-vs-worker races and reconciler recoveries stay atomic.
 var transitionMap = map[Status]map[Status]bool{
 	StatusScheduled: {
 		StatusProcessing: true,

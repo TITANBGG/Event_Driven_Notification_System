@@ -26,22 +26,12 @@ const (
 
 var e164Pattern = regexp.MustCompile(`^\+[1-9]\d{7,14}$`)
 
-// ValidateNotification checks all common, channel-specific, scheduling, and idempotency rules.
-//
-// WHY: Collecting every validation failure in one pass produces clear, actionable 422 details
-// without leaking downstream invalid payloads to Redis or external providers.
-//
-// Expected output example:
-//
-//	ValidateNotification(badSMS, now, opts).Fields -> [
-//	  {Field: "recipient", Code: "invalid_e164", Message: "must match ^\\+[1-9]\\d{7,14}$"},
-//	  {Field: "content", Code: "too_many_segments", Message: "11 segments (GSM-7), max 10"},
-//	]
+// ValidateNotification evaluates all common, channel-specific, scheduling, and idempotency rules in one pass.
 func ValidateNotification(in CreateNotificationInput, now time.Time, opts ValidationOptions) *ValidationError {
 	return ValidateNotificationWithPrefix("", in, now, opts)
 }
 
-// ValidateNotificationWithPrefix validates an input while prefixing field paths (e.g. "notifications[3].").
+// ValidateNotificationWithPrefix validates an input while prefixing field paths (e.g., "notifications[3].").
 func ValidateNotificationWithPrefix(prefix string, in CreateNotificationInput, now time.Time, opts ValidationOptions) *ValidationError {
 	ve := &ValidationError{}
 
@@ -58,8 +48,8 @@ func ValidateNotificationWithPrefix(prefix string, in CreateNotificationInput, n
 		}
 	}
 
-	recipient := strings.TrimSpace(in.Recipient)
-	if recipient == "" {
+	recipientBlank := strings.TrimSpace(in.Recipient) == ""
+	if recipientBlank {
 		ve.Add(joinField(prefix, "recipient"), "required", "recipient is required")
 	}
 
@@ -71,11 +61,11 @@ func ValidateNotificationWithPrefix(prefix string, in CreateNotificationInput, n
 	if chErr == nil {
 		switch channel {
 		case ChannelSMS:
-			validateSMS(prefix, in, recipient, contentEmpty, ve)
+			validateSMS(prefix, in, recipientBlank, contentEmpty, ve)
 		case ChannelEmail:
-			validateEmail(prefix, in, recipient, ve)
+			validateEmail(prefix, in, recipientBlank, ve)
 		case ChannelPush:
-			validatePush(prefix, in, recipient, opts.ExtendedProviderFields, ve)
+			validatePush(prefix, in, recipientBlank, opts.ExtendedProviderFields, ve)
 		}
 	}
 
@@ -95,9 +85,15 @@ func ValidateNotificationWithPrefix(prefix string, in CreateNotificationInput, n
 	return ve
 }
 
-func validateSMS(prefix string, in CreateNotificationInput, recipient string, contentEmpty bool, ve *ValidationError) {
-	if recipient != "" && !e164Pattern.MatchString(in.Recipient) {
+func validateSMS(prefix string, in CreateNotificationInput, recipientBlank, contentEmpty bool, ve *ValidationError) {
+	if !recipientBlank && !e164Pattern.MatchString(in.Recipient) {
 		ve.Add(joinField(prefix, "recipient"), "invalid_e164", `must match ^\+[1-9]\d{7,14}$`)
+	}
+	if in.Subject != nil && *in.Subject != "" {
+		ve.Add(joinField(prefix, "subject"), "unsupported_field", "subject is only supported for email channel")
+	}
+	if in.Title != nil && *in.Title != "" {
+		ve.Add(joinField(prefix, "title"), "unsupported_field", "title is only supported for push channel")
 	}
 	if !contentEmpty {
 		info := SMSInfo(in.Content)
@@ -111,17 +107,21 @@ func validateSMS(prefix string, in CreateNotificationInput, recipient string, co
 	}
 }
 
-func validateEmail(prefix string, in CreateNotificationInput, recipient string, ve *ValidationError) {
-	if recipient != "" {
+func validateEmail(prefix string, in CreateNotificationInput, recipientBlank bool, ve *ValidationError) {
+	if !recipientBlank {
 		if utf8.RuneCountInString(in.Recipient) > maxEmailRecipientRunes {
 			ve.Add(joinField(prefix, "recipient"), "invalid_email", "email recipient exceeds 254 characters")
 		} else {
 			parsed, err := mail.ParseAddress(in.Recipient)
-			// Require exact equality so display names ("Alice <a@b.com>") and angle brackets are rejected.
+			// Require exact equality so display names ("Alice <a@b.com>"), angle brackets, or extra spaces fail.
 			if err != nil || parsed.Address != in.Recipient {
 				ve.Add(joinField(prefix, "recipient"), "invalid_email", "must be a valid email address without a display name")
 			}
 		}
+	}
+
+	if in.Title != nil && *in.Title != "" {
+		ve.Add(joinField(prefix, "title"), "unsupported_field", "title is only supported for push channel")
 	}
 
 	if in.Subject != nil {
@@ -139,12 +139,16 @@ func validateEmail(prefix string, in CreateNotificationInput, recipient string, 
 	}
 }
 
-func validatePush(prefix string, in CreateNotificationInput, recipient string, extendedFields bool, ve *ValidationError) {
-	if recipient != "" {
+func validatePush(prefix string, in CreateNotificationInput, recipientBlank bool, extendedFields bool, ve *ValidationError) {
+	if !recipientBlank {
 		runeLen := utf8.RuneCountInString(in.Recipient)
 		if runeLen < 1 || runeLen > maxPushTokenRunes || containsWhitespace(in.Recipient) {
 			ve.Add(joinField(prefix, "recipient"), "invalid_device_token", "device token must be 1..4096 characters with no whitespace")
 		}
+	}
+
+	if in.Subject != nil && *in.Subject != "" {
+		ve.Add(joinField(prefix, "subject"), "unsupported_field", "subject is only supported for email channel")
 	}
 
 	if in.Title != nil && utf8.RuneCountInString(*in.Title) > maxPushTitleRunes {
@@ -192,7 +196,7 @@ func validateScheduledAt(prefix string, scheduledAt, now time.Time, opts Validat
 	}
 }
 
-// IsValidIdempotencyKey verifies that k is 1..255 printable ASCII characters (0x20..0x7E).
+// IsValidIdempotencyKey verifies that k consists of 1..255 printable ASCII bytes.
 func IsValidIdempotencyKey(k string) bool {
 	if len(k) < 1 || len(k) > maxIdempotencyKeyLen {
 		return false
