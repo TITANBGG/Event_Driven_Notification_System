@@ -1,0 +1,459 @@
+package queue
+
+import (
+	"context"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+
+	"github.com/TITANBGG/notification-system/internal/domain"
+)
+
+//go:embed lua/*.lua
+var luaFS embed.FS
+
+func mustLoadScript(name string) *redis.Script {
+	src, err := luaFS.ReadFile("lua/" + name)
+	if err != nil {
+		panic(fmt.Sprintf("embedded lua script %q missing: %v", name, err))
+	}
+	return redis.NewScript(string(src))
+}
+
+var (
+	enqueueScript    = mustLoadScript("enqueue.lua")
+	scheduleScript   = mustLoadScript("schedule.lua")
+	dequeueScript    = mustLoadScript("dequeue.lua")
+	ackScript        = mustLoadScript("ack.lua")
+	deadletterScript = mustLoadScript("deadletter.lua")
+	requeueScript    = mustLoadScript("requeue.lua")
+	moveDueScript    = mustLoadScript("move_due.lua")
+)
+
+var weightedSlotSchedule = [10]domain.Priority{
+	domain.PriorityHigh,
+	domain.PriorityHigh,
+	domain.PriorityHigh,
+	domain.PriorityHigh,
+	domain.PriorityHigh,
+	domain.PriorityHigh,
+	domain.PriorityNormal,
+	domain.PriorityNormal,
+	domain.PriorityNormal,
+	domain.PriorityLow,
+}
+
+// Meta is the compact JSON payload stored in {notif}:msg so queues hold only UUIDs
+// while workers and the delayed mover retain channel, priority, and trace metadata.
+type Meta struct {
+	ID            uuid.UUID       `json:"id"`
+	Channel       domain.Channel  `json:"channel"`
+	Priority      domain.Priority `json:"priority"`
+	CorrelationID string          `json:"correlationId,omitempty"`
+	TraceParent   string          `json:"traceparent,omitempty"`
+}
+
+// MetricsDepths captures live queue lengths across channels, priorities, delayed ZSET, DLQ, and inflight lists.
+type MetricsDepths struct {
+	ByChannel map[domain.Channel]map[domain.Priority]int64
+	Delayed   int64
+	DLQ       int64
+	Inflight  int64
+}
+
+// PriorityOrderForSlot computes the 3-key dequeue probe order for the 6:3:1 weighted priority
+// schedule with deterministic fall-through (high > normal > low for remaining slots).
+func PriorityOrderForSlot(slot int) [3]domain.Priority {
+	idx := ((slot % len(weightedSlotSchedule)) + len(weightedSlotSchedule)) % len(weightedSlotSchedule)
+	preferred := weightedSlotSchedule[idx]
+	switch preferred {
+	case domain.PriorityHigh:
+		return [3]domain.Priority{domain.PriorityHigh, domain.PriorityNormal, domain.PriorityLow}
+	case domain.PriorityNormal:
+		return [3]domain.Priority{domain.PriorityNormal, domain.PriorityHigh, domain.PriorityLow}
+	default:
+		return [3]domain.Priority{domain.PriorityLow, domain.PriorityHigh, domain.PriorityNormal}
+	}
+}
+
+// NewClient constructs a configured *redis.Client matching pool size and timeout bounds.
+func NewClient(addr string, poolSize int) *redis.Client {
+	opts := &redis.Options{
+		Addr:         addr,
+		PoolSize:     poolSize,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolTimeout:  4 * time.Second,
+	}
+	return redis.NewClient(opts)
+}
+
+// Queue manages Redis priority queues, per-worker inflight lists, delayed scheduling, and DLQ operations.
+type Queue struct {
+	rdb       redis.UniversalClient
+	dlqMaxLen int64
+
+	slotMu   sync.Mutex
+	slotByCh map[domain.Channel]*atomic.Uint64
+}
+
+// New constructs a Queue backed by a go-redis client.
+func New(rdb redis.UniversalClient) *Queue {
+	return &Queue{
+		rdb:       rdb,
+		dlqMaxLen: DefaultDLQMaxLen,
+		slotByCh: map[domain.Channel]*atomic.Uint64{
+			domain.ChannelSMS:   {},
+			domain.ChannelEmail: {},
+			domain.ChannelPush:  {},
+		},
+	}
+}
+
+// Ping verifies Redis connectivity within ctx's deadline.
+func (q *Queue) Ping(ctx context.Context) error {
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	return q.rdb.Ping(ctx).Err()
+}
+
+// Enqueue idempotently pushes one or more notification IDs onto their target channel/priority
+// queues in a single pipelined round trip, retrying once after SCRIPT LOAD on cold Redis nodes.
+func (q *Queue) Enqueue(ctx context.Context, items ...Meta) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+
+	payloads := make([][]byte, len(items))
+	qKeys := make([]string, len(items))
+	for i, item := range items {
+		if !item.Channel.Valid() {
+			return fmt.Errorf("enqueue invalid channel %q for %s", item.Channel, item.ID)
+		}
+		if !item.Priority.Valid() {
+			item.Priority = domain.PriorityNormal
+		}
+		raw, err := json.Marshal(item)
+		if err != nil {
+			return fmt.Errorf("marshaling queue meta for %s: %w", item.ID, err)
+		}
+		payloads[i] = raw
+		qKeys[i] = Key(item.Channel, item.Priority)
+	}
+
+	runPipe := func() ([]*redis.Cmd, error) {
+		pipe := q.rdb.Pipeline()
+		cmds := make([]*redis.Cmd, len(items))
+		for i, item := range items {
+			cmds[i] = enqueueScript.EvalSha(ctx, pipe, []string{MsgHashKey, qKeys[i]}, item.ID.String(), string(payloads[i]))
+		}
+		_, err := pipe.Exec(ctx)
+		return cmds, err
+	}
+
+	cmds, err := runPipe()
+	if err != nil && isNoScriptError(err, cmds) {
+		if loadErr := enqueueScript.Load(ctx, q.rdb).Err(); loadErr != nil {
+			return fmt.Errorf("loading enqueue script: %w", loadErr)
+		}
+		_, err = runPipe()
+	}
+	if err != nil {
+		return fmt.Errorf("executing enqueue pipeline: %w", err)
+	}
+	return nil
+}
+
+// Dequeue atomically moves one item from ch's weighted priority queues into workerID's inflight list.
+// Returns (nil, false, nil) when all three priority lists for ch are empty.
+func (q *Queue) Dequeue(ctx context.Context, ch domain.Channel, workerID string) (*Meta, bool, error) {
+	if q.rdb == nil {
+		return nil, false, errors.New("redis client is nil")
+	}
+	if !ch.Valid() {
+		return nil, false, fmt.Errorf("invalid channel %q", ch)
+	}
+
+	slot := q.nextSlot(ch)
+	order := PriorityOrderForSlot(slot)
+	keys := []string{
+		MsgHashKey,
+		InflightKey(workerID),
+		Key(ch, order[0]),
+		Key(ch, order[1]),
+		Key(ch, order[2]),
+	}
+
+	res, err := dequeueScript.Run(ctx, q.rdb, keys).Result()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("running dequeue script: %w", err)
+	}
+
+	pair, ok := res.([]any)
+	if !ok || len(pair) != 2 {
+		return nil, false, fmt.Errorf("unexpected dequeue script result type %T", res)
+	}
+	idStr, _ := pair[0].(string)
+	metaRaw, _ := pair[1].(string)
+
+	id, parseErr := uuid.Parse(idStr)
+	if parseErr != nil {
+		return nil, false, fmt.Errorf("parsing dequeued id %q: %w", idStr, parseErr)
+	}
+
+	if metaRaw != "" {
+		var meta Meta
+		if unmarshalErr := json.Unmarshal([]byte(metaRaw), &meta); unmarshalErr == nil {
+			return &meta, true, nil
+		}
+	}
+
+	// Defensive fallback if queue list contained an ID whose msg hash entry was cleared.
+	return &Meta{
+		ID:       id,
+		Channel:  ch,
+		Priority: order[0],
+	}, true, nil
+}
+
+// Ack removes id from workerID's inflight list and deletes its tracking metadata from {notif}:msg.
+func (q *Queue) Ack(ctx context.Context, workerID string, id uuid.UUID) error {
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	if err := ackScript.Run(ctx, q.rdb, []string{MsgHashKey, InflightKey(workerID)}, id.String()).Err(); err != nil {
+		return fmt.Errorf("acknowledging notification %s: %w", id, err)
+	}
+	return nil
+}
+
+// Schedule upserts metadata and places id into {notif}:delayed at dueAt while optionally removing
+// it from workerID's inflight list.
+func (q *Queue) Schedule(ctx context.Context, meta Meta, dueAt time.Time, workerID string) error {
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	if !meta.Channel.Valid() {
+		return fmt.Errorf("schedule invalid channel %q for %s", meta.Channel, meta.ID)
+	}
+	if !meta.Priority.Valid() {
+		meta.Priority = domain.PriorityNormal
+	}
+
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshaling schedule meta: %w", err)
+	}
+	keys := []string{MsgHashKey, DelayedZSetKey}
+	if workerID != "" {
+		keys = append(keys, InflightKey(workerID))
+	}
+	dueMs := strconv.FormatInt(dueAt.UTC().UnixMilli(), 10)
+	if err := scheduleScript.Run(ctx, q.rdb, keys, meta.ID.String(), string(raw), dueMs).Err(); err != nil {
+		return fmt.Errorf("scheduling notification %s: %w", meta.ID, err)
+	}
+	return nil
+}
+
+// DeadLetter acknowledges the item and appends its ID to the bounded {notif}:dlq list.
+// When workerID is empty (e.g., reconciler expiry), only tracking cleanup and DLQ insertion run.
+func (q *Queue) DeadLetter(ctx context.Context, workerID string, id uuid.UUID) error {
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	keys := []string{MsgHashKey, DLQListKey}
+	if workerID != "" {
+		keys = append(keys, InflightKey(workerID))
+	}
+	if err := deadletterScript.Run(ctx, q.rdb, keys, id.String(), q.dlqMaxLen).Err(); err != nil {
+		return fmt.Errorf("deadlettering notification %s: %w", id, err)
+	}
+	return nil
+}
+
+// RequeueInflight moves every item remaining in workerID's inflight list back to the front
+// of its channel/priority queue while preserving FIFO ordering.
+func (q *Queue) RequeueInflight(ctx context.Context, workerID string) (int64, error) {
+	if q.rdb == nil {
+		return 0, errors.New("redis client is nil")
+	}
+	n, err := requeueScript.Run(ctx, q.rdb, []string{MsgHashKey, InflightKey(workerID)}, QueuePrefix).Int64()
+	if err != nil {
+		return 0, fmt.Errorf("requeueing inflight for worker %s: %w", workerID, err)
+	}
+	return n, nil
+}
+
+// MoveDue atomically promotes up to limit delayed notification IDs with score <= nowMs to their priority queues.
+func (q *Queue) MoveDue(ctx context.Context, now time.Time, limit int) (int64, error) {
+	if q.rdb == nil {
+		return 0, errors.New("redis client is nil")
+	}
+	if limit <= 0 {
+		limit = 500
+	}
+	nowMs := strconv.FormatInt(now.UTC().UnixMilli(), 10)
+	n, err := moveDueScript.Run(ctx, q.rdb, []string{MsgHashKey, DelayedZSetKey}, nowMs, limit, QueuePrefix).Int64()
+	if err != nil {
+		return 0, fmt.Errorf("moving due notifications: %w", err)
+	}
+	return n, nil
+}
+
+// Heartbeat refreshes workerID's liveness key with expiration ttl.
+func (q *Queue) Heartbeat(ctx context.Context, workerID string, ttl time.Duration) error {
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	if err := q.rdb.Set(ctx, HeartbeatKey(workerID), strconv.FormatInt(time.Now().UTC().Unix(), 10), ttl).Err(); err != nil {
+		return fmt.Errorf("setting worker heartbeat: %w", err)
+	}
+	return nil
+}
+
+// DeleteHeartbeat removes workerID's heartbeat key cleanly on graceful shutdown.
+func (q *Queue) DeleteHeartbeat(ctx context.Context, workerID string) error {
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	if err := q.rdb.Del(ctx, HeartbeatKey(workerID)).Err(); err != nil {
+		return fmt.Errorf("deleting worker heartbeat: %w", err)
+	}
+	return nil
+}
+
+// IsTracked checks which notification IDs currently have tracking metadata in {notif}:msg via pipelined HEXISTS.
+func (q *Queue) IsTracked(ctx context.Context, ids []uuid.UUID) (map[uuid.UUID]bool, error) {
+	out := make(map[uuid.UUID]bool, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	if q.rdb == nil {
+		return nil, errors.New("redis client is nil")
+	}
+
+	pipe := q.rdb.Pipeline()
+	cmds := make([]*redis.BoolCmd, len(ids))
+	for i, id := range ids {
+		cmds[i] = pipe.HExists(ctx, MsgHashKey, id.String())
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("checking tracked ids: %w", err)
+	}
+	for i, id := range ids {
+		out[id] = cmds[i].Val()
+	}
+	return out, nil
+}
+
+// Depths measures live Redis queue depths across channels/priorities, delayed ZSET, DLQ, and inflight lists.
+func (q *Queue) Depths(ctx context.Context) (MetricsDepths, error) {
+	if q.rdb == nil {
+		return MetricsDepths{}, errors.New("redis client is nil")
+	}
+
+	channels := []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}
+	priorities := []domain.Priority{domain.PriorityHigh, domain.PriorityNormal, domain.PriorityLow}
+
+	depths := MetricsDepths{
+		ByChannel: make(map[domain.Channel]map[domain.Priority]int64, len(channels)),
+	}
+	pipe := q.rdb.Pipeline()
+	type qCmd struct {
+		ch  domain.Channel
+		pr  domain.Priority
+		cmd *redis.IntCmd
+	}
+	var queueCmds []qCmd
+	for _, ch := range channels {
+		depths.ByChannel[ch] = make(map[domain.Priority]int64, len(priorities))
+		for _, pr := range priorities {
+			queueCmds = append(queueCmds, qCmd{
+				ch:  ch,
+				pr:  pr,
+				cmd: pipe.LLen(ctx, Key(ch, pr)),
+			})
+		}
+	}
+	delayedCmd := pipe.ZCard(ctx, DelayedZSetKey)
+	dlqCmd := pipe.LLen(ctx, DLQListKey)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return MetricsDepths{}, fmt.Errorf("measuring queue depths: %w", err)
+	}
+
+	for _, qc := range queueCmds {
+		depths.ByChannel[qc.ch][qc.pr] = qc.cmd.Val()
+	}
+	depths.Delayed = delayedCmd.Val()
+	depths.DLQ = dlqCmd.Val()
+
+	var inflightKeys []string
+	var cursor uint64
+	for {
+		keys, next, err := q.rdb.Scan(ctx, cursor, InflightScanPattern, 200).Result()
+		if err != nil {
+			return MetricsDepths{}, fmt.Errorf("scanning inflight lists: %w", err)
+		}
+		inflightKeys = append(inflightKeys, keys...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	if len(inflightKeys) > 0 {
+		inPipe := q.rdb.Pipeline()
+		lenCmds := make([]*redis.IntCmd, len(inflightKeys))
+		for i, k := range inflightKeys {
+			lenCmds[i] = inPipe.LLen(ctx, k)
+		}
+		if _, err := inPipe.Exec(ctx); err != nil {
+			return MetricsDepths{}, fmt.Errorf("measuring inflight depths: %w", err)
+		}
+		for _, cmd := range lenCmds {
+			depths.Inflight += cmd.Val()
+		}
+	}
+
+	return depths, nil
+}
+
+func (q *Queue) nextSlot(ch domain.Channel) int {
+	q.slotMu.Lock()
+	ctr, ok := q.slotByCh[ch]
+	if !ok {
+		ctr = &atomic.Uint64{}
+		q.slotByCh[ch] = ctr
+	}
+	q.slotMu.Unlock()
+	val := ctr.Add(1) - 1
+	return int(val % uint64(len(weightedSlotSchedule)))
+}
+
+func isNoScriptError(err error, cmds []*redis.Cmd) bool {
+	if err != nil && strings.Contains(err.Error(), "NOSCRIPT") {
+		return true
+	}
+	for _, cmd := range cmds {
+		if cmd.Err() != nil && strings.Contains(cmd.Err().Error(), "NOSCRIPT") {
+			return true
+		}
+	}
+	return false
+}
