@@ -527,7 +527,7 @@ Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_c
 |---|---|
 | `POST /api/v1/notifications` | `202` resource \| `400` malformed JSON / unknown fields \| `415` wrong `Content-Type` \| `422` validation \| `409` idempotency conflict \| `413` body too large |
 | `POST /api/v1/notifications/batch` | `202 {"batchId","count","notificationIds"}` \| `422` `batch_too_large` / validation / duplicate item key \| `409` conflict \| `413` `payload_too_large` |
-| `GET /api/v1/notifications/{id}` | `200` resource + `"attempts":[...]` \| `400` bad UUID \| `404` not found |
+| `GET /api/v1/notifications/{id}` | `200` resource + `"deliveryAttempts":[...]` (alongside integer `"attempts"`) \| `400` bad UUID \| `404` not found |
 | `GET /api/v1/notifications` | Filters: `?status=pending,failed&channel=sms&priority=high&from=&to=&cursor=&limit=` → `200 {"data":[...],"nextCursor":"..." \| null}` |
 | `POST /api/v1/notifications/{id}/cancel` | `200` updated resource \| `409 {"error":{...,"details":[{"field":"status","code":"current_status","message":"sent"}]}}` \| `404` |
 | `POST /api/v1/notifications/{id}/retry` | `failed → pending` (manual DLQ replay; resets `attempts=0`, `deferrals=0`, clears `last_error`) → `200` \| `409` otherwise \| `404` |
