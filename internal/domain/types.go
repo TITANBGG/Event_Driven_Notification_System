@@ -264,15 +264,21 @@ func (in CreateNotificationInput) Normalize() CreateNotificationInput {
 		utc := in.ScheduledAt.UTC()
 		out.ScheduledAt = &utc
 	}
-	if in.IdempotencyKey != nil {
-		trimmed := strings.TrimSpace(*in.IdempotencyKey)
-		if trimmed == "" {
-			out.IdempotencyKey = nil
-		} else {
-			out.IdempotencyKey = &trimmed
-		}
-	}
+	out.Subject = normalizeOptionalText(in.Subject)
+	out.Title = normalizeOptionalText(in.Title)
+	out.IdempotencyKey = normalizeOptionalText(in.IdempotencyKey)
 	return out
+}
+
+func normalizeOptionalText(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	trimmed := strings.TrimSpace(*s)
+	if trimmed == "" {
+		return nil
+	}
+	return &trimmed
 }
 
 func (in CreateNotificationInput) canonicalize() any {

@@ -6,10 +6,6 @@ import (
 )
 
 // Typed sentinel errors mapped to HTTP status codes in one place (internal/api/errors.go).
-//
-// Expected output example:
-//
-//	errors.Is(err, domain.ErrInvalidTransition) -> mapped to HTTP 409 Conflict
 var (
 	ErrNotFound            = errors.New("notification not found")
 	ErrInvalidTransition   = errors.New("invalid status transition")
@@ -25,14 +21,7 @@ type FieldError struct {
 	Message string `json:"message"`
 }
 
-// ValidationError collects all input validation violations for a single or batch request.
-//
-// WHY: Returning every field violation at once (e.g., notifications[3].recipient and content)
-// prevents frustrating multi-round API fix loops for callers.
-//
-// Expected output example:
-//
-//	ve.Error() -> "request has 2 invalid fields"
+// ValidationError collects every input violation so callers fix all fields in one round trip.
 type ValidationError struct {
 	Fields []FieldError
 }

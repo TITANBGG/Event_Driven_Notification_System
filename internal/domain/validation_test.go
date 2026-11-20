@@ -146,6 +146,11 @@ func TestValidateChannelInappropriateFieldsRejected(t *testing.T) {
 			wantField: "subject",
 		},
 		{
+			name:      "sms rejects empty subject",
+			in:        domain.CreateNotificationInput{Recipient: "+905551234567", Channel: "sms", Content: "hi", Subject: strPtr("")},
+			wantField: "subject",
+		},
+		{
 			name:      "sms rejects title",
 			in:        domain.CreateNotificationInput{Recipient: "+905551234567", Channel: "sms", Content: "hi", Title: strPtr("T")},
 			wantField: "title",
@@ -153,6 +158,11 @@ func TestValidateChannelInappropriateFieldsRejected(t *testing.T) {
 		{
 			name:      "email rejects title",
 			in:        domain.CreateNotificationInput{Recipient: "ali@example.com", Channel: "email", Content: "hi", Title: strPtr("T")},
+			wantField: "title",
+		},
+		{
+			name:      "email rejects empty title",
+			in:        domain.CreateNotificationInput{Recipient: "ali@example.com", Channel: "email", Content: "hi", Title: strPtr("")},
 			wantField: "title",
 		},
 		{

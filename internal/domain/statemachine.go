@@ -29,11 +29,6 @@ var transitionMap = map[Status]map[Status]bool{
 }
 
 // CanTransition reports whether transitioning from -> to is permitted by the domain state machine.
-//
-// Expected output example:
-//
-//	CanTransition(StatusPending, StatusProcessing) -> true
-//	CanTransition(StatusSent, StatusCancelled)   -> false
 func CanTransition(from, to Status) bool {
 	allowed, ok := transitionMap[from]
 	if !ok {
@@ -44,10 +39,6 @@ func CanTransition(from, to Status) bool {
 
 // AllowedFrom returns all source statuses permitted to transition directly into target status to.
 // The returned slice follows AllStatuses() order so callers and SQL tests observe deterministic output.
-//
-// Expected output example:
-//
-//	AllowedFrom(StatusCancelled) -> []Status{StatusScheduled, StatusPending, StatusRetrying}
 func AllowedFrom(to Status) []Status {
 	var out []Status
 	for _, from := range AllStatuses() {
@@ -59,11 +50,6 @@ func AllowedFrom(to Status) []Status {
 }
 
 // IsCancellable reports whether a notification in status s can be cancelled via the API (FR-1.5).
-//
-// Expected output example:
-//
-//	IsCancellable(StatusRetrying)   -> true
-//	IsCancellable(StatusProcessing) -> false
 func IsCancellable(s Status) bool {
 	return CanTransition(s, StatusCancelled)
 }

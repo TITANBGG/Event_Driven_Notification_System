@@ -64,27 +64,14 @@ type Config struct {
 	LogLevel           string
 }
 
-// Load reads environment variables from the current process and validates all invariants.
-//
-// WHY: Single entrypoint used by cmd/api and cmd/worker main() functions to guarantee identical
-// defaults and fail-fast checks across services.
-//
-// Expected output example:
-//
-//	cfg, err := config.Load() // err == nil with defaults: cfg.RedisPoolSize == 95, cfg.RateLimitPerSec == 100
+// Load reads environment variables from the current process and validates all invariants
+// so services share identical defaults and fail-fast startup bounds.
 func Load() (Config, error) {
 	return LoadFrom(os.LookupEnv)
 }
 
-// LoadFrom parses environment variables using a caller-provided lookup function and validates invariants.
-//
-// WHY: Accepting a pure lookup function makes unit testing all 43 env vars and error branches
-// completely parallel-safe without mutating process-global environment variables via t.Setenv.
-//
-// Expected output example:
-//
-//	cfg, err := config.LoadFrom(func(k string) (string, bool) { return "", false })
-//	// Returns valid defaults with cfg.VisibilityTimeout == 60*time.Second and cfg.RedisPoolSize == 95.
+// LoadFrom parses environment variables using a caller-provided lookup function instead of
+// os.LookupEnv so parallel unit tests never mutate process-global state.
 func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 	var parseErrs []error
 
@@ -226,10 +213,8 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		LogLevel:           strings.ToLower(getStr("LOG_LEVEL", "info")),
 	}
 
-	// Auto-size the Redis connection pool when REDIS_POOL_SIZE=0 so each of the 3 channel worker
-	// pools (sms, email, push) can hold concurrent connections without starving background loops
-	// (delayed mover, reconciler, heartbeat, pub/sub).
-	// Expected output example: WorkerConcurrency=25 -> RedisPoolSize=95 (3*25 + 20).
+	// Auto-size RedisPoolSize (3*concurrency + 20) so all 3 channel worker pools can hold
+	// concurrent connections without starving background loops (mover, reconciler, heartbeat, pub/sub).
 	if cfg.RedisPoolSize == 0 && cfg.WorkerConcurrency > 0 {
 		cfg.RedisPoolSize = 3*cfg.WorkerConcurrency + 20
 	}
@@ -243,15 +228,8 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 	return cfg, nil
 }
 
-// Validate checks cross-field invariants and bounds across the entire Config struct.
-//
-// WHY: Catching invalid bounds (e.g., batch > 1000, non-positive rate limits, or unsafe visibility
-// timeouts) before serving traffic prevents cascading retries and duplicate provider sends.
-//
-// Expected output example:
-//
-//	cfg.VisibilityTimeout = 34 * time.Second; cfg.ProviderTimeout = 10 * time.Second
-//	cfg.Validate() -> error: "VISIBILITY_TIMEOUT (34s) must be >= 2*PROVIDER_TIMEOUT + 15s (35s)"
+// Validate enforces cross-field invariants and bounds at startup to prevent unsafe
+// timeout windows or invalid worker/API limits from entering production traffic.
 func (c Config) Validate() error {
 	var errs []error
 
@@ -324,10 +302,8 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("RETRY_AFTER_MAX (%s) must be >= RETRY_CAP (%s)", c.RetryAfterMax, c.RetryCap))
 	}
 
-	// WHY: VISIBILITY_TIMEOUT must cover at least twice PROVIDER_TIMEOUT plus 15s headroom so a
-	// slow-but-alive worker can complete a provider HTTP call, handle DB fencing/backoff, or drain
-	// gracefully before the reconciler presumes the worker dead and reclaims the row (preventing duplicates).
-	// Expected output example: PROVIDER_TIMEOUT=10s requires VISIBILITY_TIMEOUT >= 35s (default 60s passes).
+	// VISIBILITY_TIMEOUT must cover >= 2*PROVIDER_TIMEOUT + 15s headroom so slow-but-alive
+	// workers can finish HTTP sends and fenced updates before the reconciler reclaims the row.
 	minVisibility := 2*c.ProviderTimeout + 15*time.Second
 	if c.VisibilityTimeout < minVisibility {
 		errs = append(errs, fmt.Errorf(

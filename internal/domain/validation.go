@@ -89,10 +89,10 @@ func validateSMS(prefix string, in CreateNotificationInput, recipientBlank, cont
 	if !recipientBlank && !e164Pattern.MatchString(in.Recipient) {
 		ve.Add(joinField(prefix, "recipient"), "invalid_e164", `must match ^\+[1-9]\d{7,14}$`)
 	}
-	if in.Subject != nil && *in.Subject != "" {
+	if in.Subject != nil {
 		ve.Add(joinField(prefix, "subject"), "unsupported_field", "subject is only supported for email channel")
 	}
-	if in.Title != nil && *in.Title != "" {
+	if in.Title != nil {
 		ve.Add(joinField(prefix, "title"), "unsupported_field", "title is only supported for push channel")
 	}
 	if !contentEmpty {
@@ -120,7 +120,7 @@ func validateEmail(prefix string, in CreateNotificationInput, recipientBlank boo
 		}
 	}
 
-	if in.Title != nil && *in.Title != "" {
+	if in.Title != nil {
 		ve.Add(joinField(prefix, "title"), "unsupported_field", "title is only supported for push channel")
 	}
 
@@ -147,7 +147,7 @@ func validatePush(prefix string, in CreateNotificationInput, recipientBlank bool
 		}
 	}
 
-	if in.Subject != nil && *in.Subject != "" {
+	if in.Subject != nil {
 		ve.Add(joinField(prefix, "subject"), "unsupported_field", "subject is only supported for email channel")
 	}
 

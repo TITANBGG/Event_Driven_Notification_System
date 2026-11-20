@@ -25,10 +25,6 @@ const (
 )
 
 // SMSSegmentInfo reports the encoding, character/code-unit count, and segment count of an SMS body.
-//
-// Expected output example:
-//
-//	SMSInfo("Şifreniz: 1234") -> SMSSegmentInfo{Encoding: "UCS-2", Units: 14, Segments: 1}
 type SMSSegmentInfo struct {
 	Encoding SMSEncoding `json:"encoding"`
 	Units    int         `json:"units"`
@@ -63,12 +59,6 @@ var gsm7Extension = map[rune]struct{}{
 
 // SMSInfo calculates GSM-7 vs UCS-2 encoding, unit count (septets or UTF-16 code units),
 // and exact segment count without ever splitting a GSM-7 ESC pair or UTF-16 surrogate pair.
-//
-// Expected output example:
-//
-//	SMSInfo(strings.Repeat("a", 160))      -> {Encoding: "GSM-7", Units: 160, Segments: 1}
-//	SMSInfo(strings.Repeat("a", 159)+"€")  -> {Encoding: "GSM-7", Units: 161, Segments: 2}
-//	SMSInfo(strings.Repeat("a", 69)+"😀")  -> {Encoding: "UCS-2", Units: 71, Segments: 2}
 func SMSInfo(content string) SMSSegmentInfo {
 	if content == "" {
 		return SMSSegmentInfo{

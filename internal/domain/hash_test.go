@@ -105,4 +105,21 @@ func TestRequestHashScheduledAtTimezoneAndBatchDefaults(t *testing.T) {
 	hb2, err := domain.RequestHash(b2)
 	require.NoError(t, err)
 	assert.Equal(t, hb1, hb2)
+
+	// Blank optional subject/title normalizes to nil so empty string and omitted field hash identically.
+	emptySubj := "   "
+	hEmailOmitted, err := domain.RequestHash(domain.CreateNotificationInput{
+		Recipient: "ali@example.com",
+		Channel:   "email",
+		Content:   "hello",
+	})
+	require.NoError(t, err)
+	hEmailEmptySubj, err := domain.RequestHash(domain.CreateNotificationInput{
+		Recipient: "ali@example.com",
+		Channel:   "email",
+		Content:   "hello",
+		Subject:   &emptySubj,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, hEmailOmitted, hEmailEmptySubj)
 }
