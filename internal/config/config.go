@@ -56,6 +56,7 @@ type Config struct {
 	BatchMaxItems      int
 	PageLimitDefault   int
 	PageLimitMax       int
+	MaxWSClients       int
 	IdempotencyTTL     time.Duration
 	ScheduleMaxAhead   time.Duration
 	CORSAllowedOrigins []string
@@ -205,6 +206,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		BatchMaxItems:      getInt("BATCH_MAX_ITEMS", 1000),
 		PageLimitDefault:   getInt("PAGE_LIMIT_DEFAULT", 50),
 		PageLimitMax:       getInt("PAGE_LIMIT_MAX", 200),
+		MaxWSClients:       getInt("MAX_WS_CLIENTS", 1000),
 		IdempotencyTTL:     getDuration("IDEMPOTENCY_TTL", 24*time.Hour),
 		ScheduleMaxAhead:   getDuration("SCHEDULE_MAX_AHEAD", 720*time.Hour),
 		CORSAllowedOrigins: parseCSV(getStrAllowEmpty("CORS_ALLOWED_ORIGINS", "http://localhost:8081")),
@@ -281,6 +283,9 @@ func (c Config) Validate() error {
 	}
 	if c.PageLimitMax < c.PageLimitDefault {
 		errs = append(errs, fmt.Errorf("PAGE_LIMIT_MAX (%d) must be >= PAGE_LIMIT_DEFAULT (%d)", c.PageLimitMax, c.PageLimitDefault))
+	}
+	if c.MaxWSClients < 1 {
+		errs = append(errs, fmt.Errorf("MAX_WS_CLIENTS (%d) must be >= 1", c.MaxWSClients))
 	}
 
 	if c.ProviderTimeout <= 0 {

@@ -20,6 +20,7 @@ import (
 	"github.com/TITANBGG/notification-system/internal/provider"
 	"github.com/TITANBGG/notification-system/internal/queue"
 	"github.com/TITANBGG/notification-system/internal/ratelimit"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 	"github.com/TITANBGG/notification-system/internal/repository"
 	"github.com/TITANBGG/notification-system/internal/worker"
 )
@@ -161,6 +162,7 @@ func run() error {
 		RetryPolicy: retryPolicy,
 		Breaker:     breaker,
 		Reconciler:  reconciler,
+		Publisher:   realtime.NewRedisPublisher(rdb),
 		Hooks:       hooks,
 	})
 	if err != nil {

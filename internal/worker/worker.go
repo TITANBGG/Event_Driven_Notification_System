@@ -18,6 +18,7 @@ import (
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/provider"
 	"github.com/TITANBGG/notification-system/internal/queue"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 )
 
 const (
@@ -41,6 +42,7 @@ type Deps struct {
 	RetryPolicy RetryPolicy
 	Breaker     Breaker
 	Reconciler  Reconciler
+	Publisher   realtime.Publisher
 	Hooks       Hooks
 	Now         func() time.Time
 	Jitter      func(maxJitter time.Duration) time.Duration
@@ -57,6 +59,7 @@ type Worker struct {
 	retryPolicy RetryPolicy
 	breaker     Breaker
 	reconciler  Reconciler
+	publisher   realtime.Publisher
 	hooks       Hooks
 	nowFn       func() time.Time
 	jitterFn    func(maxJitter time.Duration) time.Duration
@@ -94,6 +97,10 @@ func New(deps Deps) (*Worker, error) {
 	if breaker == nil {
 		breaker = NoopBreaker{}
 	}
+	publisher := deps.Publisher
+	if publisher == nil {
+		publisher = realtime.NoopPublisher{}
+	}
 	nowFn := deps.Now
 	if nowFn == nil {
 		nowFn = func() time.Time { return time.Now().UTC() }
@@ -124,6 +131,7 @@ func New(deps Deps) (*Worker, error) {
 		retryPolicy: retryPolicy,
 		breaker:     breaker,
 		reconciler:  deps.Reconciler,
+		publisher:   publisher,
 		hooks:       deps.Hooks,
 		nowFn:       nowFn,
 		jitterFn:    jitterFn,
@@ -299,6 +307,8 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 		return
 	}
 
+	w.publishEvent(itemDrainCtx, itemLogger, *n, meta.CorrelationID)
+
 	attemptLogger := itemLogger.With(
 		slog.Int("attempt", n.Attempts),
 		slog.String("recipient", observability.MaskRecipient(ch.String(), n.Recipient)),
@@ -343,13 +353,15 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 
 	switch res.Outcome {
 	case provider.OutcomeSent:
-		if _, err := w.store.MarkSent(itemDrainCtx, n.ID, n.Attempts, res.ProviderMessageID); err != nil {
+		sentRow, err := w.store.MarkSent(itemDrainCtx, n.ID, n.Attempts, res.ProviderMessageID)
+		if err != nil {
 			w.handleFencedError(itemDrainCtx, attemptLogger, n.ID, "MarkSent", err)
 			return
 		}
 		if ackErr := w.queue.Ack(itemDrainCtx, w.cfg.WorkerID, n.ID); ackErr != nil {
 			attemptLogger.Warn("failed acking sent notification", slog.String("error", ackErr.Error()))
 		}
+		w.publishEvent(itemDrainCtx, attemptLogger, *sentRow, meta.CorrelationID)
 		if w.hooks.OnEndToEndLatency != nil && !n.CreatedAt.IsZero() {
 			w.hooks.OnEndToEndLatency(ch, max(w.nowFn().Sub(n.CreatedAt), 0))
 		}
@@ -373,6 +385,7 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 			"permanent_failure",
 			domain.OutcomePermanent,
 			durationMS,
+			meta.CorrelationID,
 		)
 	}
 }
@@ -410,6 +423,7 @@ func (w *Worker) handleCircuitOpen(
 			"circuit_open_exhausted",
 			domain.OutcomeCircuitOpen,
 			0,
+			meta.CorrelationID,
 		)
 		return
 	}
@@ -423,6 +437,7 @@ func (w *Worker) handleCircuitOpen(
 	if schedErr := w.queue.Schedule(drainCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
 		logger.Warn("failed scheduling circuit-open deferral", slog.String("error", schedErr.Error()))
 	}
+	w.publishEvent(drainCtx, logger, *updated, meta.CorrelationID)
 	logger.Warn("notification deferred while circuit breaker is open",
 		slog.String("outcome", domain.OutcomeCircuitOpen.String()),
 		slog.Int("duration_ms", 0),
@@ -453,6 +468,7 @@ func (w *Worker) handleTransientOutcome(
 		if schedErr := w.queue.Schedule(drainCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
 			logger.Warn("failed scheduling notification retry", slog.String("error", schedErr.Error()))
 		}
+		w.publishEvent(drainCtx, logger, *updated, meta.CorrelationID)
 		w.emitProcessed(ch, domain.StatusRetrying)
 		if w.hooks.OnRetryScheduled != nil {
 			w.hooks.OnRetryScheduled(ch)
@@ -477,6 +493,7 @@ func (w *Worker) handleTransientOutcome(
 		"max_attempts_exhausted",
 		domain.OutcomeTransient,
 		durationMS,
+		meta.CorrelationID,
 	)
 }
 
@@ -490,14 +507,17 @@ func (w *Worker) failNotification(
 	reason string,
 	outcome domain.AttemptOutcome,
 	durationMS int,
+	correlationID string,
 ) {
-	if _, err := w.store.MarkFailed(drainCtx, id, claimedAttempts, lastError); err != nil {
+	failedRow, err := w.store.MarkFailed(drainCtx, id, claimedAttempts, lastError)
+	if err != nil {
 		w.handleFencedError(drainCtx, logger, id, "MarkFailed", err)
 		return
 	}
 	if dlqErr := w.queue.DeadLetter(drainCtx, w.cfg.WorkerID, id); dlqErr != nil {
 		logger.Warn("failed deadlettering failed notification", slog.String("error", dlqErr.Error()))
 	}
+	w.publishEvent(drainCtx, logger, *failedRow, correlationID)
 	w.emitProcessed(ch, domain.StatusFailed)
 	logger.Warn("notification failed permanently",
 		slog.String("outcome", outcome.String()),
@@ -505,6 +525,15 @@ func (w *Worker) failNotification(
 		slog.String("reason", reason),
 		slog.String("error", lastError),
 	)
+}
+
+func (w *Worker) publishEvent(ctx context.Context, logger *slog.Logger, n domain.Notification, correlationID string) {
+	if w.publisher == nil {
+		return
+	}
+	if err := w.publisher.Publish(ctx, realtime.NewEvent(n, w.nowFn(), correlationID)); err != nil {
+		logger.Warn("failed publishing realtime status event", slog.String("error", err.Error()))
+	}
 }
 
 func (w *Worker) handleFencedError(ctx context.Context, logger *slog.Logger, id uuid.UUID, op string, err error) {
