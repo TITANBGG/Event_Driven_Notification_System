@@ -1,10 +1,29 @@
 openapi: 3.0.3
 info:
   title: Event-Driven Notification System API
-  version: 0.3.0
+  version: 1.0.0
   description: |
-    Scalable multi-channel event-driven notification management and delivery service (SMS, Email, Push).
-    PostgreSQL is the authoritative system of record; Redis provides prioritized asynchronous dispatch queues.
+    Multi-channel (SMS, email, push) notification API. Requests are validated and persisted in PostgreSQL
+    (the source of truth), then queued in Redis for asynchronous delivery by stateless workers
+    (max 100 sends/s per channel, weighted high/normal/low priority, retries with full-jitter backoff,
+    per-channel circuit breaker, dead-letter queue and manual retry).
+
+    **Conventions**
+    - JSON uses camelCase; timestamps are RFC3339 UTC; IDs are UUIDv7. Unknown JSON fields are rejected (`400`).
+    - `X-Correlation-ID` is accepted on every request (or generated) and echoed in the response header and in
+      every error body. A W3C `traceparent` header continues the caller's trace through API, queue, worker and provider.
+    - `Idempotency-Key` on `POST /api/v1/notifications` and `POST /api/v1/notifications/batch`: the same key with
+      the same canonical body replays the original `202` response with `Idempotent-Replayed: true`; the same key with a
+      different body returns `409 idempotency_conflict`. Keys expire after 24h.
+    - Delivery is at-least-once. The provider receives `Idempotency-Key: <notification id>` on every attempt so it can
+      deduplicate retries.
+
+    **Error codes** (`error.code` in the common `ErrorResponse` envelope): `malformed_json`, `unsupported_media_type`,
+    `payload_too_large`, `validation_failed`, `batch_too_large`, `invalid_uuid`, `invalid_cursor`, `not_found`,
+    `idempotency_conflict`, `item_idempotency_key_exists`, `not_cancellable`, `not_retryable`, `template_name_exists`,
+    `missing_ws_filter`, `too_many_ws_clients`, `method_not_allowed`, `request_timeout`, `service_unavailable`,
+    `internal_error`. Field-level problems are listed in `error.details[]` with dot/bracket paths such as
+    `notifications[3].recipient`.
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -44,8 +63,6 @@ paths:
                 $ref: "#/components/schemas/LiveStatus"
               example:
                 status: ok
-        "400":
-          $ref: "#/components/responses/MalformedJSON"
 
   /openapi.yaml:
     get:
@@ -63,8 +80,6 @@ paths:
             application/yaml:
               schema:
                 type: string
-        "400":
-          $ref: "#/components/responses/MalformedJSON"
 
   /demo:
     get:
@@ -79,8 +94,6 @@ paths:
             text/html:
               schema:
                 type: string
-        "400":
-          $ref: "#/components/responses/MalformedJSON"
 
   /api/v1/notifications:
     post:
@@ -143,6 +156,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/NotificationResponse"
+              example:
+                id: 01a1faed-d97c-7d59-b513-70207b434dda
+                batchId: null
+                recipient: "+905551234567"
+                channel: sms
+                priority: high
+                status: pending
+                content: "Siparişiniz kargoya verildi"
+                attempts: 0
+                maxAttempts: 5
+                scheduledAt: null
+                nextAttemptAt: null
+                providerMessageId: null
+                lastError: null
+                createdAt: "2026-11-20T21:47:34.141017Z"
+                updatedAt: "2026-11-20T21:47:34.141017Z"
+                sentAt: null
+                failedAt: null
+                cancelledAt: null
         "400":
           $ref: "#/components/responses/MalformedJSON"
         "409":
@@ -239,17 +271,37 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/BatchCreateRequest"
-            example:
-              notifications:
-                - recipient: "+905551234567"
-                  channel: sms
-                  content: "Kampanya kodunuz: INSIDER20"
-                  priority: high
-                  idempotencyKey: batch-item-1
-                - recipient: "user@example.com"
-                  channel: email
-                  subject: "Weekly Digest"
-                  content: "Hello from Insider One"
+            examples:
+              mixedChannels:
+                summary: SMS + email + push in one all-or-nothing batch
+                value:
+                  notifications:
+                    - recipient: "+905551234501"
+                      channel: sms
+                      priority: high
+                      content: "Flaş indirim başladı!"
+                      idempotencyKey: flash-sale-sms-1
+                    - recipient: "user@example.com"
+                      channel: email
+                      subject: "Flash sale"
+                      content: "50% off today."
+                    - recipient: "fcm-device-token-12345"
+                      channel: push
+                      priority: low
+                      title: "Sale"
+                      content: "Tap to view."
+              templateBatch:
+                summary: Personalized SMS rendered from a template at creation time
+                value:
+                  notifications:
+                    - recipient: "+905551230001"
+                      channel: sms
+                      templateId: 01a1faed-ed53-7075-b03f-819061f52f93
+                      templateVariables: {name: "Ayşe", code: "4821"}
+                    - recipient: "+905551230002"
+                      channel: sms
+                      templateId: 01a1faed-ed53-7075-b03f-819061f52f93
+                      templateVariables: {name: "Mehmet", code: "9037"}
       responses:
         "202":
           description: Batch persisted atomically and queued for delivery
@@ -262,6 +314,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BatchCreateResponse"
+              example:
+                batchId: 01a1faec-a20c-7096-8bf9-575c7d4cea60
+                count: 3
+                notificationIds:
+                  - 01a1faec-a20c-70b2-ad01-4dde0bb40b1a
+                  - 01a1faec-a20c-70b5-af63-e4cd1d0c725b
+                  - 01a1faec-a20c-70b7-a12c-4876d3d4015f
         "400":
           $ref: "#/components/responses/MalformedJSON"
         "409":
@@ -665,21 +724,40 @@ paths:
             enum: [sms, email, push]
       responses:
         "101":
-          description: Switching Protocols to WebSocket stream (sends `WSSnapshotMessage` followed by `RealtimeStatusEvent` JSON frames)
-        "200":
-          description: WebSocket frame payload schema reference (`WSSnapshotMessage` initial snapshot followed by `RealtimeStatusEvent` frames)
+          description: |
+            Switching Protocols. OpenAPI 3.0 cannot describe WebSocket frames natively, so the content below documents
+            the JSON payload of each text frame sent after the upgrade: one `WSSnapshotMessage` (for `notificationId` /
+            `batchId` filters) followed by `RealtimeStatusEvent` frames. The server never reads client frames.
           content:
             application/json:
               schema:
                 oneOf:
                   - $ref: "#/components/schemas/WSSnapshotMessage"
                   - $ref: "#/components/schemas/RealtimeStatusEvent"
+              examples:
+                event:
+                  summary: Live status event
+                  value:
+                    type: event
+                    notificationId: 01a1faec-a20c-70b2-ad01-4dde0bb40b1a
+                    batchId: 01a1faec-a20c-7096-8bf9-575c7d4cea60
+                    channel: sms
+                    status: sent
+                    attempt: 1
+                    error: null
+                    occurredAt: "2026-11-20T21:46:14.449266Z"
+                    correlationId: corr-order-42
         "400":
           description: Missing filter query parameter or invalid UUID/channel before WebSocket upgrade
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: missing_ws_filter
+                  message: at least one filter query parameter (notificationId, batchId, or channel) is required
+                correlationId: 01a1faec-fa8d-7807-bd64-5e7e9125458f
         "503":
           description: Maximum concurrent WebSocket clients (`MAX_WS_CLIENTS`) exceeded
           content:
@@ -700,14 +778,17 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadyStatus"
-        "400":
-          $ref: "#/components/responses/MalformedJSON"
         "503":
           description: One or more dependencies unavailable
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadyStatus"
+              example:
+                status: degraded
+                checks:
+                  postgres: {status: down, latencyMs: 1000}
+                  redis: {status: ok, latencyMs: 0}
 
   /health/ready:
     get:
@@ -727,14 +808,17 @@ paths:
                 checks:
                   postgres: {status: ok, latencyMs: 2}
                   redis: {status: ok, latencyMs: 1}
-        "400":
-          $ref: "#/components/responses/MalformedJSON"
         "503":
           description: One or more dependencies unavailable
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadyStatus"
+              example:
+                status: degraded
+                checks:
+                  postgres: {status: down, latencyMs: 1000}
+                  redis: {status: ok, latencyMs: 0}
 
   /metrics:
     get:
@@ -749,8 +833,6 @@ paths:
             text/plain:
               schema:
                 type: string
-        "400":
-          $ref: "#/components/responses/MalformedJSON"
 
   /api/v1/metrics:
     get:
@@ -770,8 +852,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/MetricsSnapshot"
-        "400":
-          $ref: "#/components/responses/MalformedJSON"
         "500":
           $ref: "#/components/responses/InternalError"
         "503":
@@ -1396,42 +1476,89 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: malformed_json
+              message: 'malformed JSON request: json: unknown field "foo"'
+            correlationId: 01a1faec-0000-7000-8000-000000000010
     InvalidUUID:
       description: Invalid UUID path parameter
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: invalid_uuid
+              message: parameter "id" must be a valid UUID
+            correlationId: 01a1faec-0000-7000-8000-000000000011
     BadCursor:
       description: Malformed pagination cursor
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: invalid_cursor
+              message: cursor parameter is malformed
+            correlationId: 01a1faec-a0d0-7993-b4bd-4e236b3a2eed
     NotFound:
       description: Requested resource not found
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: not_found
+              message: requested resource was not found
+            correlationId: 01a1faec-ac45-769e-b6f1-761ec94e1de6
     IdempotencyConflict:
       description: Idempotency-Key reused with a different request payload
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: idempotency_conflict
+              message: idempotency key was previously used with a different request payload
+            correlationId: 01a1faec-9775-77b4-af95-af453cad98f1
     BatchConflict:
       description: Batch Idempotency-Key conflict or item idempotencyKey already exists
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            batchKeyReusedWithDifferentBody:
+              value:
+                error:
+                  code: idempotency_conflict
+                  message: idempotency key was previously used with a different request payload
+                correlationId: 01a1faec-0000-7000-8000-000000000012
+            itemKeyExists:
+              value:
+                error:
+                  code: item_idempotency_key_exists
+                  message: one or more batch item idempotency keys already exist
+                  details:
+                    - field: notifications[0].idempotencyKey
+                      code: item_idempotency_key_exists
+                      message: already exists for notification 01a1faec-a20c-70b2-ad01-4dde0bb40b1a
+                correlationId: 01a1faec-0000-7000-8000-000000000013
     TemplateNameConflict:
       description: An active template with the same name already exists
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: template_name_exists
+              message: an active template named "otp_sms_tr" already exists
+            correlationId: 01a1faec-0000-7000-8000-000000000014
     NotCancellable:
       description: Notification is not in a cancellable status
       content:
@@ -1446,25 +1573,44 @@ components:
                 - field: status
                   code: current_status
                   message: sent
-            correlationId: 01936f7e-0000-7000-8000-000000000001
+            correlationId: 01a1faec-a1c8-7174-a96f-f47c5075e384
     NotRetryable:
       description: Only failed notifications can be manually retried
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: not_retryable
+              message: notification cannot be retried in status "sent"
+              details:
+                - field: status
+                  code: current_status
+                  message: sent
+            correlationId: 01a1faec-f270-7663-a203-1c4172472540
     PayloadTooLarge:
       description: Request body exceeds configured size limit
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: payload_too_large
+              message: request body exceeds limit of 16777216 bytes; split batch into smaller requests
+            correlationId: 01a1faec-0000-7000-8000-000000000015
     UnsupportedMediaType:
       description: Request Content-Type must be application/json
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: unsupported_media_type
+              message: Content-Type must be application/json
+            correlationId: 01a1faec-0000-7000-8000-000000000016
     ValidationFailed:
       description: One or more validation rules failed
       content:
@@ -1474,24 +1620,37 @@ components:
           example:
             error:
               code: validation_failed
-              message: request has 2 invalid fields
+              message: request has 3 invalid fields
               details:
+                - field: content
+                  code: required
+                  message: content is required
                 - field: recipient
                   code: invalid_e164
                   message: 'must match ^\+[1-9]\d{7,14}$'
-                - field: content
-                  code: too_many_segments
-                  message: 12 segments (UCS-2), max 10
-            correlationId: 01936f7e-0000-7000-8000-000000000002
+                - field: subject
+                  code: unsupported_field
+                  message: subject is only supported for email channel
+            correlationId: 01a1faec-9799-75e7-a04f-b2bb01eae96c
     InternalError:
       description: Internal server error
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: internal_error
+              message: internal server error
+            correlationId: 01a1faec-0000-7000-8000-000000000017
     ServiceUnavailable:
       description: PostgreSQL is temporarily unavailable
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: service_unavailable
+              message: database temporarily unavailable
+            correlationId: 01a1faec-0000-7000-8000-000000000018

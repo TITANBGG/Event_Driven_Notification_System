@@ -1,0 +1,15 @@
+# Intentional exceptions to Redocly's recommended rules (reviewed, not blanket-disabled):
+# - operation-4xx-response: health probes, /metrics, /openapi.yaml and /demo take no input, so they have no
+#   4xx response to document; inventing one would make the contract less accurate.
+# - operation-2xx-response: /api/v1/ws answers 101 Switching Protocols, never 2xx.
+api/openapi.yaml:
+  operation-4xx-response:
+    - '#/paths/~1health~1live/get/responses'
+    - '#/paths/~1openapi.yaml/get/responses'
+    - '#/paths/~1demo/get/responses'
+    - '#/paths/~1health/get/responses'
+    - '#/paths/~1health~1ready/get/responses'
+    - '#/paths/~1metrics/get/responses'
+    - '#/paths/~1api~1v1~1metrics/get/responses'
+  operation-2xx-response:
+    - '#/paths/~1api~1v1~1ws/get/responses'
