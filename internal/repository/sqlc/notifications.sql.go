@@ -7,9 +7,9 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const cancel = `-- name: Cancel :one
@@ -75,6 +75,7 @@ type ClaimParams struct {
 	SkewSecs float64   `json:"skew_secs"`
 }
 
+// Skew tolerance bridges minor clock drift between the worker delayed-mover and PostgreSQL now().
 func (q *Queries) Claim(ctx context.Context, arg ClaimParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, claim, arg.ID, arg.SkewSecs)
 	var i Notification
@@ -109,20 +110,20 @@ func (q *Queries) Claim(ctx context.Context, arg ClaimParams) (Notification, err
 }
 
 type CopyNotificationsParams struct {
-	ID             uuid.UUID          `json:"id"`
-	BatchID        *uuid.UUID         `json:"batch_id"`
-	Channel        string             `json:"channel"`
-	Priority       string             `json:"priority"`
-	Status         string             `json:"status"`
-	Recipient      string             `json:"recipient"`
-	Subject        *string            `json:"subject"`
-	Title          *string            `json:"title"`
-	Content        string             `json:"content"`
-	IdempotencyKey *string            `json:"idempotency_key"`
-	MaxAttempts    int32              `json:"max_attempts"`
-	ScheduledAt    pgtype.Timestamptz `json:"scheduled_at"`
-	CorrelationID  *string            `json:"correlation_id"`
-	Traceparent    *string            `json:"traceparent"`
+	ID             uuid.UUID  `json:"id"`
+	BatchID        *uuid.UUID `json:"batch_id"`
+	Channel        string     `json:"channel"`
+	Priority       string     `json:"priority"`
+	Status         string     `json:"status"`
+	Recipient      string     `json:"recipient"`
+	Subject        *string    `json:"subject"`
+	Title          *string    `json:"title"`
+	Content        string     `json:"content"`
+	IdempotencyKey *string    `json:"idempotency_key"`
+	MaxAttempts    int32      `json:"max_attempts"`
+	ScheduledAt    *time.Time `json:"scheduled_at"`
+	CorrelationID  *string    `json:"correlation_id"`
+	Traceparent    *string    `json:"traceparent"`
 }
 
 const deferCircuitOpen = `-- name: DeferCircuitOpen :one
@@ -140,12 +141,13 @@ RETURNING id, batch_id, channel, priority, status, recipient, subject, title, co
 `
 
 type DeferCircuitOpenParams struct {
-	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
-	LastError       *string            `json:"last_error"`
-	ID              uuid.UUID          `json:"id"`
-	ClaimedAttempts int32              `json:"claimed_attempts"`
+	NextAttemptAt   *time.Time `json:"next_attempt_at"`
+	LastError       *string    `json:"last_error"`
+	ID              uuid.UUID  `json:"id"`
+	ClaimedAttempts int32      `json:"claimed_attempts"`
 }
 
+// Circuit-open deferrals roll back the claim increment so breaker outages never exhaust retry budgets.
 func (q *Queries) DeferCircuitOpen(ctx context.Context, arg DeferCircuitOpenParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, deferCircuitOpen,
 		arg.NextAttemptAt,
@@ -468,7 +470,6 @@ func (q *Queries) GetNotification(ctx context.Context, id uuid.UUID) (Notificati
 }
 
 const insertNotification = `-- name: InsertNotification :one
-
 INSERT INTO notifications (
   id, batch_id, channel, priority, status, recipient, subject, title, content,
   idempotency_key, max_attempts, scheduled_at, correlation_id, traceparent
@@ -480,30 +481,22 @@ RETURNING id, batch_id, channel, priority, status, recipient, subject, title, co
 `
 
 type InsertNotificationParams struct {
-	ID             uuid.UUID          `json:"id"`
-	BatchID        *uuid.UUID         `json:"batch_id"`
-	Channel        string             `json:"channel"`
-	Priority       string             `json:"priority"`
-	Status         string             `json:"status"`
-	Recipient      string             `json:"recipient"`
-	Subject        *string            `json:"subject"`
-	Title          *string            `json:"title"`
-	Content        string             `json:"content"`
-	IdempotencyKey *string            `json:"idempotency_key"`
-	MaxAttempts    int32              `json:"max_attempts"`
-	ScheduledAt    pgtype.Timestamptz `json:"scheduled_at"`
-	CorrelationID  *string            `json:"correlation_id"`
-	Traceparent    *string            `json:"traceparent"`
+	ID             uuid.UUID  `json:"id"`
+	BatchID        *uuid.UUID `json:"batch_id"`
+	Channel        string     `json:"channel"`
+	Priority       string     `json:"priority"`
+	Status         string     `json:"status"`
+	Recipient      string     `json:"recipient"`
+	Subject        *string    `json:"subject"`
+	Title          *string    `json:"title"`
+	Content        string     `json:"content"`
+	IdempotencyKey *string    `json:"idempotency_key"`
+	MaxAttempts    int32      `json:"max_attempts"`
+	ScheduledAt    *time.Time `json:"scheduled_at"`
+	CorrelationID  *string    `json:"correlation_id"`
+	Traceparent    *string    `json:"traceparent"`
 }
 
-// WHAT: Notification CRUD, keyset filtering, atomic worker Claim, fenced state transitions, and reconciler scans.
-// WHY: Every transition enforces allowed_from status guards directly in SQL and uses fencing
-//
-//	(status='processing' AND attempts=$claimed_attempts) so slow workers never overwrite reclaimed rows.
-//
-// EXPECTED OUTPUT EXAMPLE:
-//
-//	Claim(id, 2.0) -> returns notification with status='processing', attempts=1 (or pgx.ErrNoRows if cancelled/not due).
 func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotificationParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, insertNotification,
 		arg.ID,
@@ -569,14 +562,14 @@ LIMIT $8::int
 `
 
 type ListNotificationsParams struct {
-	Statuses        []string           `json:"statuses"`
-	Channel         *string            `json:"channel"`
-	Priority        *string            `json:"priority"`
-	FromTime        pgtype.Timestamptz `json:"from_time"`
-	ToTime          pgtype.Timestamptz `json:"to_time"`
-	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        *uuid.UUID         `json:"cursor_id"`
-	PageLimit       int32              `json:"page_limit"`
+	Statuses        []string   `json:"statuses"`
+	Channel         *string    `json:"channel"`
+	Priority        *string    `json:"priority"`
+	FromTime        *time.Time `json:"from_time"`
+	ToTime          *time.Time `json:"to_time"`
+	CursorCreatedAt *time.Time `json:"cursor_created_at"`
+	CursorID        *uuid.UUID `json:"cursor_id"`
+	PageLimit       int32      `json:"page_limit"`
 }
 
 func (q *Queries) ListNotifications(ctx context.Context, arg ListNotificationsParams) ([]Notification, error) {
@@ -751,6 +744,7 @@ type MarkSentParams struct {
 	ClaimedAttempts   int32     `json:"claimed_attempts"`
 }
 
+// Fenced on status='processing' AND attempts=$claimed_attempts so slow workers cannot overwrite reclaimed rows.
 func (q *Queries) MarkSent(ctx context.Context, arg MarkSentParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, markSent, arg.ProviderMessageID, arg.ID, arg.ClaimedAttempts)
 	var i Notification
@@ -846,10 +840,10 @@ RETURNING id, batch_id, channel, priority, status, recipient, subject, title, co
 `
 
 type ScheduleRetryParams struct {
-	NextAttemptAt   pgtype.Timestamptz `json:"next_attempt_at"`
-	LastError       *string            `json:"last_error"`
-	ID              uuid.UUID          `json:"id"`
-	ClaimedAttempts int32              `json:"claimed_attempts"`
+	NextAttemptAt   *time.Time `json:"next_attempt_at"`
+	LastError       *string    `json:"last_error"`
+	ID              uuid.UUID  `json:"id"`
+	ClaimedAttempts int32      `json:"claimed_attempts"`
 }
 
 func (q *Queries) ScheduleRetry(ctx context.Context, arg ScheduleRetryParams) (Notification, error) {

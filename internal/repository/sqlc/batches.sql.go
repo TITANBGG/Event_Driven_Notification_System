@@ -7,9 +7,9 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const cancelBatch = `-- name: CancelBatch :many
@@ -22,6 +22,7 @@ WHERE batch_id = $1
 RETURNING id
 `
 
+// Returning cancelled IDs lets callers clean up optional Redis delayed entries without extra queries.
 func (q *Queries) CancelBatch(ctx context.Context, batchID *uuid.UUID) ([]uuid.UUID, error) {
 	rows, err := q.db.Query(ctx, cancelBatch, batchID)
 	if err != nil {
@@ -93,7 +94,6 @@ func (q *Queries) GetBatchSummary(ctx context.Context, batchID *uuid.UUID) ([]Ge
 }
 
 const insertBatch = `-- name: InsertBatch :one
-
 INSERT INTO batches (id, total, correlation_id)
 VALUES ($1, $2, $3)
 RETURNING id, total, correlation_id, created_at
@@ -105,14 +105,6 @@ type InsertBatchParams struct {
 	CorrelationID *string   `json:"correlation_id"`
 }
 
-// WHAT: Batch management SQL queries for creation, summary aggregation, keyset listing, and cancellation.
-// WHY: Computing batch counts via GROUP BY status and cancelling items in a single atomic UPDATE
-//
-//	avoids N+1 queries and prevents cancel-vs-worker races across up to 1000 items.
-//
-// EXPECTED OUTPUT EXAMPLE:
-//
-//	GetBatchSummary($batchID) -> rows: [{status: "pending", count: 10}, {status: "sent", count: 990}]
 func (q *Queries) InsertBatch(ctx context.Context, arg InsertBatchParams) (Batch, error) {
 	row := q.db.QueryRow(ctx, insertBatch, arg.ID, arg.Total, arg.CorrelationID)
 	var i Batch
@@ -138,10 +130,10 @@ LIMIT $4::int
 `
 
 type ListBatchItemsParams struct {
-	BatchID         uuid.UUID          `json:"batch_id"`
-	CursorCreatedAt pgtype.Timestamptz `json:"cursor_created_at"`
-	CursorID        *uuid.UUID         `json:"cursor_id"`
-	PageLimit       int32              `json:"page_limit"`
+	BatchID         uuid.UUID  `json:"batch_id"`
+	CursorCreatedAt *time.Time `json:"cursor_created_at"`
+	CursorID        *uuid.UUID `json:"cursor_id"`
+	PageLimit       int32      `json:"page_limit"`
 }
 
 func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) ([]Notification, error) {

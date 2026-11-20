@@ -7,13 +7,12 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const insertAttempt = `-- name: InsertAttempt :one
-
 INSERT INTO delivery_attempts (
   notification_id, attempt_no, counted, started_at, duration_ms,
   http_status, outcome, error, provider_message_id, worker_id
@@ -25,26 +24,18 @@ RETURNING id, notification_id, attempt_no, counted, started_at, duration_ms, htt
 `
 
 type InsertAttemptParams struct {
-	NotificationID    uuid.UUID          `json:"notification_id"`
-	AttemptNo         int32              `json:"attempt_no"`
-	Counted           bool               `json:"counted"`
-	StartedAt         pgtype.Timestamptz `json:"started_at"`
-	DurationMs        int32              `json:"duration_ms"`
-	HttpStatus        *int32             `json:"http_status"`
-	Outcome           string             `json:"outcome"`
-	Error             *string            `json:"error"`
-	ProviderMessageID *string            `json:"provider_message_id"`
-	WorkerID          *string            `json:"worker_id"`
+	NotificationID    uuid.UUID `json:"notification_id"`
+	AttemptNo         int32     `json:"attempt_no"`
+	Counted           bool      `json:"counted"`
+	StartedAt         time.Time `json:"started_at"`
+	DurationMs        int32     `json:"duration_ms"`
+	HttpStatus        *int32    `json:"http_status"`
+	Outcome           string    `json:"outcome"`
+	Error             *string   `json:"error"`
+	ProviderMessageID *string   `json:"provider_message_id"`
+	WorkerID          *string   `json:"worker_id"`
 }
 
-// WHAT: Audit log queries recording every delivery attempt, circuit deferral, and visibility abandonment.
-// WHY: Separating delivery_attempts from notifications preserves full retry history (HTTP status,
-//
-//	duration, worker ID, error) even after manual replay resets attempts=0.
-//
-// EXPECTED OUTPUT EXAMPLE:
-//
-//	ListAttempts($notifID) -> [{attempt_no: 1, outcome: "transient", http_status: 500}, {attempt_no: 2, outcome: "sent", http_status: 202}]
 func (q *Queries) InsertAttempt(ctx context.Context, arg InsertAttemptParams) (DeliveryAttempt, error) {
 	row := q.db.QueryRow(ctx, insertAttempt,
 		arg.NotificationID,

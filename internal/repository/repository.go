@@ -10,7 +10,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/TITANBGG/notification-system/internal/domain"
@@ -79,13 +78,7 @@ func (s *Store) Ping(ctx context.Context) error {
 }
 
 // WithTx executes fn inside a single PostgreSQL transaction, rolling back automatically on error or panic.
-//
-// WHY: Idempotency key insertion and notification/batch creation must commit atomically so
-// concurrent duplicate requests observe strict serialization via PostgreSQL row locks.
-//
-// Expected output example:
-//
-//	err := store.WithTx(ctx, func(ctx context.Context, tx *Store) error { ... })
+// Atomic transactions serialize idempotency key creation alongside notification/batch inserts.
 func (s *Store) WithTx(ctx context.Context, fn func(ctx context.Context, txStore *Store) error) error {
 	if s.pool == nil {
 		return errors.New("repository pool is nil")
@@ -95,7 +88,7 @@ func (s *Store) WithTx(ctx context.Context, fn func(ctx context.Context, txStore
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
 	defer func() {
-		// Use WithoutCancel so rollback still completes even if the request context was cancelled.
+		// WithoutCancel ensures rollback still runs even if the caller's request context expired.
 		_ = tx.Rollback(context.WithoutCancel(ctx))
 	}()
 
@@ -113,11 +106,6 @@ func (s *Store) WithTx(ctx context.Context, fn func(ctx context.Context, txStore
 }
 
 // MapError translates pgx/Postgres errors into typed domain sentinel errors.
-//
-// Expected output example:
-//
-//	MapError(pgx.ErrNoRows)                      -> domain.ErrNotFound
-//	MapError(&pgconn.PgError{Code: "23505"})     -> domain.ErrDuplicateKey
 func MapError(err error) error {
 	if err == nil {
 		return nil
@@ -183,10 +171,11 @@ func (s *Store) ListBatchItems(ctx context.Context, batchID uuid.UUID, cursor *C
 	if s.q == nil {
 		return nil, errors.New("repository store is not initialized")
 	}
-	var cursorTS pgtype.Timestamptz
+	var cursorTS *time.Time
 	var cursorID *uuid.UUID
 	if cursor != nil {
-		cursorTS = toTimestamptz(cursor.CreatedAt)
+		u := cursor.CreatedAt.UTC()
+		cursorTS = &u
 		idCopy := cursor.ID
 		cursorID = &idCopy
 	}
@@ -231,7 +220,7 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 		Content:        n.Content,
 		IdempotencyKey: n.IdempotencyKey,
 		MaxAttempts:    clampInt32(n.MaxAttempts),
-		ScheduledAt:    toNullTimestamptz(n.ScheduledAt),
+		ScheduledAt:    toNullUTC(n.ScheduledAt),
 		CorrelationID:  n.CorrelationID,
 		Traceparent:    n.TraceParent,
 	})
@@ -261,7 +250,7 @@ func (s *Store) CopyNotifications(ctx context.Context, items []domain.Notificati
 			Content:        n.Content,
 			IdempotencyKey: n.IdempotencyKey,
 			MaxAttempts:    clampInt32(n.MaxAttempts),
-			ScheduledAt:    toNullTimestamptz(n.ScheduledAt),
+			ScheduledAt:    toNullUTC(n.ScheduledAt),
 			CorrelationID:  n.CorrelationID,
 			Traceparent:    n.TraceParent,
 		})
@@ -307,10 +296,11 @@ func (s *Store) ListNotifications(ctx context.Context, f ListFilter) ([]domain.N
 		s := f.Priority.String()
 		prPtr = &s
 	}
-	var cursorTS pgtype.Timestamptz
+	var cursorTS *time.Time
 	var cursorID *uuid.UUID
 	if f.Cursor != nil {
-		cursorTS = toTimestamptz(f.Cursor.CreatedAt)
+		u := f.Cursor.CreatedAt.UTC()
+		cursorTS = &u
 		idCopy := f.Cursor.ID
 		cursorID = &idCopy
 	}
@@ -318,8 +308,8 @@ func (s *Store) ListNotifications(ctx context.Context, f ListFilter) ([]domain.N
 		Statuses:        statuses,
 		Channel:         chPtr,
 		Priority:        prPtr,
-		FromTime:        toNullTimestamptz(f.From),
-		ToTime:          toNullTimestamptz(f.To),
+		FromTime:        toNullUTC(f.From),
+		ToTime:          toNullUTC(f.To),
 		CursorCreatedAt: cursorTS,
 		CursorID:        cursorID,
 		PageLimit:       clampInt32(f.Limit),
@@ -374,7 +364,7 @@ func (s *Store) ScheduleRetry(ctx context.Context, id uuid.UUID, claimedAttempts
 		return nil, errors.New("repository store is not initialized")
 	}
 	row, err := s.q.ScheduleRetry(ctx, sqlc.ScheduleRetryParams{
-		NextAttemptAt:   toTimestamptz(nextAttemptAt),
+		NextAttemptAt:   toNullUTC(&nextAttemptAt),
 		LastError:       &lastError,
 		ID:              id,
 		ClaimedAttempts: clampInt32(claimedAttempts),
@@ -392,7 +382,7 @@ func (s *Store) DeferCircuitOpen(ctx context.Context, id uuid.UUID, claimedAttem
 		return nil, errors.New("repository store is not initialized")
 	}
 	row, err := s.q.DeferCircuitOpen(ctx, sqlc.DeferCircuitOpenParams{
-		NextAttemptAt:   toTimestamptz(nextAttemptAt),
+		NextAttemptAt:   toNullUTC(&nextAttemptAt),
 		LastError:       &lastError,
 		ID:              id,
 		ClaimedAttempts: clampInt32(claimedAttempts),
@@ -422,7 +412,7 @@ func (s *Store) MarkFailed(ctx context.Context, id uuid.UUID, claimedAttempts in
 }
 
 // Cancel transitions a scheduled/pending/retrying notification to cancelled.
-// Returns domain.ErrNotFound when absent or domain.ErrInvalidTransition when in a non-cancellable state.
+// Returns domain.ErrNotFound when absent or domain.ErrInvalidTransition when non-cancellable.
 func (s *Store) Cancel(ctx context.Context, id uuid.UUID) (*domain.Notification, error) {
 	if s.q == nil {
 		return nil, errors.New("repository store is not initialized")
@@ -556,7 +546,7 @@ func (s *Store) InsertAttempt(ctx context.Context, a domain.DeliveryAttempt) (*d
 		NotificationID:    a.NotificationID,
 		AttemptNo:         clampInt32(a.AttemptNo),
 		Counted:           a.Counted,
-		StartedAt:         toTimestamptz(a.StartedAt),
+		StartedAt:         a.StartedAt.UTC(),
 		DurationMs:        clampInt32(a.DurationMS),
 		HttpStatus:        httpStatus,
 		Outcome:           a.Outcome.String(),
@@ -587,8 +577,8 @@ func (s *Store) ListAttempts(ctx context.Context, notificationID uuid.UUID) ([]d
 	return out, nil
 }
 
-// InsertIdempotencyKey inserts a key with ON CONFLICT DO NOTHING.
-// Returns (inserted, true, nil) on success, or (nil, false, nil) if the key already exists.
+// InsertIdempotencyKey inserts a key or atomically overwrites an expired row with the same key.
+// Returns (inserted, true, nil) on success, or (nil, false, nil) if an unexpired key already exists.
 func (s *Store) InsertIdempotencyKey(ctx context.Context, k domain.IdempotencyKey) (*domain.IdempotencyKey, bool, error) {
 	if s.q == nil {
 		return nil, false, errors.New("repository store is not initialized")
@@ -599,7 +589,7 @@ func (s *Store) InsertIdempotencyKey(ctx context.Context, k domain.IdempotencyKe
 		ResourceType:   string(k.ResourceType),
 		ResourceID:     k.ResourceID,
 		ResponseStatus: clampInt32(k.ResponseStatus),
-		ExpiresAt:      toTimestamptz(k.ExpiresAt),
+		ExpiresAt:      k.ExpiresAt.UTC(),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -705,7 +695,7 @@ func toDomainBatch(b sqlc.Batch) domain.Batch {
 		ID:            b.ID,
 		Total:         int(b.Total),
 		CorrelationID: b.CorrelationID,
-		CreatedAt:     fromTimestamptz(b.CreatedAt),
+		CreatedAt:     b.CreatedAt.UTC(),
 	}
 }
 
@@ -732,18 +722,18 @@ func toDomainNotification(n sqlc.Notification) domain.Notification {
 		Attempts:            int(n.Attempts),
 		MaxAttempts:         int(n.MaxAttempts),
 		Deferrals:           int(n.Deferrals),
-		ScheduledAt:         fromNullTimestamptz(n.ScheduledAt),
-		NextAttemptAt:       fromNullTimestamptz(n.NextAttemptAt),
-		ProcessingStartedAt: fromNullTimestamptz(n.ProcessingStartedAt),
+		ScheduledAt:         fromNullUTC(n.ScheduledAt),
+		NextAttemptAt:       fromNullUTC(n.NextAttemptAt),
+		ProcessingStartedAt: fromNullUTC(n.ProcessingStartedAt),
 		LastError:           n.LastError,
 		ProviderMessageID:   n.ProviderMessageID,
 		CorrelationID:       n.CorrelationID,
 		TraceParent:         n.Traceparent,
-		CreatedAt:           fromTimestamptz(n.CreatedAt),
-		UpdatedAt:           fromTimestamptz(n.UpdatedAt),
-		SentAt:              fromNullTimestamptz(n.SentAt),
-		FailedAt:            fromNullTimestamptz(n.FailedAt),
-		CancelledAt:         fromNullTimestamptz(n.CancelledAt),
+		CreatedAt:           n.CreatedAt.UTC(),
+		UpdatedAt:           n.UpdatedAt.UTC(),
+		SentAt:              fromNullUTC(n.SentAt),
+		FailedAt:            fromNullUTC(n.FailedAt),
+		CancelledAt:         fromNullUTC(n.CancelledAt),
 	}
 }
 
@@ -758,7 +748,7 @@ func toDomainAttempt(a sqlc.DeliveryAttempt) domain.DeliveryAttempt {
 		NotificationID:    a.NotificationID,
 		AttemptNo:         int(a.AttemptNo),
 		Counted:           a.Counted,
-		StartedAt:         fromTimestamptz(a.StartedAt),
+		StartedAt:         a.StartedAt.UTC(),
 		DurationMS:        int(a.DurationMs),
 		HTTPStatus:        httpStatus,
 		Outcome:           domain.AttemptOutcome(a.Outcome),
@@ -775,37 +765,24 @@ func toDomainIdempotencyKey(k sqlc.IdempotencyKey) domain.IdempotencyKey {
 		ResourceType:   domain.ResourceType(k.ResourceType),
 		ResourceID:     k.ResourceID,
 		ResponseStatus: int(k.ResponseStatus),
-		CreatedAt:      fromTimestamptz(k.CreatedAt),
-		ExpiresAt:      fromTimestamptz(k.ExpiresAt),
+		CreatedAt:      k.CreatedAt.UTC(),
+		ExpiresAt:      k.ExpiresAt.UTC(),
 	}
 }
 
-func toTimestamptz(t time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{
-		Time:  t.UTC(),
-		Valid: true,
-	}
-}
-
-func toNullTimestamptz(t *time.Time) pgtype.Timestamptz {
+func toNullUTC(t *time.Time) *time.Time {
 	if t == nil {
-		return pgtype.Timestamptz{}
-	}
-	return toTimestamptz(*t)
-}
-
-func fromTimestamptz(ts pgtype.Timestamptz) time.Time {
-	if !ts.Valid {
-		return time.Time{}
-	}
-	return ts.Time.UTC()
-}
-
-func fromNullTimestamptz(ts pgtype.Timestamptz) *time.Time {
-	if !ts.Valid {
 		return nil
 	}
-	u := ts.Time.UTC()
+	u := t.UTC()
+	return &u
+}
+
+func fromNullUTC(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	u := t.UTC()
 	return &u
 }
 

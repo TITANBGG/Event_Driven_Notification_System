@@ -69,11 +69,11 @@ func (q *Queries) LatencyPercentiles(ctx context.Context) (LatencyPercentilesRow
 const metricsWindowCounts = `-- name: MetricsWindowCounts :many
 
 WITH windows AS (
-  SELECT '1m'::text AS window_name, now() - interval '1 minute' AS cutoff
+  SELECT 1 AS sort_order, '1m'::text AS window_name, now() - interval '1 minute' AS cutoff
   UNION ALL
-  SELECT '5m'::text AS window_name, now() - interval '5 minutes' AS cutoff
+  SELECT 2 AS sort_order, '5m'::text AS window_name, now() - interval '5 minutes' AS cutoff
   UNION ALL
-  SELECT '15m'::text AS window_name, now() - interval '15 minutes' AS cutoff
+  SELECT 3 AS sort_order, '15m'::text AS window_name, now() - interval '15 minutes' AS cutoff
 ),
 channels AS (
   SELECT 'sms'::text AS channel
@@ -102,7 +102,7 @@ SELECT
   ) AS retrying_count
 FROM windows w
 CROSS JOIN channels c
-ORDER BY w.window_name, c.channel
+ORDER BY w.sort_order, c.channel
 `
 
 type MetricsWindowCountsRow struct {
@@ -113,14 +113,7 @@ type MetricsWindowCountsRow struct {
 	RetryingCount int64  `json:"retrying_count"`
 }
 
-// WHAT: Aggregation and percentile_cont queries powering GET /api/v1/metrics.
-// WHY: Uses partial indexes on sent_at, failed_at, and active statuses plus a 2s API cache
-//
-//	to compute 1m/5m/15m delivery counts and 15m latency percentiles without full table scans.
-//
-// EXPECTED OUTPUT EXAMPLE:
-//
-//	LatencyPercentiles() -> {e2e_p50_ms: 420, e2e_p95_ms: 1800, e2e_p99_ms: 4200, provider_p50_ms: 95, ...}
+// Explicit sort_order keeps metric windows chronological (1m, 5m, 15m) instead of alphabetical.
 func (q *Queries) MetricsWindowCounts(ctx context.Context) ([]MetricsWindowCountsRow, error) {
 	rows, err := q.db.Query(ctx, metricsWindowCounts)
 	if err != nil {

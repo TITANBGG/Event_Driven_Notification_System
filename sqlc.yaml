@@ -1,8 +1,3 @@
-# WHAT: sqlc v2 codegen configuration mapping PostgreSQL schema + queries to type-safe pgx/v5 Go methods.
-# WHY: Eliminates runtime SQL syntax/column bugs and prevents string-concatenated SQL injections.
-# EXPECTED OUTPUT EXAMPLE (`make sqlc`):
-#   Generates internal/repository/sqlc/{db.go,models.go,*.sql.go} with zero diff on repeat runs.
-
 version: "2"
 sql:
   - engine: "postgresql"
@@ -28,15 +23,14 @@ sql:
               import: "github.com/google/uuid"
               type: "UUID"
               pointer: true
-          - db_type: "pg_catalog.timestamptz"
+          - db_type: "timestamptz"
             nullable: false
             go_type:
               import: "time"
               type: "Time"
-          - db_type: "pg_catalog.timestamptz"
+          - db_type: "timestamptz"
             nullable: true
             go_type:
               import: "time"
               type: "Time"
               pointer: true
-

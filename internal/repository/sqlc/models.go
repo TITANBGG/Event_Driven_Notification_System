@@ -5,65 +5,66 @@
 package sqlc
 
 import (
+	"time"
+
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Batch struct {
-	ID            uuid.UUID          `json:"id"`
-	Total         int32              `json:"total"`
-	CorrelationID *string            `json:"correlation_id"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ID            uuid.UUID `json:"id"`
+	Total         int32     `json:"total"`
+	CorrelationID *string   `json:"correlation_id"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 type DeliveryAttempt struct {
-	ID                int64              `json:"id"`
-	NotificationID    uuid.UUID          `json:"notification_id"`
-	AttemptNo         int32              `json:"attempt_no"`
-	Counted           bool               `json:"counted"`
-	StartedAt         pgtype.Timestamptz `json:"started_at"`
-	DurationMs        int32              `json:"duration_ms"`
-	HttpStatus        *int32             `json:"http_status"`
-	Outcome           string             `json:"outcome"`
-	Error             *string            `json:"error"`
-	ProviderMessageID *string            `json:"provider_message_id"`
-	WorkerID          *string            `json:"worker_id"`
+	ID                int64     `json:"id"`
+	NotificationID    uuid.UUID `json:"notification_id"`
+	AttemptNo         int32     `json:"attempt_no"`
+	Counted           bool      `json:"counted"`
+	StartedAt         time.Time `json:"started_at"`
+	DurationMs        int32     `json:"duration_ms"`
+	HttpStatus        *int32    `json:"http_status"`
+	Outcome           string    `json:"outcome"`
+	Error             *string   `json:"error"`
+	ProviderMessageID *string   `json:"provider_message_id"`
+	WorkerID          *string   `json:"worker_id"`
 }
 
 type IdempotencyKey struct {
-	Key            string             `json:"key"`
-	RequestHash    string             `json:"request_hash"`
-	ResourceType   string             `json:"resource_type"`
-	ResourceID     uuid.UUID          `json:"resource_id"`
-	ResponseStatus int32              `json:"response_status"`
-	CreatedAt      pgtype.Timestamptz `json:"created_at"`
-	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+	Key            string    `json:"key"`
+	RequestHash    string    `json:"request_hash"`
+	ResourceType   string    `json:"resource_type"`
+	ResourceID     uuid.UUID `json:"resource_id"`
+	ResponseStatus int32     `json:"response_status"`
+	CreatedAt      time.Time `json:"created_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 type Notification struct {
-	ID                  uuid.UUID          `json:"id"`
-	BatchID             *uuid.UUID         `json:"batch_id"`
-	Channel             string             `json:"channel"`
-	Priority            string             `json:"priority"`
-	Status              string             `json:"status"`
-	Recipient           string             `json:"recipient"`
-	Subject             *string            `json:"subject"`
-	Title               *string            `json:"title"`
-	Content             string             `json:"content"`
-	IdempotencyKey      *string            `json:"idempotency_key"`
-	Attempts            int32              `json:"attempts"`
-	MaxAttempts         int32              `json:"max_attempts"`
-	Deferrals           int32              `json:"deferrals"`
-	ScheduledAt         pgtype.Timestamptz `json:"scheduled_at"`
-	NextAttemptAt       pgtype.Timestamptz `json:"next_attempt_at"`
-	ProcessingStartedAt pgtype.Timestamptz `json:"processing_started_at"`
-	LastError           *string            `json:"last_error"`
-	ProviderMessageID   *string            `json:"provider_message_id"`
-	CorrelationID       *string            `json:"correlation_id"`
-	Traceparent         *string            `json:"traceparent"`
-	CreatedAt           pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
-	SentAt              pgtype.Timestamptz `json:"sent_at"`
-	FailedAt            pgtype.Timestamptz `json:"failed_at"`
-	CancelledAt         pgtype.Timestamptz `json:"cancelled_at"`
+	ID                  uuid.UUID  `json:"id"`
+	BatchID             *uuid.UUID `json:"batch_id"`
+	Channel             string     `json:"channel"`
+	Priority            string     `json:"priority"`
+	Status              string     `json:"status"`
+	Recipient           string     `json:"recipient"`
+	Subject             *string    `json:"subject"`
+	Title               *string    `json:"title"`
+	Content             string     `json:"content"`
+	IdempotencyKey      *string    `json:"idempotency_key"`
+	Attempts            int32      `json:"attempts"`
+	MaxAttempts         int32      `json:"max_attempts"`
+	Deferrals           int32      `json:"deferrals"`
+	ScheduledAt         *time.Time `json:"scheduled_at"`
+	NextAttemptAt       *time.Time `json:"next_attempt_at"`
+	ProcessingStartedAt *time.Time `json:"processing_started_at"`
+	LastError           *string    `json:"last_error"`
+	ProviderMessageID   *string    `json:"provider_message_id"`
+	CorrelationID       *string    `json:"correlation_id"`
+	Traceparent         *string    `json:"traceparent"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+	SentAt              *time.Time `json:"sent_at"`
+	FailedAt            *time.Time `json:"failed_at"`
+	CancelledAt         *time.Time `json:"cancelled_at"`
 }

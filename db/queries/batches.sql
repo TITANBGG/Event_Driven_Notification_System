@@ -1,9 +1,3 @@
--- WHAT: Batch management SQL queries for creation, summary aggregation, keyset listing, and cancellation.
--- WHY: Computing batch counts via GROUP BY status and cancelling items in a single atomic UPDATE
---      avoids N+1 queries and prevents cancel-vs-worker races across up to 1000 items.
--- EXPECTED OUTPUT EXAMPLE:
---   GetBatchSummary($batchID) -> rows: [{status: "pending", count: 10}, {status: "sent", count: 990}]
-
 -- name: InsertBatch :one
 INSERT INTO batches (id, total, correlation_id)
 VALUES ($1, $2, $3)
@@ -31,6 +25,7 @@ WHERE batch_id = sqlc.arg(batch_id)::uuid
 ORDER BY created_at DESC, id DESC
 LIMIT sqlc.arg(page_limit)::int;
 
+-- Returning cancelled IDs lets callers clean up optional Redis delayed entries without extra queries.
 -- name: CancelBatch :many
 UPDATE notifications
 SET status = 'cancelled',
@@ -39,4 +34,3 @@ SET status = 'cancelled',
 WHERE batch_id = $1
   AND status IN ('scheduled', 'pending', 'retrying')
 RETURNING id;
-

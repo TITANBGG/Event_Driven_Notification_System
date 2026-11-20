@@ -1,9 +1,3 @@
--- WHAT: Notification CRUD, keyset filtering, atomic worker Claim, fenced state transitions, and reconciler scans.
--- WHY: Every transition enforces allowed_from status guards directly in SQL and uses fencing
---      (status='processing' AND attempts=$claimed_attempts) so slow workers never overwrite reclaimed rows.
--- EXPECTED OUTPUT EXAMPLE:
---   Claim(id, 2.0) -> returns notification with status='processing', attempts=1 (or pgx.ErrNoRows if cancelled/not due).
-
 -- name: InsertNotification :one
 INSERT INTO notifications (
   id, batch_id, channel, priority, status, recipient, subject, title, content,
@@ -43,6 +37,7 @@ WHERE (sqlc.narg(statuses)::text[] IS NULL OR status = ANY(sqlc.narg(statuses)::
 ORDER BY created_at DESC, id DESC
 LIMIT sqlc.arg(page_limit)::int;
 
+-- Skew tolerance bridges minor clock drift between the worker delayed-mover and PostgreSQL now().
 -- name: Claim :one
 UPDATE notifications
 SET status = 'processing',
@@ -57,6 +52,7 @@ WHERE id = sqlc.arg(id)
   )
 RETURNING *;
 
+-- Fenced on status='processing' AND attempts=$claimed_attempts so slow workers cannot overwrite reclaimed rows.
 -- name: MarkSent :one
 UPDATE notifications
 SET status = 'sent',
@@ -80,6 +76,7 @@ WHERE id = sqlc.arg(id)
   AND attempts = sqlc.arg(claimed_attempts)
 RETURNING *;
 
+-- Circuit-open deferrals roll back the claim increment so breaker outages never exhaust retry budgets.
 -- name: DeferCircuitOpen :one
 UPDATE notifications
 SET status = 'retrying',
@@ -174,4 +171,3 @@ WHERE id = sqlc.arg(id)
   AND status = 'processing'
   AND attempts = sqlc.arg(claimed_attempts)
 RETURNING *;
-

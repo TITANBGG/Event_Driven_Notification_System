@@ -7,9 +7,9 @@ package sqlc
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const deleteExpiredIdempotencyKeys = `-- name: DeleteExpiredIdempotencyKeys :execrows
@@ -22,6 +22,7 @@ WHERE key IN (
 )
 `
 
+// Batched delete avoids holding long table locks during reconciler cleanup.
 func (q *Queries) DeleteExpiredIdempotencyKeys(ctx context.Context, batchLimit int32) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteExpiredIdempotencyKeys, batchLimit)
 	if err != nil {
@@ -90,31 +91,31 @@ func (q *Queries) GetIdempotencyKeysByKeys(ctx context.Context, keys []string) (
 const insertIdempotencyKey = `-- name: InsertIdempotencyKey :one
 
 INSERT INTO idempotency_keys (
-  key, request_hash, resource_type, resource_id, response_status, expires_at
+  key, request_hash, resource_type, resource_id, response_status, created_at, expires_at
 ) VALUES (
-  $1, $2, $3, $4, $5, $6
+  $1, $2, $3, $4, $5, now(), $6
 )
-ON CONFLICT (key) DO NOTHING
+ON CONFLICT (key) DO UPDATE
+SET request_hash    = EXCLUDED.request_hash,
+    resource_type   = EXCLUDED.resource_type,
+    resource_id     = EXCLUDED.resource_id,
+    response_status = EXCLUDED.response_status,
+    created_at      = now(),
+    expires_at      = EXCLUDED.expires_at
+WHERE idempotency_keys.expires_at <= now()
 RETURNING key, request_hash, resource_type, resource_id, response_status, created_at, expires_at
 `
 
 type InsertIdempotencyKeyParams struct {
-	Key            string             `json:"key"`
-	RequestHash    string             `json:"request_hash"`
-	ResourceType   string             `json:"resource_type"`
-	ResourceID     uuid.UUID          `json:"resource_id"`
-	ResponseStatus int32              `json:"response_status"`
-	ExpiresAt      pgtype.Timestamptz `json:"expires_at"`
+	Key            string    `json:"key"`
+	RequestHash    string    `json:"request_hash"`
+	ResourceType   string    `json:"resource_type"`
+	ResourceID     uuid.UUID `json:"resource_id"`
+	ResponseStatus int32     `json:"response_status"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
-// WHAT: Idempotency key queries for single/batch API deduplication and batched reconciler expiration cleanup.
-// WHY: Inserting with ON CONFLICT DO NOTHING in the same transaction serializes concurrent duplicate
-//
-//	requests at PostgreSQL row lock level without race conditions.
-//
-// EXPECTED OUTPUT EXAMPLE:
-//
-//	InsertIdempotencyKey(...) -> returns inserted row on first call, or pgx.ErrNoRows on duplicate key conflict.
+// Reclaim expired keys atomically on conflict; active keys return 0 rows so the handler can replay or return 409.
 func (q *Queries) InsertIdempotencyKey(ctx context.Context, arg InsertIdempotencyKeyParams) (IdempotencyKey, error) {
 	row := q.db.QueryRow(ctx, insertIdempotencyKey,
 		arg.Key,

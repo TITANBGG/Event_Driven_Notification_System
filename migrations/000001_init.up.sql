@@ -1,10 +1,4 @@
--- WHAT: Initial PostgreSQL schema, updated_at trigger, and query-specific B-tree/partial indexes.
--- WHY: PostgreSQL acts as the durable source of truth for all notifications, batch counts,
---      delivery attempts, and idempotency keys; text + CHECK avoids PG ENUM ALTER TYPE caveats,
---      and partial indexes keep reconciler/metrics scans fast without indexing terminal rows.
--- EXPECTED OUTPUT EXAMPLE (after `migrate up`):
---   Tables: batches, notifications, delivery_attempts, idempotency_keys
---   Trigger: trg_notifications_set_updated_at on notifications
+-- Initial schema: PostgreSQL acts as the durable source of truth while Redis handles transient queue hints.
 
 CREATE TABLE batches (
   id uuid PRIMARY KEY,
@@ -13,6 +7,7 @@ CREATE TABLE batches (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- text + CHECK keeps future channel additions transactional without ALTER TYPE ENUM caveats.
 CREATE TABLE notifications (
   id uuid PRIMARY KEY,
   batch_id uuid NULL REFERENCES batches(id),
@@ -65,7 +60,7 @@ CREATE TABLE idempotency_keys (
   expires_at timestamptz NOT NULL
 );
 
--- Maintain updated_at automatically on any UPDATE (even manual SQL) so stale detection stays accurate.
+-- Keep updated_at accurate even on manual SQL updates for reconciler staleness checks.
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS trigger AS $$
 BEGIN
@@ -79,7 +74,6 @@ CREATE TRIGGER trg_notifications_set_updated_at
   FOR EACH ROW
   EXECUTE FUNCTION set_updated_at();
 
--- Keyset pagination & filtered listing indexes (ORDER BY created_at DESC, id DESC).
 CREATE INDEX idx_notifications_created_id
   ON notifications (created_at DESC, id DESC);
 
@@ -93,12 +87,11 @@ CREATE INDEX idx_notifications_batch_created_id
   ON notifications (batch_id, created_at DESC, id DESC)
   WHERE batch_id IS NOT NULL;
 
--- Partial index covering only active/non-terminal rows so reconciler scans remain tiny at millions of rows.
+-- Partial index limits reconciler scans to active non-terminal rows.
 CREATE INDEX idx_notifications_reconciler
   ON notifications (status, updated_at)
   WHERE status IN ('pending', 'processing', 'retrying', 'scheduled');
 
--- Partial indexes for 1m/5m/15m metrics windows & percentile_cont latency queries.
 CREATE INDEX idx_notifications_sent_at
   ON notifications (sent_at)
   WHERE status = 'sent';
@@ -107,11 +100,13 @@ CREATE INDEX idx_notifications_failed_at
   ON notifications (failed_at)
   WHERE status = 'failed';
 
--- Fast attempt timeline lookups for GET /api/v1/notifications/{id}.
 CREATE INDEX idx_delivery_attempts_notif_attempt
   ON delivery_attempts (notification_id, attempt_no);
 
--- Fast batched cleanup of expired idempotency keys in reconciler step (e).
+-- Supports 15-minute provider latency percentile queries without full table scans.
+CREATE INDEX idx_delivery_attempts_started_at
+  ON delivery_attempts (started_at)
+  WHERE counted = true;
+
 CREATE INDEX idx_idempotency_keys_expires_at
   ON idempotency_keys (expires_at);
-
