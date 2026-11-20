@@ -319,7 +319,7 @@ func applyMigrations(t *testing.T, dbURL string) {
 
 func (inf *testInfra) resetState(t *testing.T) {
 	t.Helper()
-	_, err := inf.pool.Exec(t.Context(), "TRUNCATE TABLE delivery_attempts, notifications, batches, idempotency_keys RESTART IDENTITY CASCADE")
+	_, err := inf.pool.Exec(t.Context(), "TRUNCATE TABLE delivery_attempts, notifications, batches, templates, idempotency_keys RESTART IDENTITY CASCADE")
 	require.NoError(t, err)
 	require.NoError(t, inf.rdb.FlushDB(t.Context()).Err())
 	inf.provider.reset()
@@ -964,5 +964,81 @@ func TestCoreIntegration(t *testing.T) {
 
 		// Confirm the cancelled scheduled notification was never sent to the provider.
 		assert.Empty(t, inf.provider.callsForID(toCancel.ID.String()), "cancelled scheduled notification must never reach provider")
+	})
+
+	t.Run("k_template_create_preview_and_batch_personalized_sms_delivery", func(t *testing.T) {
+		inf.resetState(t)
+		stopWorker := inf.startWorker(t, nil, 500, 10)
+		defer stopWorker()
+
+		// 1. Create SMS template with Turkish body.
+		var tmpl api.TemplateResponse
+		cTmpl, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/templates", nil, map[string]any{
+			"name":      "otp_sms_tr",
+			"channel":   "sms",
+			"body":      "Merhaba {{name}}, doğrulama kodunuz: {{code}}",
+			"variables": []string{"name", "code"},
+		}, &tmpl)
+		require.Equal(t, http.StatusCreated, cTmpl)
+
+		// 2. Preview template -> UCS-2 encoding, 1 segment, unusedVariables reported.
+		var preview api.TemplatePreviewResponse
+		cPrev, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/templates/"+tmpl.ID.String()+"/preview", nil, map[string]any{
+			"variables": map[string]any{
+				"name":        "Ayşe",
+				"code":        "4821",
+				"unusedField": true,
+			},
+		}, &preview)
+		require.Equal(t, http.StatusOK, cPrev)
+		assert.Equal(t, "Merhaba Ayşe, doğrulama kodunuz: 4821", preview.Content)
+		require.NotNil(t, preview.SMS)
+		assert.Equal(t, "UCS-2", preview.SMS.Encoding)
+		assert.Equal(t, 1, preview.SMS.Segments)
+		assert.Equal(t, []string{"unusedField"}, preview.UnusedVariables)
+
+		// 3. Submit a batch of 3 personalized SMS notifications using templateId + templateVariables.
+		var batch api.BatchCreateResponse
+		cBatch, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/notifications/batch", nil, map[string]any{
+			"notifications": []map[string]any{
+				{
+					"recipient":         "+905551111111",
+					"channel":           "sms",
+					"templateId":        tmpl.ID.String(),
+					"templateVariables": map[string]any{"name": "Ayşe", "code": "4821"},
+				},
+				{
+					"recipient":         "+905552222222",
+					"channel":           "sms",
+					"templateId":        tmpl.ID.String(),
+					"templateVariables": map[string]any{"name": "Mehmet", "code": "9035"},
+				},
+				{
+					"recipient":         "+905553333333",
+					"channel":           "sms",
+					"templateId":        tmpl.ID.String(),
+					"templateVariables": map[string]any{"name": "Zeynep", "code": 7142},
+				},
+			},
+		}, &batch)
+		require.Equal(t, http.StatusAccepted, cBatch)
+		require.Len(t, batch.NotificationIDs, 3)
+
+		var summary api.BatchDetailResponse
+		require.Eventually(t, func() bool {
+			c, _ := doJSON(t, http.MethodGet, inf.apiSrv.URL+"/api/v1/batches/"+batch.BatchID.String()+"?limit=10", nil, nil, &summary)
+			return c == http.StatusOK && summary.CountsByStatus["sent"] == 3
+		}, 10*time.Second, 30*time.Millisecond)
+
+		expectedBodies := map[string]string{
+			batch.NotificationIDs[0].String(): "Merhaba Ayşe, doğrulama kodunuz: 4821",
+			batch.NotificationIDs[1].String(): "Merhaba Mehmet, doğrulama kodunuz: 9035",
+			batch.NotificationIDs[2].String(): "Merhaba Zeynep, doğrulama kodunuz: 7142",
+		}
+		for idStr, wantBody := range expectedBodies {
+			calls := inf.provider.callsForID(idStr)
+			require.Len(t, calls, 1)
+			assert.Equal(t, wantBody, calls[0].Body["content"])
+		}
 	})
 }

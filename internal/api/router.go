@@ -104,6 +104,14 @@ func NewRouter(deps Deps) chi.Router {
 
 		r.Get("/batches/{id}", h.handleGetBatch)
 		r.Post("/batches/{id}/cancel", h.handleCancelBatch)
+
+		r.Post("/templates", h.handleCreateTemplate)
+		r.Get("/templates", h.handleListTemplates)
+		r.Get("/templates/{id}", h.handleGetTemplate)
+		r.Put("/templates/{id}", h.handleUpdateTemplate)
+		r.Delete("/templates/{id}", h.handleDeleteTemplate)
+		r.Post("/templates/{id}/preview", h.handlePreviewTemplate)
+
 		r.Get("/metrics", h.handleMetricsSnapshot)
 	})
 

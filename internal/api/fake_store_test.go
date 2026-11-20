@@ -20,6 +20,7 @@ type fakeDBState struct {
 	batches       map[uuid.UUID]domain.Batch
 	attempts      map[uuid.UUID][]domain.DeliveryAttempt
 	idempotency   map[string]domain.IdempotencyKey
+	templates     map[uuid.UUID]domain.Template
 }
 
 func newFakeDBState() *fakeDBState {
@@ -28,6 +29,7 @@ func newFakeDBState() *fakeDBState {
 		batches:       make(map[uuid.UUID]domain.Batch),
 		attempts:      make(map[uuid.UUID][]domain.DeliveryAttempt),
 		idempotency:   make(map[string]domain.IdempotencyKey),
+		templates:     make(map[uuid.UUID]domain.Template),
 	}
 }
 
@@ -46,6 +48,9 @@ func (s *fakeDBState) clone() *fakeDBState {
 	}
 	for k, v := range s.idempotency {
 		cp.idempotency[k] = v
+	}
+	for k, v := range s.templates {
+		cp.templates[k] = v
 	}
 	return cp
 }
@@ -223,6 +228,42 @@ func (f *fakeStore) GetIdempotencyKeysByKeys(_ context.Context, keys []string) (
 	return (&fakeTxStore{root: f, st: f.st}).getIdempotencyKeysByKeysLocked(keys)
 }
 
+func (f *fakeStore) InsertTemplate(_ context.Context, tmpl domain.Template) (*domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return (&fakeTxStore{root: f, st: f.st}).insertTemplateLocked(tmpl)
+}
+
+func (f *fakeStore) GetTemplate(_ context.Context, id uuid.UUID) (*domain.Template, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return (&fakeTxStore{root: f, st: f.st}).getTemplateLocked(id)
+}
+
+func (f *fakeStore) GetTemplatesByIDs(_ context.Context, ids []uuid.UUID) ([]domain.Template, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return (&fakeTxStore{root: f, st: f.st}).getTemplatesByIDsLocked(ids)
+}
+
+func (f *fakeStore) ListTemplates(_ context.Context, filter repository.TemplateListFilter) ([]domain.Template, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return (&fakeTxStore{root: f, st: f.st}).listTemplatesLocked(filter)
+}
+
+func (f *fakeStore) UpdateTemplate(_ context.Context, tmpl domain.Template) (*domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return (&fakeTxStore{root: f, st: f.st}).updateTemplateLocked(tmpl)
+}
+
+func (f *fakeStore) SoftDeleteTemplate(_ context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return (&fakeTxStore{root: f, st: f.st}).softDeleteTemplateLocked(id)
+}
+
 func (f *fakeStore) MetricsWindowCounts(_ context.Context) ([]repository.MetricsWindowRow, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -327,6 +368,24 @@ func (t *fakeTxStore) GetIdempotencyKey(_ context.Context, key string) (*domain.
 }
 func (t *fakeTxStore) GetIdempotencyKeysByKeys(_ context.Context, keys []string) ([]domain.IdempotencyKey, error) {
 	return t.getIdempotencyKeysByKeysLocked(keys)
+}
+func (t *fakeTxStore) InsertTemplate(_ context.Context, tmpl domain.Template) (*domain.Template, error) {
+	return t.insertTemplateLocked(tmpl)
+}
+func (t *fakeTxStore) GetTemplate(_ context.Context, id uuid.UUID) (*domain.Template, error) {
+	return t.getTemplateLocked(id)
+}
+func (t *fakeTxStore) GetTemplatesByIDs(_ context.Context, ids []uuid.UUID) ([]domain.Template, error) {
+	return t.getTemplatesByIDsLocked(ids)
+}
+func (t *fakeTxStore) ListTemplates(_ context.Context, filter repository.TemplateListFilter) ([]domain.Template, error) {
+	return t.listTemplatesLocked(filter)
+}
+func (t *fakeTxStore) UpdateTemplate(_ context.Context, tmpl domain.Template) (*domain.Template, error) {
+	return t.updateTemplateLocked(tmpl)
+}
+func (t *fakeTxStore) SoftDeleteTemplate(_ context.Context, id uuid.UUID) error {
+	return t.softDeleteTemplateLocked(id)
 }
 func (t *fakeTxStore) MetricsWindowCounts(_ context.Context) ([]repository.MetricsWindowRow, error) {
 	return t.metricsWindowCountsLocked()
@@ -664,4 +723,110 @@ func beforeCursor(n domain.Notification, c repository.Cursor) bool {
 		return false
 	}
 	return bytes.Compare(n.ID[:], c.ID[:]) < 0
+}
+
+func (t *fakeTxStore) insertTemplateLocked(tmpl domain.Template) (*domain.Template, error) {
+	for _, existing := range t.st.templates {
+		if existing.DeletedAt == nil && existing.Name == tmpl.Name {
+			return nil, fmt.Errorf("%w: templates_name_active", domain.ErrDuplicateKey)
+		}
+	}
+	now := t.root.nextStamp()
+	if tmpl.CreatedAt.IsZero() {
+		tmpl.CreatedAt = now
+	}
+	if tmpl.UpdatedAt.IsZero() {
+		tmpl.UpdatedAt = tmpl.CreatedAt
+	}
+	t.st.templates[tmpl.ID] = tmpl
+	cp := tmpl
+	return &cp, nil
+}
+
+func (t *fakeTxStore) getTemplateLocked(id uuid.UUID) (*domain.Template, error) {
+	tmpl, ok := t.st.templates[id]
+	if !ok || tmpl.DeletedAt != nil {
+		return nil, domain.ErrNotFound
+	}
+	cp := tmpl
+	return &cp, nil
+}
+
+func (t *fakeTxStore) getTemplatesByIDsLocked(ids []uuid.UUID) ([]domain.Template, error) {
+	set := make(map[uuid.UUID]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	out := make([]domain.Template, 0)
+	for _, tmpl := range t.st.templates {
+		if _, ok := set[tmpl.ID]; ok && tmpl.DeletedAt == nil {
+			out = append(out, tmpl)
+		}
+	}
+	return out, nil
+}
+
+func (t *fakeTxStore) listTemplatesLocked(f repository.TemplateListFilter) ([]domain.Template, error) {
+	items := make([]domain.Template, 0)
+	for _, tmpl := range t.st.templates {
+		if tmpl.DeletedAt != nil {
+			continue
+		}
+		if f.Channel != nil && tmpl.Channel != *f.Channel {
+			continue
+		}
+		if f.Cursor != nil {
+			tn, tc := tmpl.CreatedAt.UTC(), f.Cursor.CreatedAt.UTC()
+			if tn.After(tc) || (tn.Equal(tc) && bytes.Compare(tmpl.ID[:], f.Cursor.ID[:]) >= 0) {
+				continue
+			}
+		}
+		items = append(items, tmpl)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		ti, tj := items[i].CreatedAt.UTC(), items[j].CreatedAt.UTC()
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return bytes.Compare(items[i].ID[:], items[j].ID[:]) > 0
+	})
+	if f.Limit > 0 && len(items) > f.Limit {
+		items = items[:f.Limit]
+	}
+	return items, nil
+}
+
+func (t *fakeTxStore) updateTemplateLocked(tmpl domain.Template) (*domain.Template, error) {
+	cur, ok := t.st.templates[tmpl.ID]
+	if !ok || cur.DeletedAt != nil {
+		return nil, domain.ErrNotFound
+	}
+	for _, existing := range t.st.templates {
+		if existing.ID != tmpl.ID && existing.DeletedAt == nil && existing.Name == tmpl.Name {
+			return nil, fmt.Errorf("%w: templates_name_active", domain.ErrDuplicateKey)
+		}
+	}
+	now := t.root.nextStamp()
+	cur.Name = tmpl.Name
+	cur.Channel = tmpl.Channel
+	cur.Subject = tmpl.Subject
+	cur.Title = tmpl.Title
+	cur.Body = tmpl.Body
+	cur.Variables = tmpl.Variables
+	cur.UpdatedAt = now
+	t.st.templates[tmpl.ID] = cur
+	cp := cur
+	return &cp, nil
+}
+
+func (t *fakeTxStore) softDeleteTemplateLocked(id uuid.UUID) error {
+	cur, ok := t.st.templates[id]
+	if !ok || cur.DeletedAt != nil {
+		return domain.ErrNotFound
+	}
+	now := t.root.nextStamp()
+	cur.DeletedAt = &now
+	cur.UpdatedAt = now
+	t.st.templates[id] = cur
+	return nil
 }

@@ -20,6 +20,8 @@ tags:
     description: Single and batch notification submission, queries, cancellation, and manual retry
   - name: Batches
     description: Batch status aggregation and bulk cancellation
+  - name: Templates
+    description: Message template management and variable substitution preview
 
 paths:
   /health/live:
@@ -400,6 +402,217 @@ paths:
         "500":
           $ref: "#/components/responses/InternalError"
 
+  /api/v1/templates:
+    post:
+      operationId: createTemplate
+      tags: [Templates]
+      summary: Create a message template with {{variable}} placeholders
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertTemplateRequest"
+            example:
+              name: otp_sms_tr
+              channel: sms
+              body: "Merhaba {{name}}, doğrulama kodunuz: {{code}}"
+              variables: [name, code]
+      responses:
+        "201":
+          description: Template created
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/CorrelationIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "400":
+          $ref: "#/components/responses/MalformedJSON"
+        "409":
+          $ref: "#/components/responses/TemplateNameConflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    get:
+      operationId: listTemplates
+      tags: [Templates]
+      summary: List active templates with optional channel filter and cursor pagination
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+        - name: channel
+          in: query
+          schema:
+            type: string
+            enum: [sms, email, push]
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Paginated list of active templates
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/CorrelationIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateListResponse"
+        "400":
+          $ref: "#/components/responses/BadCursor"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/templates/{id}:
+    get:
+      operationId: getTemplate
+      tags: [Templates]
+      summary: Get an active template by ID
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+        - $ref: "#/components/parameters/UUIDPathParam"
+      responses:
+        "200":
+          description: Template details
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/CorrelationIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "400":
+          $ref: "#/components/responses/InvalidUUID"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    put:
+      operationId: updateTemplate
+      tags: [Templates]
+      summary: Update an active template by ID
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+        - $ref: "#/components/parameters/UUIDPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertTemplateRequest"
+      responses:
+        "200":
+          description: Template updated
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/CorrelationIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateResponse"
+        "400":
+          $ref: "#/components/responses/InvalidUUID"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/TemplateNameConflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+    delete:
+      operationId: deleteTemplate
+      tags: [Templates]
+      summary: Soft-delete a template by ID
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+        - $ref: "#/components/parameters/UUIDPathParam"
+      responses:
+        "204":
+          description: Template soft-deleted
+        "400":
+          $ref: "#/components/responses/InvalidUUID"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/templates/{id}/preview:
+    post:
+      operationId: previewTemplate
+      tags: [Templates]
+      summary: Render a template preview with sample variables and SMS encoding metrics
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+        - $ref: "#/components/parameters/UUIDPathParam"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplatePreviewRequest"
+            example:
+              variables:
+                name: "Ayşe"
+                code: "4821"
+      responses:
+        "200":
+          description: Rendered preview with SMS segmentation info and unused variables list
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/CorrelationIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplatePreviewResponse"
+        "400":
+          $ref: "#/components/responses/MalformedJSON"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /health:
     get:
       operationId: getHealth
@@ -664,7 +877,7 @@ components:
     CreateNotificationRequest:
       type: object
       additionalProperties: false
-      required: [recipient, channel, content]
+      required: [recipient, channel]
       properties:
         recipient:
           type: string
@@ -674,6 +887,7 @@ components:
           enum: [sms, email, push]
         content:
           type: string
+          description: Message body (provide either `content` or `templateId` + `templateVariables`, never both)
         priority:
           type: string
           enum: [high, normal, low]
@@ -698,11 +912,11 @@ components:
         templateId:
           type: string
           format: uuid
-          description: Reserved for Phase 9 templates
+          description: Active template UUID to render at creation time (mutually exclusive with `content`)
         templateVariables:
           type: object
           additionalProperties: true
-          description: Reserved for Phase 9 templates
+          description: Primitive variable map (`string`, `number`, `boolean`) substituted into the template at creation time
 
     BatchCreateRequest:
       type: object
@@ -742,6 +956,10 @@ components:
           type: string
           format: uuid
         batchId:
+          type: string
+          format: uuid
+          nullable: true
+        templateId:
           type: string
           format: uuid
           nullable: true
@@ -908,6 +1126,114 @@ components:
         notCancellable:
           type: integer
 
+    UpsertTemplateRequest:
+      type: object
+      additionalProperties: false
+      required: [name, channel, body, variables]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        channel:
+          type: string
+          enum: [sms, email, push]
+        subject:
+          type: string
+          maxLength: 200
+        title:
+          type: string
+          maxLength: 100
+        body:
+          type: string
+          minLength: 1
+        variables:
+          type: array
+          items:
+            type: string
+
+    TemplateResponse:
+      type: object
+      required: [id, name, channel, body, variables, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        channel:
+          type: string
+          enum: [sms, email, push]
+        subject:
+          type: string
+          nullable: true
+        title:
+          type: string
+          nullable: true
+        body:
+          type: string
+        variables:
+          type: array
+          items:
+            type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    TemplateListResponse:
+      type: object
+      required: [data, nextCursor]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/TemplateResponse"
+        nextCursor:
+          type: string
+          nullable: true
+
+    TemplatePreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [variables]
+      properties:
+        variables:
+          type: object
+          additionalProperties: true
+
+    SMSPreviewInfo:
+      type: object
+      required: [encoding, units, segments]
+      properties:
+        encoding:
+          type: string
+          enum: [GSM-7, UCS-2]
+        units:
+          type: integer
+        segments:
+          type: integer
+
+    TemplatePreviewResponse:
+      type: object
+      required: [subject, title, content, unusedVariables]
+      properties:
+        subject:
+          type: string
+          nullable: true
+        title:
+          type: string
+          nullable: true
+        content:
+          type: string
+        sms:
+          $ref: "#/components/schemas/SMSPreviewInfo"
+        unusedVariables:
+          type: array
+          items:
+            type: string
+
     FieldError:
       type: object
       required: [field, code, message]
@@ -971,6 +1297,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     BatchConflict:
       description: Batch Idempotency-Key conflict or item idempotencyKey already exists
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    TemplateNameConflict:
+      description: An active template with the same name already exists
       content:
         application/json:
           schema:

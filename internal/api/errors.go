@@ -63,15 +63,19 @@ func writeError(w http.ResponseWriter, r *http.Request, logger *slog.Logger, err
 	if errors.As(err, &ve) {
 		code := "validation_failed"
 		if len(ve.Fields) > 0 {
-			allDup := true
-			for _, f := range ve.Fields {
-				if f.Code != "duplicate_idempotency_key" {
-					allDup = false
-					break
+			firstCode := ve.Fields[0].Code
+			switch firstCode {
+			case "duplicate_idempotency_key", "missing_variable", "template_not_found":
+				allSame := true
+				for _, f := range ve.Fields {
+					if f.Code != firstCode {
+						allSame = false
+						break
+					}
 				}
-			}
-			if allDup {
-				code = "duplicate_idempotency_key"
+				if allSame {
+					code = firstCode
+				}
 			}
 		}
 		writeJSON(w, logger, http.StatusUnprocessableEntity, ErrorResponse{

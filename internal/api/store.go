@@ -33,6 +33,13 @@ type Store interface {
 	GetIdempotencyKey(ctx context.Context, key string) (*domain.IdempotencyKey, error)
 	GetIdempotencyKeysByKeys(ctx context.Context, keys []string) ([]domain.IdempotencyKey, error)
 
+	InsertTemplate(ctx context.Context, t domain.Template) (*domain.Template, error)
+	GetTemplate(ctx context.Context, id uuid.UUID) (*domain.Template, error)
+	GetTemplatesByIDs(ctx context.Context, ids []uuid.UUID) ([]domain.Template, error)
+	ListTemplates(ctx context.Context, f repository.TemplateListFilter) ([]domain.Template, error)
+	UpdateTemplate(ctx context.Context, t domain.Template) (*domain.Template, error)
+	SoftDeleteTemplate(ctx context.Context, id uuid.UUID) error
+
 	MetricsWindowCounts(ctx context.Context) ([]repository.MetricsWindowRow, error)
 	LatencyPercentiles(ctx context.Context) (repository.LatencyStats, error)
 }

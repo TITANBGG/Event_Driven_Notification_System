@@ -141,19 +141,142 @@ func TestCreateNotificationPhase3FeatureGatesAndUnknownFields(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, recUnknown.Code)
 	assert.Contains(t, recUnknown.Body.String(), "malformed_json")
 
-	// templateId and templateVariables are rejected with 422 not_supported_yet until Phase 9.
-	recGate := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+	// Missing template returns 422 template_not_found.
+	recMissingTmpl := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
 		`{"recipient":"+905551234567","channel":"sms","templateId":"01936f7e-0000-7000-8000-000000000001"}`,
 		nil,
 	)
-	require.Equal(t, http.StatusUnprocessableEntity, recGate.Code)
+	require.Equal(t, http.StatusUnprocessableEntity, recMissingTmpl.Code)
 	var errResp api.ErrorResponse
-	require.NoError(t, json.Unmarshal(recGate.Body.Bytes(), &errResp))
-	codes := map[string]string{}
-	for _, d := range errResp.Error.Details {
-		codes[d.Field] = d.Code
-	}
-	assert.Equal(t, "not_supported_yet", codes["templateId"])
+	require.NoError(t, json.Unmarshal(recMissingTmpl.Body.Bytes(), &errResp))
+	assert.Equal(t, "template_not_found", errResp.Error.Code)
+}
+
+func TestTemplatesCRUDPreviewSoftDeleteAndRenderAtCreate(t *testing.T) {
+	t.Parallel()
+
+	h, store, enq := newTestRouter(t)
+
+	// 1. Create SMS template with Turkish body and placeholders {{name}} and {{code}}.
+	recCreate := doJSONRequest(t, h, http.MethodPost, "/api/v1/templates",
+		`{"name":"otp_tr","channel":"sms","body":"Merhaba {{name}}, doğrulama kodunuz: {{code}}","variables":["name","code"]}`,
+		nil,
+	)
+	require.Equal(t, http.StatusCreated, recCreate.Code)
+	var tmpl api.TemplateResponse
+	require.NoError(t, json.Unmarshal(recCreate.Body.Bytes(), &tmpl))
+	assert.Equal(t, "otp_tr", tmpl.Name)
+	assert.Equal(t, "sms", tmpl.Channel)
+	assert.Equal(t, []string{"name", "code"}, tmpl.Variables)
+
+	// Duplicate active template name returns 409 template_name_exists.
+	recDupName := doJSONRequest(t, h, http.MethodPost, "/api/v1/templates",
+		`{"name":"otp_tr","channel":"sms","body":"Hi {{name}}","variables":["name"]}`,
+		nil,
+	)
+	require.Equal(t, http.StatusConflict, recDupName.Code)
+	assert.Contains(t, recDupName.Body.String(), "template_name_exists")
+
+	// 2. Preview template with extra unused variable -> returns rendered content, UCS-2 SMS info, and unusedVariables.
+	recPreview := doJSONRequest(t, h, http.MethodPost, "/api/v1/templates/"+tmpl.ID.String()+"/preview",
+		`{"variables":{"name":"Ayşe","code":4821,"unusedKey":"extra"}}`,
+		nil,
+	)
+	require.Equal(t, http.StatusOK, recPreview.Code)
+	var preview api.TemplatePreviewResponse
+	require.NoError(t, json.Unmarshal(recPreview.Body.Bytes(), &preview))
+	assert.Equal(t, "Merhaba Ayşe, doğrulama kodunuz: 4821", preview.Content)
+	require.NotNil(t, preview.SMS)
+	assert.Equal(t, "UCS-2", preview.SMS.Encoding)
+	assert.Equal(t, 1, preview.SMS.Segments)
+	assert.Equal(t, []string{"unusedKey"}, preview.UnusedVariables)
+
+	// 3. Reject notification specifying both content and templateId, or neither, or mismatched channel.
+	recBoth := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		fmt.Sprintf(`{"recipient":"+905551234567","channel":"sms","content":"direct","templateId":%q,"templateVariables":{"name":"Ayşe","code":"1234"}}`, tmpl.ID),
+		nil,
+	)
+	require.Equal(t, http.StatusUnprocessableEntity, recBoth.Code)
+	assert.Contains(t, recBoth.Body.String(), "content_and_template_conflict")
+
+	recNeither := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms"}`,
+		nil,
+	)
+	require.Equal(t, http.StatusUnprocessableEntity, recNeither.Code)
+
+	recWrongCh := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		fmt.Sprintf(`{"recipient":"a@example.com","channel":"email","templateId":%q,"templateVariables":{"name":"Ayşe","code":"1234"}}`, tmpl.ID),
+		nil,
+	)
+	require.Equal(t, http.StatusUnprocessableEntity, recWrongCh.Code)
+	assert.Contains(t, recWrongCh.Body.String(), "template_channel_mismatch")
+
+	// 4. Rendered SMS exceeding 10 segments (> 670 UCS-2 code units) fails with 422 too_many_segments.
+	recTooLong := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		fmt.Sprintf(`{"recipient":"+905551234567","channel":"sms","templateId":%q,"templateVariables":{"name":%q,"code":"1234"}}`, tmpl.ID, strings.Repeat("ş", 660)),
+		nil,
+	)
+	require.Equal(t, http.StatusUnprocessableEntity, recTooLong.Code)
+	assert.Contains(t, recTooLong.Body.String(), "too_many_segments")
+
+	// 5. Batch create with personalized SMS templates (render-at-create).
+	batchBody := fmt.Sprintf(`{"notifications":[
+		{"recipient":"+905551111111","channel":"sms","templateId":%q,"templateVariables":{"name":"Ayşe","code":"4821"}},
+		{"recipient":"+905552222222","channel":"sms","templateId":%q,"templateVariables":{"name":"Mehmet","code":"9035"}}
+	]}`, tmpl.ID, tmpl.ID)
+	recBatch := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications/batch", batchBody, nil)
+	require.Equal(t, http.StatusAccepted, recBatch.Code)
+	var batchResp api.BatchCreateResponse
+	require.NoError(t, json.Unmarshal(recBatch.Body.Bytes(), &batchResp))
+	require.Len(t, batchResp.NotificationIDs, 2)
+	assert.Len(t, enq.Items(), 2)
+
+	n0, err := store.GetNotification(t.Context(), batchResp.NotificationIDs[0])
+	require.NoError(t, err)
+	assert.Equal(t, "Merhaba Ayşe, doğrulama kodunuz: 4821", n0.Content)
+	require.NotNil(t, n0.TemplateID)
+	assert.Equal(t, tmpl.ID, *n0.TemplateID)
+
+	// 6. PUT /api/v1/templates/{id} updates template definition, and does NOT alter already-created notifications.
+	recPut := doJSONRequest(t, h, http.MethodPut, "/api/v1/templates/"+tmpl.ID.String(),
+		`{"name":"otp_tr","channel":"sms","body":"YENI METIN: {{name}} - {{code}}","variables":["name","code"]}`,
+		nil,
+	)
+	require.Equal(t, http.StatusOK, recPut.Code)
+	n0AfterPut, err := store.GetNotification(t.Context(), batchResp.NotificationIDs[0])
+	require.NoError(t, err)
+	assert.Equal(t, "Merhaba Ayşe, doğrulama kodunuz: 4821", n0AfterPut.Content, "render-at-create must keep queued notification immutable after template PUT")
+
+	// 7. GET /api/v1/templates?channel=sms lists active template.
+	recList := doJSONRequest(t, h, http.MethodGet, "/api/v1/templates?channel=sms", "", nil)
+	require.Equal(t, http.StatusOK, recList.Code)
+	var listResp api.TemplateListResponse
+	require.NoError(t, json.Unmarshal(recList.Body.Bytes(), &listResp))
+	require.Len(t, listResp.Data, 1)
+	assert.Equal(t, tmpl.ID, listResp.Data[0].ID)
+
+	// 8. DELETE /api/v1/templates/{id} soft-deletes (204) -> subsequent GET returns 404 -> create notification returns 422 template_not_found, while existing notification keeps templateId and content.
+	recDel := doJSONRequest(t, h, http.MethodDelete, "/api/v1/templates/"+tmpl.ID.String(), "", nil)
+	require.Equal(t, http.StatusNoContent, recDel.Code)
+
+	recGetDeleted := doJSONRequest(t, h, http.MethodGet, "/api/v1/templates/"+tmpl.ID.String(), "", nil)
+	require.Equal(t, http.StatusNotFound, recGetDeleted.Code)
+
+	recUseDeleted := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		fmt.Sprintf(`{"recipient":"+905551234567","channel":"sms","templateId":%q,"templateVariables":{"name":"Ali","code":"0000"}}`, tmpl.ID),
+		nil,
+	)
+	require.Equal(t, http.StatusUnprocessableEntity, recUseDeleted.Code)
+	assert.Contains(t, recUseDeleted.Body.String(), "template_not_found")
+
+	recGetExistingNotif := doJSONRequest(t, h, http.MethodGet, "/api/v1/notifications/"+batchResp.NotificationIDs[0].String(), "", nil)
+	require.Equal(t, http.StatusOK, recGetExistingNotif.Code)
+	var existingDetail api.NotificationDetailResponse
+	require.NoError(t, json.Unmarshal(recGetExistingNotif.Body.Bytes(), &existingDetail))
+	assert.Equal(t, "Merhaba Ayşe, doğrulama kodunuz: 4821", existingDetail.Content)
+	require.NotNil(t, existingDetail.TemplateID)
+	assert.Equal(t, tmpl.ID, *existingDetail.TemplateID)
 }
 
 func TestScheduledNotificationsValidationImmediateThresholdAndCancel(t *testing.T) {

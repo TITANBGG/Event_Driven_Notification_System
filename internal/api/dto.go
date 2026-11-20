@@ -116,6 +116,7 @@ type MetricsSnapshotResponse struct {
 type NotificationResponse struct {
 	ID                uuid.UUID  `json:"id"`
 	BatchID           *uuid.UUID `json:"batchId"`
+	TemplateID        *uuid.UUID `json:"templateId,omitempty"`
 	Recipient         string     `json:"recipient"`
 	Channel           string     `json:"channel"`
 	Priority          string     `json:"priority"`
@@ -134,6 +135,54 @@ type NotificationResponse struct {
 	SentAt            *time.Time `json:"sentAt"`
 	FailedAt          *time.Time `json:"failedAt"`
 	CancelledAt       *time.Time `json:"cancelledAt"`
+}
+
+type upsertTemplateRequest struct {
+	Name      string   `json:"name"`
+	Channel   string   `json:"channel"`
+	Subject   *string  `json:"subject,omitempty"`
+	Title     *string  `json:"title,omitempty"`
+	Body      string   `json:"body"`
+	Variables []string `json:"variables"`
+}
+
+type previewTemplateRequest struct {
+	Variables map[string]any `json:"variables"`
+}
+
+// TemplateResponse is the public HTTP representation of a message template.
+type TemplateResponse struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Channel   string    `json:"channel"`
+	Subject   *string   `json:"subject,omitempty"`
+	Title     *string   `json:"title,omitempty"`
+	Body      string    `json:"body"`
+	Variables []string  `json:"variables"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// TemplateListResponse is returned by GET /api/v1/templates.
+type TemplateListResponse struct {
+	Data       []TemplateResponse `json:"data"`
+	NextCursor *string            `json:"nextCursor"`
+}
+
+// SMSPreviewInfo describes SMS encoding, code units, and segment count for a rendered SMS preview.
+type SMSPreviewInfo struct {
+	Encoding string `json:"encoding"`
+	Units    int    `json:"units"`
+	Segments int    `json:"segments"`
+}
+
+// TemplatePreviewResponse is returned by POST /api/v1/templates/{id}/preview.
+type TemplatePreviewResponse struct {
+	Subject         *string         `json:"subject"`
+	Title           *string         `json:"title"`
+	Content         string          `json:"content"`
+	SMS             *SMSPreviewInfo `json:"sms,omitempty"`
+	UnusedVariables []string        `json:"unusedVariables"`
 }
 
 // DeliveryAttemptResponse is the public representation of one recorded delivery attempt.
@@ -190,6 +239,7 @@ func toNotificationResponse(n domain.Notification) NotificationResponse {
 	return NotificationResponse{
 		ID:                n.ID,
 		BatchID:           n.BatchID,
+		TemplateID:        n.TemplateID,
 		Recipient:         n.Recipient,
 		Channel:           n.Channel.String(),
 		Priority:          n.Priority.String(),
@@ -209,6 +259,32 @@ func toNotificationResponse(n domain.Notification) NotificationResponse {
 		FailedAt:          utcTimePtr(n.FailedAt),
 		CancelledAt:       utcTimePtr(n.CancelledAt),
 	}
+}
+
+func toTemplateResponse(t domain.Template) TemplateResponse {
+	vars := t.Variables
+	if vars == nil {
+		vars = []string{}
+	}
+	return TemplateResponse{
+		ID:        t.ID,
+		Name:      t.Name,
+		Channel:   t.Channel.String(),
+		Subject:   t.Subject,
+		Title:     t.Title,
+		Body:      t.Body,
+		Variables: vars,
+		CreatedAt: t.CreatedAt.UTC(),
+		UpdatedAt: t.UpdatedAt.UTC(),
+	}
+}
+
+func toTemplateResponses(items []domain.Template) []TemplateResponse {
+	out := make([]TemplateResponse, 0, len(items))
+	for _, t := range items {
+		out = append(out, toTemplateResponse(t))
+	}
+	return out
 }
 
 func toNotificationResponses(items []domain.Notification) []NotificationResponse {

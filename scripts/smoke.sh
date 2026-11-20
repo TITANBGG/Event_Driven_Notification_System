@@ -129,6 +129,45 @@ run_req "GET /api/v1/notifications?status=scheduled&limit=5" "200" \
 run_req "POST /api/v1/notifications/${SCHED_ID}/cancel (cancel scheduled notification before due)" "200" \
   curl -X POST "${API_URL}/api/v1/notifications/${SCHED_ID}/cancel"
 
+echo "=== Template system (B-3): create template -> preview -> batch of 3 personalized SMS ==="
+TMPL_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/templates" \
+  -H "Content-Type: application/json" \
+  -d "{\"name\":\"otp-tr-${RUN_TAG}\",\"channel\":\"sms\",\"body\":\"Merhaba {{name}}, doğrulama kodunuz: {{code}}\",\"variables\":[\"name\",\"code\"]}")"
+TMPL_ID="$(printf '%s' "${TMPL_JSON}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
+echo "Created template id=${TMPL_ID}"
+
+run_req "POST /api/v1/templates/${TMPL_ID}/preview" "200" \
+  curl -X POST "${API_URL}/api/v1/templates/${TMPL_ID}/preview" \
+  -H "Content-Type: application/json" \
+  -d '{"variables":{"name":"Ayşe","code":"4821","unusedVar":"extra"}}'
+
+TMPL_BATCH_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/notifications/batch" \
+  -H "Content-Type: application/json" \
+  -d "{\"notifications\":[
+    {\"recipient\":\"+905551111111\",\"channel\":\"sms\",\"templateId\":\"${TMPL_ID}\",\"templateVariables\":{\"name\":\"Ayşe\",\"code\":\"4821\"}},
+    {\"recipient\":\"+905552222222\",\"channel\":\"sms\",\"templateId\":\"${TMPL_ID}\",\"templateVariables\":{\"name\":\"Mehmet\",\"code\":\"9035\"}},
+    {\"recipient\":\"+905553333333\",\"channel\":\"sms\",\"templateId\":\"${TMPL_ID}\",\"templateVariables\":{\"name\":\"Zeynep\",\"code\":7142}}
+  ]}")"
+TMPL_BATCH_ID="$(printf '%s' "${TMPL_BATCH_JSON}" | sed -n 's/.*"batchId":"\([^"]*\)".*/\1/p')"
+echo "Created template batchId=${TMPL_BATCH_ID}"
+
+TMPL_ALL_SENT=0
+for _ in $(seq 1 40); do
+  TSUM_JSON="$(curl -fsS "${API_URL}/api/v1/batches/${TMPL_BATCH_ID}")"
+  if printf '%s' "${TSUM_JSON}" | grep -q '"countsByStatus":{"sent":3}'; then
+    TMPL_ALL_SENT=1
+    break
+  fi
+  sleep 0.25
+done
+if [ "${TMPL_ALL_SENT}" -ne 1 ]; then
+  echo "ERROR: template batch ${TMPL_BATCH_ID} did not reach sent=3 within 10s" >&2
+  exit 1
+fi
+
+run_req "GET /api/v1/batches/${TMPL_BATCH_ID} (all 3 personalized template SMS sent)" "200" \
+  curl "${API_URL}/api/v1/batches/${TMPL_BATCH_ID}"
+
 run_req "GET /api/v1/metrics (real-time JSON observability snapshot)" "200" \
   curl "${API_URL}/api/v1/metrics"
 

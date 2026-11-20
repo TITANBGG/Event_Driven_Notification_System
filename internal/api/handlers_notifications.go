@@ -18,6 +18,7 @@ import (
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/repository"
+	"github.com/TITANBGG/notification-system/internal/template"
 )
 
 var (
@@ -33,34 +34,37 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 	}
 
 	now := h.nowFn().UTC()
-	in := req.toDomainInput()
+	rawIn := req.toDomainInput()
 
 	ve := &domain.ValidationError{}
 	idemKey, idemValid := parseIdempotencyHeader(r)
 	if !idemValid {
 		ve.Add("Idempotency-Key", "invalid_idempotency_key", "must be 1..255 printable ASCII characters")
 	}
-
-	addPhase3UnsupportedErrors("", in, ve)
-	if in.IdempotencyKey != nil {
+	if rawIn.IdempotencyKey != nil {
 		ve.Add("idempotencyKey", "unsupported_field", "use the Idempotency-Key header for single notifications; body idempotencyKey is only supported for batch items")
 	}
-	opts := domain.ValidationOptions{
-		AllowEmptyContent:      in.TemplateID != nil,
-		CheckScheduledAt:       true,
-		ClockSkewTolerance:     h.cfg.ClockSkewTolerance,
-		ScheduleMaxAhead:       h.cfg.ScheduleMaxAhead,
-		ExtendedProviderFields: h.cfg.ProviderExtended,
+
+	var tmplByID map[uuid.UUID]domain.Template
+	if rawIn.TemplateID != nil {
+		tmpl, getErr := h.store.GetTemplate(r.Context(), *rawIn.TemplateID)
+		if getErr != nil {
+			if !errors.Is(getErr, domain.ErrNotFound) {
+				writeError(w, r, h.logger, getErr)
+				return
+			}
+		} else {
+			tmplByID = map[uuid.UUID]domain.Template{tmpl.ID: *tmpl}
+		}
 	}
-	if domErr := domain.ValidateNotification(in, now, opts); domErr != nil {
-		ve.Fields = append(ve.Fields, domErr.Fields...)
-	}
+
+	in := h.resolveAndValidateNotificationInput("", rawIn, tmplByID, now, ve)
 	if ve.HasErrors() {
 		writeError(w, r, h.logger, ve)
 		return
 	}
 
-	norm := in.Normalize()
+	norm := rawIn.Normalize()
 	cid := observability.CorrelationID(r.Context())
 	reqHash, err := domain.RequestHash(norm)
 	if err != nil {
@@ -80,21 +84,24 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 		storedIdemKey = &kCopy
 	}
 
-	status, scheduledAt := resolveScheduleState(norm.ScheduledAt, now)
+	renderedNorm := in.Normalize()
+	status, scheduledAt := resolveScheduleState(renderedNorm.ScheduledAt, now)
 
 	candidate := domain.Notification{
 		ID:             notifID,
-		Channel:        domain.Channel(norm.Channel),
-		Priority:       domain.Priority(norm.Priority),
+		Channel:        domain.Channel(renderedNorm.Channel),
+		Priority:       domain.Priority(renderedNorm.Priority),
 		Status:         status,
-		Recipient:      norm.Recipient,
-		Subject:        norm.Subject,
-		Title:          norm.Title,
-		Content:        norm.Content,
+		Recipient:      renderedNorm.Recipient,
+		Subject:        renderedNorm.Subject,
+		Title:          renderedNorm.Title,
+		Content:        renderedNorm.Content,
 		IdempotencyKey: storedIdemKey,
 		MaxAttempts:    h.cfg.MaxAttempts,
 		ScheduledAt:    scheduledAt,
 		CorrelationID:  optionalNonEmpty(cid),
+		TemplateID:     norm.TemplateID,
+		TemplateVars:   norm.TemplateVars,
 	}
 
 	created, replayed, replayStatus, err := h.persistSingleNotification(r.Context(), candidate, idemKey, reqHash, now)
@@ -220,29 +227,45 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		ve.Add("Idempotency-Key", "invalid_idempotency_key", "must be 1..255 printable ASCII characters")
 	}
 
-	normalizedItems := make([]domain.CreateNotificationInput, len(req.Notifications))
+	rawItems := make([]domain.CreateNotificationInput, len(req.Notifications))
+	var templateIDs []uuid.UUID
+	seenTemplateIDs := make(map[uuid.UUID]struct{})
+	for i, itemReq := range req.Notifications {
+		in := itemReq.toDomainInput()
+		rawItems[i] = in
+		if in.TemplateID != nil {
+			if _, ok := seenTemplateIDs[*in.TemplateID]; !ok {
+				seenTemplateIDs[*in.TemplateID] = struct{}{}
+				templateIDs = append(templateIDs, *in.TemplateID)
+			}
+		}
+	}
+
+	tmplByID := make(map[uuid.UUID]domain.Template, len(templateIDs))
+	if len(templateIDs) > 0 {
+		tmpls, getErr := h.store.GetTemplatesByIDs(r.Context(), templateIDs)
+		if getErr != nil {
+			writeError(w, r, h.logger, getErr)
+			return
+		}
+		for _, t := range tmpls {
+			tmplByID[t.ID] = t
+		}
+	}
+
+	normalizedRawItems := make([]domain.CreateNotificationInput, len(req.Notifications))
+	renderedItems := make([]domain.CreateNotificationInput, len(req.Notifications))
 	itemKeyIndexes := make(map[string][]int)
 
-	for i, itemReq := range req.Notifications {
+	for i, rawIn := range rawItems {
 		prefix := fmt.Sprintf("notifications[%d].", i)
-		in := itemReq.toDomainInput()
+		rendered := h.resolveAndValidateNotificationInput(prefix, rawIn, tmplByID, now, ve)
+		renderedItems[i] = rendered.Normalize()
 
-		addPhase3UnsupportedErrors(prefix, in, ve)
-		opts := domain.ValidationOptions{
-			AllowEmptyContent:      in.TemplateID != nil,
-			CheckScheduledAt:       true,
-			ClockSkewTolerance:     h.cfg.ClockSkewTolerance,
-			ScheduleMaxAhead:       h.cfg.ScheduleMaxAhead,
-			ExtendedProviderFields: h.cfg.ProviderExtended,
-		}
-		if domErr := domain.ValidateNotificationWithPrefix(prefix, in, now, opts); domErr != nil {
-			ve.Fields = append(ve.Fields, domErr.Fields...)
-		}
-
-		norm := in.Normalize()
-		normalizedItems[i] = norm
-		if norm.IdempotencyKey != nil {
-			itemKeyIndexes[*norm.IdempotencyKey] = append(itemKeyIndexes[*norm.IdempotencyKey], i)
+		normRaw := rawIn.Normalize()
+		normalizedRawItems[i] = normRaw
+		if normRaw.IdempotencyKey != nil {
+			itemKeyIndexes[*normRaw.IdempotencyKey] = append(itemKeyIndexes[*normRaw.IdempotencyKey], i)
 		}
 	}
 
@@ -252,7 +275,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	batchHash, err := domain.RequestHash(domain.BatchCreateInput{Notifications: normalizedItems})
+	batchHash, err := domain.RequestHash(domain.BatchCreateInput{Notifications: normalizedRawItems})
 	if err != nil {
 		writeError(w, r, h.logger, fmt.Errorf("computing batch request hash: %w", err))
 		return
@@ -265,40 +288,43 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cid := observability.CorrelationID(r.Context())
-	notifications := make([]domain.Notification, len(normalizedItems))
+	notifications := make([]domain.Notification, len(renderedItems))
 	itemKeys := make([]string, 0)
 	itemKeyRecords := make([]domain.IdempotencyKey, 0)
 	indexByItemKey := make(map[string]int)
 
-	for i, norm := range normalizedItems {
+	for i, renderedNorm := range renderedItems {
+		normRaw := normalizedRawItems[i]
 		notifID, idErr := newUUIDv7()
 		if idErr != nil {
 			writeError(w, r, h.logger, fmt.Errorf("generating notification id: %w", idErr))
 			return
 		}
-		status, scheduledAt := resolveScheduleState(norm.ScheduledAt, now)
+		status, scheduledAt := resolveScheduleState(renderedNorm.ScheduledAt, now)
 		notifications[i] = domain.Notification{
 			ID:             notifID,
 			BatchID:        &batchID,
-			Channel:        domain.Channel(norm.Channel),
-			Priority:       domain.Priority(norm.Priority),
+			Channel:        domain.Channel(renderedNorm.Channel),
+			Priority:       domain.Priority(renderedNorm.Priority),
 			Status:         status,
-			Recipient:      norm.Recipient,
-			Subject:        norm.Subject,
-			Title:          norm.Title,
-			Content:        norm.Content,
-			IdempotencyKey: norm.IdempotencyKey,
+			Recipient:      renderedNorm.Recipient,
+			Subject:        renderedNorm.Subject,
+			Title:          renderedNorm.Title,
+			Content:        renderedNorm.Content,
+			IdempotencyKey: normRaw.IdempotencyKey,
 			MaxAttempts:    h.cfg.MaxAttempts,
 			ScheduledAt:    scheduledAt,
 			CorrelationID:  optionalNonEmpty(cid),
+			TemplateID:     normRaw.TemplateID,
+			TemplateVars:   normRaw.TemplateVars,
 		}
-		if norm.IdempotencyKey != nil {
-			itemHash, hErr := domain.RequestHash(norm)
+		if normRaw.IdempotencyKey != nil {
+			itemHash, hErr := domain.RequestHash(normRaw)
 			if hErr != nil {
 				writeError(w, r, h.logger, fmt.Errorf("computing item request hash: %w", hErr))
 				return
 			}
-			k := *norm.IdempotencyKey
+			k := *normRaw.IdempotencyKey
 			itemKeys = append(itemKeys, k)
 			indexByItemKey[k] = i
 			itemKeyRecords = append(itemKeyRecords, domain.IdempotencyKey{
@@ -755,12 +781,68 @@ func resolveScheduleState(scheduledAt *time.Time, now time.Time) (domain.Status,
 	return domain.StatusScheduled, &target
 }
 
-func addPhase3UnsupportedErrors(prefix string, in domain.CreateNotificationInput, ve *domain.ValidationError) {
-	if in.TemplateID != nil {
-		ve.Add(prefix+"templateId", "not_supported_yet", "templateId is not supported until Phase 9")
-	} else if len(in.TemplateVars) > 0 {
-		ve.Add(prefix+"templateVariables", "not_supported_yet", "templateVariables are not supported until Phase 9")
+func (h *handler) resolveAndValidateNotificationInput(
+	prefix string,
+	in domain.CreateNotificationInput,
+	tmplByID map[uuid.UUID]domain.Template,
+	now time.Time,
+	ve *domain.ValidationError,
+) domain.CreateNotificationInput {
+	hasContent := strings.TrimSpace(in.Content) != ""
+	hasTemplate := in.TemplateID != nil
+
+	if hasContent && hasTemplate {
+		ve.Add(prefix+"content", "content_and_template_conflict", "provide either content or templateId, not both")
 	}
+	if !hasTemplate && len(in.TemplateVars) > 0 {
+		ve.Add(prefix+"templateVariables", "template_id_required", "templateVariables cannot be provided without templateId")
+	}
+
+	allowEmptyContent := hasContent && hasTemplate // avoid spurious "content required" when both were sent
+	resolved := in
+
+	if hasTemplate && !hasContent {
+		allowEmptyContent = true
+		tmpl, exists := tmplByID[*in.TemplateID]
+		if !exists {
+			ve.Add(prefix+"templateId", "template_not_found", fmt.Sprintf("active template %s was not found", *in.TemplateID))
+		} else {
+			reqCh, chErr := domain.ParseChannel(in.Channel)
+			if chErr == nil && tmpl.Channel != reqCh {
+				ve.Add(
+					prefix+"templateId",
+					"template_channel_mismatch",
+					fmt.Sprintf("template channel %q does not match notification channel %q", tmpl.Channel, reqCh),
+				)
+			}
+			rendered, renderErr := template.Render(prefix, tmpl, in.TemplateVars)
+			if renderErr != nil {
+				ve.Fields = append(ve.Fields, renderErr.Fields...)
+			} else {
+				resolved.Content = rendered.Content
+				if resolved.Subject == nil && rendered.Subject != nil {
+					resolved.Subject = rendered.Subject
+				}
+				if resolved.Title == nil && rendered.Title != nil {
+					resolved.Title = rendered.Title
+				}
+				// Re-enable content emptiness check on the rendered output.
+				allowEmptyContent = false
+			}
+		}
+	}
+
+	opts := domain.ValidationOptions{
+		AllowEmptyContent:      allowEmptyContent,
+		CheckScheduledAt:       true,
+		ClockSkewTolerance:     h.cfg.ClockSkewTolerance,
+		ScheduleMaxAhead:       h.cfg.ScheduleMaxAhead,
+		ExtendedProviderFields: h.cfg.ProviderExtended,
+	}
+	if domErr := domain.ValidateNotificationWithPrefix(prefix, resolved, now, opts); domErr != nil {
+		ve.Fields = append(ve.Fields, domErr.Fields...)
+	}
+	return resolved
 }
 
 func addDuplicateBatchItemKeyErrors(itemKeyIndexes map[string][]int, batchKey string, ve *domain.ValidationError) {
