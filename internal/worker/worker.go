@@ -299,7 +299,10 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 		return
 	}
 
-	attemptLogger := itemLogger.With(slog.Int("attempt", n.Attempts))
+	attemptLogger := itemLogger.With(
+		slog.Int("attempt", n.Attempts),
+		slog.String("recipient", observability.MaskRecipient(ch.String(), n.Recipient)),
+	)
 	if n.BatchID != nil {
 		attemptLogger = attemptLogger.With(slog.String("batch_id", n.BatchID.String()))
 	}
@@ -315,6 +318,10 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 	if sendErr != nil {
 		attemptLogger.Warn("provider execution aborted by context cancellation", slog.String("error", sendErr.Error()))
 		return
+	}
+
+	if w.hooks.OnProviderRequest != nil {
+		w.hooks.OnProviderRequest(ch, res.HTTPStatus, res.Err, res.Duration)
 	}
 
 	attemptErr := errorStringPtr(res.Err)
@@ -343,11 +350,17 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 		if ackErr := w.queue.Ack(itemDrainCtx, w.cfg.WorkerID, n.ID); ackErr != nil {
 			attemptLogger.Warn("failed acking sent notification", slog.String("error", ackErr.Error()))
 		}
+		if w.hooks.OnEndToEndLatency != nil && !n.CreatedAt.IsZero() {
+			w.hooks.OnEndToEndLatency(ch, max(w.nowFn().Sub(n.CreatedAt), 0))
+		}
 		w.emitProcessed(ch, domain.StatusSent)
-		attemptLogger.Info("notification sent", slog.Int("duration_ms", durationMS))
+		attemptLogger.Info("notification sent",
+			slog.String("outcome", domain.OutcomeSent.String()),
+			slog.Int("duration_ms", durationMS),
+		)
 
 	case provider.OutcomeTransient:
-		w.handleTransientOutcome(itemDrainCtx, attemptLogger, ch, n, meta, res, attemptErr)
+		w.handleTransientOutcome(itemDrainCtx, attemptLogger, ch, n, meta, res, attemptErr, durationMS)
 
 	default:
 		w.failNotification(
@@ -358,6 +371,8 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 			n.Attempts,
 			errorStringValue(attemptErr, "delivery failed"),
 			"permanent_failure",
+			domain.OutcomePermanent,
+			durationMS,
 		)
 	}
 }
@@ -385,7 +400,17 @@ func (w *Worker) handleCircuitOpen(
 	}
 
 	if n.Deferrals+1 > w.cfg.MaxCircuitDeferral {
-		w.failNotification(drainCtx, logger, ch, n.ID, n.Attempts, "circuit open too long", "circuit_open_exhausted")
+		w.failNotification(
+			drainCtx,
+			logger,
+			ch,
+			n.ID,
+			n.Attempts,
+			"circuit open too long",
+			"circuit_open_exhausted",
+			domain.OutcomeCircuitOpen,
+			0,
+		)
 		return
 	}
 
@@ -399,6 +424,8 @@ func (w *Worker) handleCircuitOpen(
 		logger.Warn("failed scheduling circuit-open deferral", slog.String("error", schedErr.Error()))
 	}
 	logger.Warn("notification deferred while circuit breaker is open",
+		slog.String("outcome", domain.OutcomeCircuitOpen.String()),
+		slog.Int("duration_ms", 0),
 		slog.Int("deferrals", updated.Deferrals),
 		slog.Time("next_attempt_at", nextAt),
 	)
@@ -412,6 +439,7 @@ func (w *Worker) handleTransientOutcome(
 	meta *queue.Meta,
 	res provider.Result,
 	attemptErr *string,
+	durationMS int,
 ) {
 	errText := errorStringValue(attemptErr, "transient delivery failure")
 	if n.Attempts < n.MaxAttempts {
@@ -425,10 +453,13 @@ func (w *Worker) handleTransientOutcome(
 		if schedErr := w.queue.Schedule(drainCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
 			logger.Warn("failed scheduling notification retry", slog.String("error", schedErr.Error()))
 		}
+		w.emitProcessed(ch, domain.StatusRetrying)
 		if w.hooks.OnRetryScheduled != nil {
 			w.hooks.OnRetryScheduled(ch)
 		}
 		logger.Warn("notification scheduled for retry",
+			slog.String("outcome", domain.OutcomeTransient.String()),
+			slog.Int("duration_ms", durationMS),
 			slog.Duration("delay", delay),
 			slog.Time("next_attempt_at", nextAt),
 			slog.String("error", errText),
@@ -436,7 +467,17 @@ func (w *Worker) handleTransientOutcome(
 		return
 	}
 
-	w.failNotification(drainCtx, logger, ch, n.ID, n.Attempts, "max attempts reached: "+errText, "max_attempts_exhausted")
+	w.failNotification(
+		drainCtx,
+		logger,
+		ch,
+		n.ID,
+		n.Attempts,
+		"max attempts reached: "+errText,
+		"max_attempts_exhausted",
+		domain.OutcomeTransient,
+		durationMS,
+	)
 }
 
 func (w *Worker) failNotification(
@@ -447,6 +488,8 @@ func (w *Worker) failNotification(
 	claimedAttempts int,
 	lastError string,
 	reason string,
+	outcome domain.AttemptOutcome,
+	durationMS int,
 ) {
 	if _, err := w.store.MarkFailed(drainCtx, id, claimedAttempts, lastError); err != nil {
 		w.handleFencedError(drainCtx, logger, id, "MarkFailed", err)
@@ -456,7 +499,12 @@ func (w *Worker) failNotification(
 		logger.Warn("failed deadlettering failed notification", slog.String("error", dlqErr.Error()))
 	}
 	w.emitProcessed(ch, domain.StatusFailed)
-	logger.Warn("notification failed permanently", slog.String("reason", reason), slog.String("error", lastError))
+	logger.Warn("notification failed permanently",
+		slog.String("outcome", outcome.String()),
+		slog.Int("duration_ms", durationMS),
+		slog.String("reason", reason),
+		slog.String("error", lastError),
+	)
 }
 
 func (w *Worker) handleFencedError(ctx context.Context, logger *slog.Logger, id uuid.UUID, op string, err error) {

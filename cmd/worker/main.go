@@ -83,7 +83,15 @@ func run() error {
 
 	store := repository.New(pool)
 	q := queue.New(rdb)
-	limiter := ratelimit.New(rdb, cfg.RateLimitPerSec, cfg.RateLimitBurst)
+	metrics := observability.NewWorkerMetrics()
+	limiter := ratelimit.New(
+		rdb,
+		cfg.RateLimitPerSec,
+		cfg.RateLimitBurst,
+		ratelimit.WithOnRateLimited(func(ch domain.Channel, wait time.Duration) {
+			metrics.ObserveRateLimit(ch.String(), wait)
+		}),
+	)
 	client := provider.NewClient(provider.ClientConfig{
 		URL:            cfg.ProviderURL,
 		Timeout:        cfg.ProviderTimeout,
@@ -92,7 +100,31 @@ func run() error {
 		Logger:         logger,
 	})
 
-	hooks := worker.Hooks{}
+	hooks := worker.Hooks{
+		OnPanic:     metrics.IncWorkerPanic,
+		OnLeaseLost: metrics.IncLeaseLost,
+		OnProcessed: func(ch domain.Channel, status domain.Status) {
+			metrics.IncNotificationProcessed(ch.String(), status.String())
+		},
+		OnProviderRequest: func(ch domain.Channel, httpStatus *int, sendErr error, duration time.Duration) {
+			metrics.ObserveProviderRequest(ch.String(), httpStatus, sendErr, duration)
+		},
+		OnEndToEndLatency: func(ch domain.Channel, latency time.Duration) {
+			metrics.ObserveEndToEndLatency(ch.String(), latency)
+		},
+		OnRetryScheduled: func(ch domain.Channel) {
+			metrics.IncRetryScheduled(ch.String())
+		},
+		OnBreakerStateChange: func(ch domain.Channel, _, to string) {
+			metrics.SetCircuitBreakerState(ch.String(), to)
+		},
+		OnReconcilerAction: func(step string, count int) {
+			metrics.AddReconcilerAction(step, count)
+		},
+		OnInflightSwept: func(count int) {
+			metrics.AddReconcilerAction("inflight_swept", count)
+		},
+	}
 	retryPolicy := worker.NewExponentialRetryPolicy(cfg.RetryBase, cfg.RetryCap, cfg.RetryMin, cfg.RetryAfterMax)
 	breaker := worker.NewChannelBreaker(worker.ChannelBreakerConfig{
 		Config: cfg,
@@ -145,6 +177,7 @@ func run() error {
 	}
 	mux.HandleFunc("GET /health/ready", readyHandler)
 	mux.HandleFunc("GET /health", readyHandler)
+	mux.Handle("GET /metrics", metrics.Handler())
 
 	srv := &http.Server{
 		Addr:              cfg.WorkerMetricsAddr,

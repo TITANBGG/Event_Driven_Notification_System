@@ -85,6 +85,8 @@ type Hooks struct {
 	OnPanic              func()
 	OnLeaseLost          func()
 	OnProcessed          func(ch domain.Channel, status domain.Status)
+	OnProviderRequest    func(ch domain.Channel, httpStatus *int, err error, duration time.Duration)
+	OnEndToEndLatency    func(ch domain.Channel, latency time.Duration)
 	OnRetryScheduled     func(ch domain.Channel)
 	OnBreakerStateChange func(ch domain.Channel, from, to string)
 	OnReconcilerAction   func(step string, count int)
