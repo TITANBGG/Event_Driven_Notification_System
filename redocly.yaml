@@ -1,0 +1,6 @@
+# Redocly CLI config used by `npx @redocly/cli lint api/openapi.yaml` (CI job openapi-lint).
+extends:
+  - recommended
+rules:
+  # The spec targets the local docker-compose stack on purpose (Swagger UI "Try it out" on :8081).
+  no-server-example.com: off

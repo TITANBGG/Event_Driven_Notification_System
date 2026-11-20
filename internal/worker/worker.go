@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	idleBackoffMin       = 50 * time.Millisecond
+	idleBackoffInitial   = 50 * time.Millisecond
 	idleBackoffMax       = time.Second
 	limiterErrorBackoff  = 200 * time.Millisecond
 	delayedMoverBatchMax = 500
@@ -226,7 +226,7 @@ func (w *Worker) Run(ctx context.Context) error {
 }
 
 func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, workerNum int) {
-	backoff := idleBackoffMin
+	backoff := idleBackoffInitial
 
 	for {
 		if ctx.Err() != nil {
@@ -266,7 +266,7 @@ func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, 
 			backoff = min(backoff*2, idleBackoffMax)
 			continue
 		}
-		backoff = idleBackoffMin
+		backoff = idleBackoffInitial
 	}
 }
 

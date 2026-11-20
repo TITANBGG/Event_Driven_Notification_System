@@ -2,6 +2,9 @@ version: "2"
 
 run:
   timeout: 5m
+  # Lint the testcontainers suite too; otherwise files behind the build tag are silently skipped.
+  build-tags:
+    - integration
 
 linters:
   default: none

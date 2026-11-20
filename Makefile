@@ -1,5 +1,7 @@
 # Use `make test-all` in WSL/Linux/CI; native Windows without GCC/make can run `go test ./...`.
 COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
+# Extra `go test` flags, e.g. make test GOTESTFLAGS="-coverprofile=coverage.out -covermode=atomic" (used by CI).
+GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
 .PHONY: up down logs build test test-integration test-all cover lint fmt migrate-up migrate-down sqlc smoke load run-api run-worker
@@ -22,10 +24,10 @@ build:
 	go build -o bin/loadgen ./cmd/loadgen
 
 test:
-	go test -race ./...
+	go test -race $(GOTESTFLAGS) ./...
 
 test-integration:
-	go test -race -tags=integration ./...
+	go test -race -tags=integration $(GOTESTFLAGS) ./...
 
 test-all: test test-integration
 
