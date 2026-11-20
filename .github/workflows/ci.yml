@@ -182,3 +182,7 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Validate docker-compose.yml (no .env present)
         run: docker compose -f docker-compose.yml config --quiet
+      # D-3 requires legacy `docker-compose` (v1) to work too; v1 is stricter about some syntax, so
+      # parse the file with the last v1 release to catch regressions (full `up` verified manually).
+      - name: Validate docker-compose.yml with legacy Compose v1 (1.29.2)
+        run: docker run --rm -v "$PWD:$PWD" -w "$PWD" docker/compose:1.29.2 -f docker-compose.yml config --quiet

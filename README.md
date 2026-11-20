@@ -24,6 +24,7 @@ It was written in Go 1.27.4 for the Insider One Software Engineer Assessment 202
 12. [Known limitations and next steps](#12-known-limitations-and-next-steps)
 13. [Requirement checklist](#13-requirement-checklist)
 14. [How this was built](#14-how-this-was-built)
+15. [License](#license)
 
 ---
 
@@ -39,7 +40,7 @@ docker compose up --build        # Compose v2
 docker-compose up --build        # legacy Compose v1
 ```
 
-The first build takes a few minutes. The `migrate` service applies `migrations/*.up.sql` and exits; `api`, `worker-1` and `worker-2` start only after it has succeeded. When every container is healthy, run the smoke test (one request per endpoint, each with an expected status code):
+Both commands were verified from a fresh clone with no `.env`: Docker Compose v5.7.0 (`docker compose`) and legacy Compose v1 1.29.2 (`docker-compose`); CI also parses the file with Compose v1 on every push. The first build takes a few minutes. The `migrate` service applies `migrations/*.up.sql` and exits; `api`, `worker-1` and `worker-2` start only after it has succeeded. When every container is healthy, run the smoke test (one request per endpoint, each with an expected status code):
 
 ```bash
 ./scripts/smoke.sh
@@ -1369,3 +1370,9 @@ Every item from the assignment, where it is implemented, and how it is tested. "
 I built this project with an AI pair programmer (Claude Code). The shared specification was [`CLAUDE.md`](CLAUDE.md): the architecture, domain rules, state machine, Redis data model, failure handling and coding conventions were written down there first, and every phase was implemented, reviewed and verified against it, with `gofmt`, `go vet`, `golangci-lint`, `-race` unit tests and the integration suite run after each phase.
 
 The design decisions in this README are mine, and I can explain and defend each of them, including the trade-offs I chose not to take.
+
+---
+
+## License
+
+[MIT](LICENSE)
