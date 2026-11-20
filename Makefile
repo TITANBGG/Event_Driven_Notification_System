@@ -1,10 +1,4 @@
-# WHAT: Standardized developer and CI task runner supporting both `docker compose` and `docker-compose`.
-# WHY: Provides single-command reproducibility for builds, unit/integration tests, coverage, linting,
-#      migrations, sqlc codegen, smoke checks, and load generation (D-3, D-6).
-# EXPECTED OUTPUT EXAMPLE (`make test`):
-#   ok  github.com/TITANBGG/notification-system/internal/config         ...
-#   ok  github.com/TITANBGG/notification-system/internal/observability  ...
-
+# Use `make test-all` in WSL/Linux/CI; native Windows without GCC/make can run `go test ./...`.
 COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compose" || echo "docker-compose")
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
@@ -68,4 +62,3 @@ run-api:
 
 run-worker:
 	go run ./cmd/worker
-

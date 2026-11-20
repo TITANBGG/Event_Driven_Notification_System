@@ -1,9 +1,5 @@
-# WHAT: Full local stack orchestration for both `docker compose up` and legacy `docker-compose up`.
-# WHY: Uses pinned tags, `${VAR:-default}` fallbacks (zero .env required), and YAML anchors instead
-#      of `deploy.replicas` (ignored by legacy docker-compose) to run two worker replicas that prove
-#      distributed rate limiting and coordination.
-# EXPECTED OUTPUT EXAMPLE (`docker compose ps`):
-#   postgres (healthy), redis (healthy), mockprovider (healthy), api (healthy), worker-1 (healthy), worker-2 (healthy)
+# Uses YAML anchors instead of deploy.replicas because legacy docker-compose ignores replicas.
+# Only api defines `build:` to build notification-system:local once; sibling services wait or reuse it.
 
 x-worker-env: &worker-env
   DATABASE_URL: ${DATABASE_URL:-postgres://notif:notif@postgres:5432/notif?sslmode=disable}
@@ -42,9 +38,7 @@ x-worker-env: &worker-env
 
 x-worker: &worker
   image: notification-system:local
-  build:
-    context: .
-    dockerfile: Dockerfile
+  pull_policy: never
   command: ["/app/worker"]
   depends_on:
     postgres:
@@ -53,6 +47,8 @@ x-worker: &worker
       condition: service_healthy
     migrate:
       condition: service_completed_successfully
+    mockprovider:
+      condition: service_healthy
   healthcheck:
     test: ["CMD", "/app/healthcheck", "http://localhost:9091/health/live"]
     interval: 5s
@@ -108,31 +104,6 @@ services:
         condition: service_healthy
     restart: "no"
 
-  mockprovider:
-    image: notification-system:local
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: ["/app/mockprovider"]
-    environment:
-      MOCK_PORT: ${MOCK_PORT:-8090}
-      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-0}
-      MOCK_LATENCY_JITTER_MS: ${MOCK_LATENCY_JITTER_MS:-0}
-      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
-      MOCK_429_RATE: ${MOCK_429_RATE:-0}
-      MOCK_PERMANENT_RATE: ${MOCK_PERMANENT_RATE:-0}
-      MOCK_SEED: ${MOCK_SEED:-0}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-    ports:
-      - "8090:8090"
-    healthcheck:
-      test: ["CMD", "/app/healthcheck", "http://localhost:8090/health/live"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
-    restart: unless-stopped
-
   api:
     image: notification-system:local
     build:
@@ -169,6 +140,32 @@ services:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/app/healthcheck", "http://localhost:8080/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
+  mockprovider:
+    image: notification-system:local
+    pull_policy: never
+    command: ["/app/mockprovider"]
+    environment:
+      MOCK_PORT: ${MOCK_PORT:-8090}
+      MOCK_LATENCY_MS: ${MOCK_LATENCY_MS:-0}
+      MOCK_LATENCY_JITTER_MS: ${MOCK_LATENCY_JITTER_MS:-0}
+      MOCK_FAILURE_RATE: ${MOCK_FAILURE_RATE:-0}
+      MOCK_429_RATE: ${MOCK_429_RATE:-0}
+      MOCK_PERMANENT_RATE: ${MOCK_PERMANENT_RATE:-0}
+      MOCK_SEED: ${MOCK_SEED:-0}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "8090:8090"
+    depends_on:
+      api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "http://localhost:8090/health/live"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -217,4 +214,3 @@ services:
 volumes:
   postgres_data:
   redis_data:
-

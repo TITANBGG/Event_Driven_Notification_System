@@ -1,12 +1,4 @@
 // Package main implements the cmd/worker background processing entrypoint.
-//
-// WHY: Each worker replica runs isolated from cmd/api, exposes its own liveness/metrics HTTP
-// port (:9091), and drains gracefully on SIGTERM so inflight work can be returned cleanly to Redis.
-//
-// Expected output example (startup log):
-//
-//	{"level":"INFO","msg":"config loaded","service":"notification-worker","worker_id":"worker-1",...}
-//	{"level":"INFO","msg":"worker metrics/health server listening","service":"notification-worker","worker_id":"worker-1","addr":":9091"}
 package main
 
 import (

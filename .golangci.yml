@@ -1,9 +1,3 @@
-# WHAT: golangci-lint v2 configuration enforcing static safety, resource cleanup, and style across the repo.
-# WHY: Catches HTTP body leaks (bodyclose), missing request context (noctx), error wrapping mistakes (errorlint),
-#      and slow HTTP server vulnerabilities (gosec) before code reaches CI or production.
-# EXPECTED OUTPUT EXAMPLE (`golangci-lint run`):
-#   0 issues.
-
 version: "2"
 
 run:
@@ -26,13 +20,17 @@ linters:
   settings:
     gosec:
       excludes:
-        - G404 # math/rand is intentional for exponential-backoff jitter and mock fault injection
+        - G404 # math/rand is intentional for backoff jitter and mock fault injection
   exclusions:
     paths:
       - internal/repository/sqlc
+    rules:
+      - path: _test\.go
+        text: "G101"
+        linters:
+          - gosec
 
 formatters:
   enable:
     - gofmt
     - goimports
-

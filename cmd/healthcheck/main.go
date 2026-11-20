@@ -1,12 +1,5 @@
-// Package main implements cmd/healthcheck, a tiny static HTTP GET probe binary for Docker healthchecks.
-//
-// WHY: Our runtime image uses gcr.io/distroless/static-debian12:nonroot which intentionally omits
-// shells, curl, and wget to shrink attack surface. Compiling a minimal static probe lets Docker
-// verify container health natively via ["CMD", "/app/healthcheck", "http://localhost:8080/health/live"].
-//
-// Expected output example:
-//
-//	$ /app/healthcheck http://localhost:8080/health/live   # returns exit code 0 on HTTP 2xx, 1 otherwise
+// Package main implements cmd/healthcheck, a minimal static HTTP GET probe for distroless
+// containers where curl, wget, and shells are intentionally absent.
 package main
 
 import (
@@ -47,11 +40,13 @@ func probe(ctx context.Context, client *http.Client, targetURL string) error {
 		return errors.New("http client must not be nil")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	//nolint:gosec // G704: CLI healthcheck probe intentionally targets the URL passed via argv.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
 	if err != nil {
 		return fmt.Errorf("creating healthcheck request: %w", err)
 	}
 
+	//nolint:gosec // G704: CLI healthcheck probe intentionally targets the validated URL above.
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("performing healthcheck request: %w", err)

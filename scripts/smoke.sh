@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# WHAT: End-to-end smoke script executed against the running Docker Compose stack.
-# WHY: Proves core HTTP health and provider contracts stay healthy after every phase change;
-#      notification create/batch/cancel/retry steps are appended in Phase 3+.
-# EXPECTED OUTPUT EXAMPLE:
-#   [smoke] GET /health/live -> 200
-#   [smoke] POST mockprovider / -> 202
-
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
@@ -24,4 +17,3 @@ curl -fsS -w "\nHTTP %{http_code}\n" -X POST "${MOCK_URL}/" \
 echo "[smoke] GET ${MOCK_URL}/stats"
 curl -fsS "${MOCK_URL}/stats"
 echo ""
-

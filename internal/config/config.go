@@ -1,11 +1,5 @@
-// Package config loads and validates all runtime configuration from environment variables.
-//
-// WHY: Validating every timeout, pool size, batch ceiling, and visibility invariant at startup
-// fails fast before an API or worker replica can silently double-send or exhaust Redis connections.
-//
-// Expected output example (startup config log with masked credentials):
-//
-//	{"level":"INFO","msg":"config loaded","http_addr":":8080","database_url":"postgres://notif:***@postgres:5432/notif?sslmode=disable","redis_pool_size":95,"visibility_timeout":"60s"}
+// Package config loads and validates runtime configuration from environment variables,
+// failing fast on invalid bounds before API or worker replicas begin serving traffic.
 package config
 
 import (
@@ -17,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/TITANBGG/notification-system/internal/observability"
 )
 
 // Config holds the complete typed configuration for API and worker binaries.
@@ -400,19 +396,12 @@ func (c Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// LogValue implements slog.LogValuer so logging Config redacts DATABASE_URL credentials automatically.
-//
-// WHY: Prevents database passwords from ever leaking to stdout or log aggregators when startup config is logged.
-//
-// Expected output example:
-//
-//	slog.Info("config loaded", slog.Any("config", cfg))
-//	// database_url renders as "postgres://notif:***@postgres:5432/notif?sslmode=disable"
+// LogValue implements slog.LogValuer so startup logs redact DATABASE_URL credentials automatically.
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("http_addr", c.HTTPAddr),
 		slog.String("worker_metrics_addr", c.WorkerMetricsAddr),
-		slog.String("database_url", maskDatabaseURL(c.DatabaseURL)),
+		slog.String("database_url", observability.MaskDatabaseURL(c.DatabaseURL)),
 		slog.String("redis_addr", c.RedisAddr),
 		slog.Int("redis_pool_size", c.RedisPoolSize),
 		slog.String("provider_url", c.ProviderURL),
@@ -444,28 +433,4 @@ func parseCSV(raw string) []string {
 		}
 	}
 	return out
-}
-
-func maskDatabaseURL(raw string) string {
-	schemeIdx := strings.Index(raw, "://")
-	if schemeIdx < 0 {
-		return "***"
-	}
-	rest := raw[schemeIdx+3:]
-	authEnd := strings.IndexAny(rest, "/?#")
-	if authEnd < 0 {
-		authEnd = len(rest)
-	}
-	authority := rest[:authEnd]
-	atIdx := strings.LastIndex(authority, "@")
-	if atIdx < 0 {
-		return raw
-	}
-	userInfo := authority[:atIdx]
-	colonIdx := strings.Index(userInfo, ":")
-	if colonIdx < 0 {
-		return raw
-	}
-	maskedUser := userInfo[:colonIdx] + ":***"
-	return raw[:schemeIdx+3] + maskedUser + rest[atIdx:]
 }

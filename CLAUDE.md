@@ -1,13 +1,3 @@
-<!--
-WHAT: Project Constitution & Architectural Specification (`CLAUDE.md`) for the Event-Driven Notification System.
-WHY: Serves as the Single Source of Truth loaded at the start of every engineering session so all phases, invariants,
-     domain rules, SQL/Redis contracts, and quality gates remain consistent without architectural drift or missing requirements.
-EXPECTED OUTPUT EXAMPLE (Session Verification & Phase 0 Gate):
-  $ Test-Path CLAUDE.md
-  True
-  # All 11 specification sections present, traceable to FR-1.1..D-6, B-1..B-6, EXT-1, with zero premature code written.
--->
-
 # CLAUDE.md — Event-Driven Notification System
 
 ## Engineering Role & Context
@@ -20,20 +10,10 @@ You are acting as a **Senior Go Engineer, Senior Software Architect, and AI/Engi
 
 ---
 
-<!--
-WHAT: Verbatim Assignment Scope, Requirement Traceability IDs, External Provider Contract, Deliverables, and Scale Targets.
-WHY: Locking every PDF requirement to an explicit ID (`FR-*`, `EXT-1`, `B-*`, `D-*`) prevents accidental scope omission and
-     powers the end-of-project traceability audit.
-EXPECTED OUTPUT EXAMPLE (Requirement Traceability Row):
-  | Requirement | Implementation                          | Verification                       | Status |
-  | FR-1.1      | internal/api/handlers.go (Create)       | TestCreateNotification + Int 7a    | PASS   |
-  | EXT-1       | internal/provider/client.go (Send)      | TestProviderClassify + webhook.site| PASS   |
--->
-
 ## 1. Assignment Scope & Requirement IDs (Insider One, Software Engineer Assessment 2026)
 
 - **Project:** Event-Driven Notification System
-- **Language:** Go (`1.2x`) — use the Go `1.2x` version installed locally (`go version`), and pin the **exact same version** in `go.mod`, `Dockerfile`, and CI workflows.
+- **Language:** Go `1.27.4` — pinned identically across `go.mod`, `Dockerfile`, and CI workflows.
 - **Overview:** Design and implement a scalable notification system that processes and delivers messages through multiple channels (**SMS**, **Email**, **Push**). It must handle high throughput, ensure reliable delivery, and provide real-time status tracking.
 - **Business Context:** Insider One sends **MILLIONS** of notifications daily. The system must handle burst traffic (flash sales, breaking news), retry failed deliveries intelligently, and provide visibility into delivery status for both internal teams (metrics, logs, traces) and API consumers (status API, WebSocket).
 
@@ -90,7 +70,7 @@ External provider = `webhook.site` (configurable via `PROVIDER_URL`; `cmd/mockpr
 - **D-3:** Docker Compose one-command setup: **BOTH** `docker-compose up` and `docker compose up` must work with zero manual steps (no `.env` required, no pre-built images, migrations run automatically).
 - **D-4:** Swagger/OpenAPI specification (`api/openapi.yaml` + Swagger UI).
 - **D-5:** Versioned database migrations (`migrations/*.up.sql` / `.down.sql`).
-- **D-6:** Test suite runnable with a single command (`make test-all`).
+- **D-6:** Test suite runnable with a single command (`make test-all` in WSL/Linux/CI; native Windows without GCC/make can run `go test ./...`).
 
 ### Timeline & Non-Functional Targets
 
@@ -98,21 +78,6 @@ External provider = `webhook.site` (configurable via `PROVIDER_URL`; `cmd/mockpr
 - **Throughput & Reliability Targets:** Millions/day (`≈ 50–500 msg/s` average, bursts capped at `100 msg/s/channel = 300 msg/s` total), **no lost notifications**, **no duplicate sends caused by our own bugs**, horizontal scaling of stateless workers.
 
 ---
-
-<!--
-WHAT: System Architecture (Option A: PostgreSQL + Redis), Delivery Semantics, Binary Layout, Compose Topology, and Package Tree.
-WHY: Committing notifications to PostgreSQL BEFORE Redis dispatch eliminates the race condition where a worker dequeues an ID
-     before the API transaction is visible, while the reconciler makes Redis data loss self-healing without transactional-outbox overhead.
-EXPECTED OUTPUT EXAMPLE (`docker compose ps` in full stack):
-  NAME                          STATUS                   PORTS
-  notification-postgres-1       Up (healthy)             5432/tcp
-  notification-redis-1          Up (healthy)             6379/tcp
-  notification-migrate-1        Exited (0)
-  notification-api-1            Up (healthy)             0.0.0.0:8080->8080/tcp
-  notification-worker-1-1       Up (healthy)             9091/tcp
-  notification-worker-2-1       Up (healthy)             9091/tcp
-  notification-mockprovider-1   Up                       0.0.0.0:8090->8090/tcp
--->
 
 ## 2. Architecture (Decided: Option A = PostgreSQL + Redis)
 
@@ -161,7 +126,7 @@ A single multi-stage `Dockerfile` builds all binaries (`CGO_ENABLED=0`, `-trimpa
   - `postgres:16-alpine` (healthcheck: `pg_isready`)
   - `redis:7-alpine` (`--appendonly yes --appendfsync everysec`, healthcheck: `redis-cli ping`)
   - `migrate` (`migrate/migrate` pinned tag; mounts `./migrations`, runs `up` then exits; `api`, `worker-1`, `worker-2` depend on `service_completed_successfully`)
-  - `api` (port `8080`)
+  - `api` (port `8080`; owns `build:` for `notification-system:local`)
   - `worker-1` and `worker-2` (identical template via YAML anchor `x-worker: &worker` + shared env anchor, distinct `WORKER_ID`; proves the distributed rate limiter across replicas)
   - `mockprovider` (port `8090`)
   - `jaeger` all-in-one (`16686` UI, `4318` OTLP HTTP)
@@ -215,26 +180,6 @@ scripts/            # smoke.sh (curl examples for every endpoint)
 - **Dependency Policy:** Prefer the Go standard library otherwise. Ask before adding any other external dependency.
 
 ---
-
-<!--
-WHAT: Domain Enums, State Machine Transitions, Atomic Claim & Fencing SQL, Multi-Channel Validation, Idempotency, Batch Policy, and Keyset Pagination.
-WHY: Enforcing transitions in one domain file + guarded conditional SQL prevents worker-vs-cancel races and stale-worker overwrites (`lease lost`),
-     while exact SMS GSM-7/UCS-2 segment validation protects carrier limits before queuing.
-EXPECTED OUTPUT EXAMPLE (ValidationError JSON & SMSInfo):
-  // SMSInfo("Şifreniz: 1234") -> {Encoding: "UCS-2", Units: 14, Segments: 1}
-  // ValidationError (422):
-  {
-    "error": {
-      "code": "validation_failed",
-      "message": "request has 2 invalid fields",
-      "details": [
-        {"field":"recipient","code":"invalid_e164","message":"must match ^\\+[1-9]\\d{7,14}$"},
-        {"field":"content","code":"too_many_segments","message":"12 segments (UCS-2), max 10"}
-      ]
-    },
-    "correlationId": "7d3c..."
-  }
--->
 
 ## 3. Domain Rules
 
@@ -299,10 +244,11 @@ Allowed transitions are enforced in **ONE** place (`internal/domain/statemachine
 Return every validation error in a single response using dot/bracket paths such as `notifications[3].recipient`:
 
 - **Common:**
-  - `recipient` required.
+  - `recipient` required (validated without silent whitespace trimming so leading/trailing spaces fail uniformly across all channels).
   - `content` required (non-empty after `strings.TrimSpace`) unless `templateId` is used (Phase 9).
-  - `channel` required and known (`sms | email | push`).
-  - `priority` known (`high | normal | low`) if present; defaults to `normal`.
+  - `channel` required and known (`sms | email | push`); input normalized lowercase (`Normalize()`) before persistence and hashing.
+  - `priority` known (`high | normal | low`) if present; normalized lowercase and defaults to `normal`.
+  - Channel-inappropriate optional fields (`subject` on `sms`/`push`, `title` on `sms`/`email`) → `422 unsupported_field`.
 - **SMS (`channel == "sms"`):**
   - `recipient`: E.164 regex `^\+[1-9]\d{7,14}$` (e.g., `"+905551234567"` valid; `"05551234567"`, `"+0555..."` invalid).
   - **Encoding:** `GSM-7` if every rune is in the GSM 03.38 basic set or extension table; otherwise `UCS-2`.
@@ -330,15 +276,15 @@ Return every validation error in a single response using dot/bracket paths such 
 ### Idempotency (`FR-2.5`)
 
 - **API Storage:** Table `idempotency_keys(key PK, request_hash, resource_type 'notification'|'batch', resource_id, response_status, created_at, expires_at)`, TTL `IDEMPOTENCY_TTL` (default `24h`).
-  - Expired keys are deleted by the reconciler; after expiry, reusing the same key creates a new resource (documented).
+  - Expired keys are deleted by the reconciler and atomically overwritten on insert (`ON CONFLICT (key) DO UPDATE ... WHERE expires_at <= now()`) even if cleanup has not run yet; after expiry, reusing the same key creates a new resource (documented).
   - Keys are global (no multi-tenant model; multi-tenancy would prefix keys with `tenant_id` — documented).
 - **Single Create (`POST /api/v1/notifications`):** Optional `Idempotency-Key` header.
-  - `request_hash` = SHA-256 hex of **canonical JSON** (sorted keys, defaults applied, e.g. omitted priority treated identically to `"normal"`).
+  - `request_hash` = SHA-256 hex of **canonical JSON** (sorted keys, lowercase normalized channel/priority, defaults applied e.g. omitted priority = `"normal"`, `scheduledAt` normalized to UTC) for both single and batch wrapper requests.
   - Same key + same hash → return **ORIGINAL** resource with **ORIGINAL** status code (`202`) + header `Idempotent-Replayed: true`.
   - Same key + different hash → `409 idempotency_conflict`.
-  - **Concurrency:** Insert the key row in the **SAME** transaction as the notification (`INSERT ... ON CONFLICT DO NOTHING`); the unique PK makes a concurrent duplicate transaction wait until the first commits/rolls back; on conflict → rollback, re-read the key, then replay or return `409`.
+  - **Concurrency:** Insert/reclaim the key row in the **SAME** transaction as the notification (`INSERT ... ON CONFLICT (key) DO UPDATE ... WHERE expires_at <= now() RETURNING *`); the unique PK serializes concurrent duplicate transactions; 0 rows returned → rollback, re-read active key, then replay or return `409`.
 - **Batch Create (`POST /api/v1/notifications/batch`):**
-  - Optional `Idempotency-Key` header for the **WHOLE** batch (hash of the whole canonical batch) → replay returns the same `batchId` and `notificationIds` (`Idempotent-Replayed: true`).
+  - Optional `Idempotency-Key` header for the **WHOLE** batch (hash of the whole canonical normalized `BatchCreateInput`) → replay returns the same `batchId` and `notificationIds` (`Idempotent-Replayed: true`).
   - Optional per-item `idempotencyKey`:
     - Duplicates inside the same batch → `422 duplicate_idempotency_key` with conflicting item indexes.
     - An item key that already exists in `idempotency_keys` → **WHOLE** batch rejected with `409 item_idempotency_key_exists`, details list item index + existing notification ID (preserves all-or-nothing; clients retry whole batches using the batch-level header).
@@ -361,18 +307,6 @@ Return every validation error in a single response using dot/bracket paths such 
   - Date range filter on `created_at`: `from` inclusive, `to` exclusive, RFC3339.
 
 ---
-
-<!--
-WHAT: Redis Keyspace Design, Cluster Hash-Tagging, Embedded Atomic Lua Scripts, and 6:3:1 Weighted Priority Scheduling.
-WHY: Using `LMOVE` into per-worker inflight lists prevents silent item loss on worker crash, hash tag `{notif}` keeps multi-key Lua
-     scripts in a single Redis Cluster slot, and 6:3:1 weighted round-robin prevents low-priority starvation under high-priority bursts.
-EXPECTED OUTPUT EXAMPLE (`dequeue.lua` atomic pop & metadata return):
-  KEYS = ["{notif}:inflight:worker-1", "{notif}:q:sms:high", "{notif}:q:sms:normal", "{notif}:q:sms:low"]
-  RETURN = [
-    "01936f7e-3b12-7a40-9f1a-123456789abc",
-    "{\"id\":\"01936f7e-3b12-7a40-9f1a-123456789abc\",\"channel\":\"sms\",\"priority\":\"high\",\"correlationId\":\"7d3c...\",\"traceparent\":\"00-...\"}"
-  ]
--->
 
 ## 4. Redis Data Model & Queues
 
@@ -409,16 +343,6 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 - **Guarantee:** `low` priority receives `≥ 10%` of slots under continuous `high`/`normal` contention and `100%` capacity when higher-priority queues are empty.
 
 ---
-
-<!--
-WHAT: Worker Processing Pipeline, Provider Outcome Classification, Backoff, Circuit Breaker, Reconciler, Shutdown, Failure Matrix, and GCRA Rate Limiting.
-WHY: Acquiring the distributed GCRA rate-limit token BEFORE PostgreSQL Claim prevents rate-limit waiting from consuming `VISIBILITY_TIMEOUT`,
-     and fencing + circuit-breaker deferral ensure slow providers never burn retry budgets or corrupt terminal state.
-EXPECTED OUTPUT EXAMPLE (Backoff Upper Bounds & Circuit Breaker Transition):
-  // RETRY_BASE=2s, MAX_ATTEMPTS=5 -> attempt 1..4 full-jitter upper bounds: 2s, 4s, 8s, 16s
-  // Attempt 1 (503 Retry-After: 7): next_attempt_at = now + max(rand[0,2s), 7s)
-  // 10 consecutive 503s -> breaker transitions Closed -> Open (state=2), attempts rolled back (-1), deferrals+1, counted=false
--->
 
 ## 5. Delivery & Retry (`FR-3`) + Failure Handling (`B-1`)
 
@@ -516,15 +440,6 @@ On `SIGINT` / `SIGTERM`: stop dequeuing immediately → allow in-flight provider
 
 ---
 
-<!--
-WHAT: Structured Logging with PII Masking, Prometheus Metrics Registry, JSON Snapshot Endpoint, and Health Probes.
-WHY: Custom Prometheus registries prevent test/package global collisions, masking recipients prevents PII leaks in log aggregators,
-     and running the queue-depth sampler exclusively in the API process avoids duplicate multi-worker metric series.
-EXPECTED OUTPUT EXAMPLE (`slog` JSON log line & `/health/ready` 200):
-  {"time":"2026-11-21T10:00:00Z","level":"INFO","msg":"notification delivered","correlation_id":"7d3c...","notification_id":"01936f7e-...","channel":"sms","attempt":1,"worker_id":"worker-1","recipient":"+90555***4567","duration_ms":48}
-  {"status":"ok","checks":{"postgres":{"status":"ok","latencyMs":2},"redis":{"status":"ok","latencyMs":1}}}
--->
-
 ## 6. Observability (`FR-4`)
 
 ### Structured Logging (`slog` JSON to `stdout`)
@@ -601,21 +516,10 @@ Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_c
 
 ---
 
-<!--
-WHAT: HTTP API Endpoints, Status Codes, Canonical JSON Formats, Central Error Contract, and CORS Policy.
-WHY: Defining one central error mapper (`internal/api/errors.go`) and strict JSON decoding (`DisallowUnknownFields`) guarantees clients receive
-     consistent, machine-readable diagnostics (`correlationId` + field paths) across every core and bonus route.
-EXPECTED OUTPUT EXAMPLE (`POST /api/v1/notifications` -> `202 Accepted`):
-  HTTP/1.1 202 Accepted
-  Content-Type: application/json
-  X-Correlation-ID: 7d3c...
-  {"id":"01936f7e-...","batchId":null,"recipient":"+905551234567","channel":"sms","priority":"high","status":"pending","content":"Siparişiniz kargoya verildi","attempts":0,"maxAttempts":5,"scheduledAt":null,"nextAttemptAt":null,"providerMessageId":null,"lastError":null,"createdAt":"2026-11-21T10:00:00Z","updatedAt":"2026-11-21T10:00:00Z","sentAt":null,"cancelledAt":null}
--->
-
 ## 7. HTTP API Contract
 
 - **Base Path:** `/api/v1` (except root probes `/health*`, `/metrics`, `/openapi.yaml`, `/demo`).
-- **Conventions:** JSON `camelCase`, timestamps `RFC3339` UTC, IDs `UUIDv7`. Unknown JSON fields rejected (`400`, via `DisallowUnknownFields`).
+- **Conventions:** JSON `camelCase`, timestamps `RFC3339` UTC, IDs `UUIDv7`. Unknown JSON fields rejected (`400`, via `DisallowUnknownFields`). Responses MUST map through explicit public DTOs (never serialize `domain.Notification` directly so internal fields like `processingStartedAt`, `traceparent`, `idempotencyKey`, and `deferrals` stay private).
 
 ### Endpoints
 
@@ -693,14 +597,6 @@ X-Correlation-ID: 7d3c...
 
 ---
 
-<!--
-WHAT: Complete Environment Variable Matrix with Production Defaults and Startup Validation Rules.
-WHY: Fail-fast configuration validation at process boot (such as enforcing `VISIBILITY_TIMEOUT >= 2*PROVIDER_TIMEOUT + 15s`) catches
-     misconfigured timeouts before workers can silently double-send or exhaust Redis connection pools.
-EXPECTED OUTPUT EXAMPLE (Masked Startup Config Log):
-  {"level":"INFO","msg":"config loaded","http_addr":":8080","database_url":"postgres://notif:***@postgres:5432/notif?sslmode=disable","redis_pool_size":95,"visibility_timeout":"60s"}
--->
-
 ## 8. Configuration (Environment Variables, All with Defaults)
 
 | Variable | Default | Notes / Validation |
@@ -753,38 +649,18 @@ EXPECTED OUTPUT EXAMPLE (Masked Startup Config Log):
 
 ---
 
-<!--
-WHAT: Idiomatic Go Engineering Standards, Test Rules, Error Handling, and Mandatory Code Commenting Standard.
-WHY: Maintaining strict boundary discipline (DI, consumer-side interfaces, central error mapping, sqlc-only SQL, zero `time.Sleep`)
-     makes the codebase race-free, unit-testable without Docker, and easy to explain line-by-line during an interview.
-EXPECTED OUTPUT EXAMPLE (Go Function Commenting Standard):
-  // CalculateBackoff computes the full-jitter exponential retry delay for the given attempt.
-  // WHY: Full jitter spreads retries across [RETRY_MIN, cap] to prevent thundering-herd spikes against a recovering provider.
-  // Example: attempt=2, RETRY_BASE=2s, RETRY_MIN=200ms -> returns duration in [200ms, 4s).
--->
-
 ## 9. Code Conventions
 
 - **Context & State:** `context.Context` is the **first parameter** of every I/O function. **No global mutable state**; inject all dependencies explicitly via `New...` constructors.
 - **Errors:** Wrap contextual errors with `fmt.Errorf("doing x: %w", err)`. Domain errors are strongly typed (`ErrNotFound`, `ErrInvalidTransition`, `ErrIdempotencyConflict`, `ErrLeaseLost`, `ValidationError`) and mapped to HTTP status codes in **ONE** place (`internal/api/errors.go`).
 - **Interfaces:** Declare interfaces where they are **consumed** (consumer package), enabling lightweight fakes in unit tests.
 - **Testing:** Table-driven unit tests everywhere. Unit tests must **not** require Docker (`miniredis` allowed); integration tests use build tag `//go:build integration` and `testcontainers-go`.
-- **Commenting Standard (Mandatory):**
-  - Comments explain **WHAT & WHY** (business invariant, race condition prevented, design trade-off), not trivial mechanics.
-  - Every non-trivial function, state transition, SQL query, Lua script, config guard, and architectural boundary must include a concise **WHAT/WHY** comment **and a concrete Expected Output Example** (sample return value, HTTP response, JSON payload, or SQL outcome).
+- **Comments:** Comments explain **WHY** (non-obvious invariants, concurrency/fencing rationale), not what the code literally does.
 - **Formatting & Linting:** Code must be `gofmt`'d / `goimports`'d and pass `go vet ./...` and `golangci-lint` (v2).
 - **Concurrency & Shutdown:** Graceful shutdown everywhere via `signal.NotifyContext`; drain in-flight work within `SHUTDOWN_TIMEOUT`. **No `time.Sleep` in production code paths** — always use `select` with `ctx.Done()` and timers.
 - **Time & SQL:** **All times in UTC.** **All SQL through `sqlc`.** Zero string-concatenated SQL anywhere.
 
 ---
-
-<!--
-WHAT: Pre-Settled Architectural & Tooling Decisions (Closed Questions).
-WHY: Documenting resolved decisions upfront prevents revisiting settled trade-offs across phases and preserves consistent patterns.
-EXPECTED OUTPUT EXAMPLE (`text` + `CHECK` constraint vs. PostgreSQL `ENUM`):
-  channel text NOT NULL CHECK (channel IN ('sms','email','push'))
-  -- Adding 'whatsapp' later is a single transactional ALTER TABLE DROP/ADD CONSTRAINT instead of `ALTER TYPE ADD VALUE` caveats.
--->
 
 ## 10. Decisions Already Made (Do Not Re-Open)
 
@@ -798,15 +674,6 @@ EXPECTED OUTPUT EXAMPLE (`text` + `CHECK` constraint vs. PostgreSQL `ENUM`):
 - **Learning Notes:** `.notes/NOTES.md` in Turkish, `.gitignore`d, **never** committed or pushed to GitHub.
 
 ---
-
-<!--
-WHAT: Strict Phase-by-Phase Execution, Verification, Documentation, and Git Commit Governance Rules.
-WHY: Enforcing verification gates (`gofmt`, `go vet`, `go test -race`), synchronized OpenAPI/smoke tests, and user-approved commits per phase
-     ensures every intermediate state is clean, reviewable, and ready for production or interview defense.
-EXPECTED OUTPUT EXAMPLE (End-of-Phase Conventional Commit Proposal):
-  git add internal/config/ internal/observability/
-  git commit -m "feat(config): add typed env config with startup validation and tests"
--->
 
 ## 11. Workflow Rules
 
@@ -834,4 +701,3 @@ EXPECTED OUTPUT EXAMPLE (End-of-Phase Conventional Commit Proposal):
    - a test still fails after 2 fix attempts;
    - an issue would blow past the phase budget.
 9. **Language Split:** Explanations, discussions, and `.notes/NOTES.md` are written in **Turkish**; all code, comments, commit messages, OpenAPI specs, and `README.md` are written in **English**.
-

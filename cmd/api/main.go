@@ -1,14 +1,4 @@
 // Package main implements the cmd/api HTTP server entrypoint.
-//
-// WHY: Phase 1 establishes the production process lifecycle (config validation, masked structured
-// logging, /health/live probe, and SIGINT/SIGTERM graceful shutdown) before database and queue
-// layers are wired in Phases 2-4.
-//
-// Expected output example (GET /health/live):
-//
-//	HTTP/1.1 200 OK
-//	Content-Type: application/json
-//	{"status":"ok"}
 package main
 
 import (
