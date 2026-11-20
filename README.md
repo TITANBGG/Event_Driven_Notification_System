@@ -315,7 +315,7 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Ea
 
 These examples were run exactly as written against a fresh `docker compose up --build`, and the outputs below are the real responses (JSON pretty-printed here; IDs and timestamps will differ on your machine). Run them in order in one shell: later blocks reuse `$SMS_ID`, `$BATCH_ID` and `$TPL_ID`. They need only `bash`, `curl`, `grep`, `cut` and GNU `date`.
 
-Request bodies that contain non-ASCII characters (Turkish text) are passed on stdin with `--data-binary @- <<'JSON'`. On Windows, the native `curl.exe` re-encodes command-line arguments with the ANSI code page, which corrupts `ş`/`ğ`. Stdin bytes are sent unchanged on every platform.
+Request bodies that contain non-ASCII characters (Turkish text) are passed on stdin with `--data-binary @- <<'JSON'`. On Windows, the native `curl.exe` re-encodes command-line arguments with the ANSI code page, so `ş`/`ğ` would arrive as invalid UTF-8; the API rejects such bodies with `400 malformed_json` instead of storing garbled text. Stdin bytes are sent unchanged on every platform.
 
 The complete contract, with every status code and error example, is in [`api/openapi.yaml`](api/openapi.yaml) (served at `/openapi.yaml` and rendered by Swagger UI at http://localhost:8081). All errors use the same envelope:
 
@@ -385,11 +385,11 @@ HTTP/1.1 202 Accepted
 Content-Type: application/json; charset=utf-8
 Vary: Origin
 X-Correlation-Id: corr-order-42
-Date: Fri, 20 Nov 2026 21:54:31 GMT
-Content-Length: 425
+Date: Fri, 20 Nov 2026 22:05:45 GMT
+Content-Length: 427
 
 {
-  "id": "01a1faf4-3868-7dbc-aa9c-d83d51f2ca26",
+  "id": "01a1fafe-7f45-7603-8cc0-8fb7aa9b854a",
   "batchId": null,
   "recipient": "+905551234567",
   "channel": "sms",
@@ -402,8 +402,8 @@ Content-Length: 425
   "nextAttemptAt": null,
   "providerMessageId": null,
   "lastError": null,
-  "createdAt": "2026-11-20T21:54:31.65704Z",
-  "updatedAt": "2026-11-20T21:54:31.65704Z",
+  "createdAt": "2026-11-20T22:05:45.157646Z",
+  "updatedAt": "2026-11-20T22:05:45.157646Z",
   "sentAt": null,
   "failedAt": null,
   "cancelledAt": null
@@ -426,7 +426,7 @@ Output:
 ```text
 HTTP/1.1 202 Accepted
 Idempotent-Replayed: true
-{"id":"01a1faf4-3868-7dbc-aa9c-d83d51f2ca26","batchId":null,"recipient":"+905551234567","channel":"sms","priority":"high
+{"id":"01a1fafe-7f45-7603-8cc0-8fb7aa9b854a","batchId":null,"recipient":"+905551234567","channel":"sms","priority":"high
 ```
 
 ### Same key, different body: `409 idempotency_conflict` — `FR-2.5`
@@ -446,7 +446,7 @@ Output:
     "code": "idempotency_conflict",
     "message": "idempotency key was previously used with a different request payload"
   },
-  "correlationId": "01a1faf4-391a-715f-80c0-af12449eb0ce"
+  "correlationId": "01a1fafe-8013-761f-96fa-4911ba2f3e62"
 }
 
 HTTP 409
@@ -485,7 +485,7 @@ Output:
       }
     ]
   },
-  "correlationId": "01a1faf4-393b-70b9-a2c0-5ffa0848709a"
+  "correlationId": "01a1fafe-8035-77d0-9e9c-801b239a7581"
 }
 
 HTTP 422
@@ -504,7 +504,7 @@ Output:
 
 ```text
 {
-  "id": "01a1faf4-395b-78de-8708-7a601b40e5bb",
+  "id": "01a1fafe-8056-71d1-89e6-29d3dadb26d1",
   "batchId": null,
   "recipient": "customer@example.com",
   "channel": "email",
@@ -518,15 +518,15 @@ Output:
   "nextAttemptAt": null,
   "providerMessageId": null,
   "lastError": null,
-  "createdAt": "2026-11-20T21:54:31.899732Z",
-  "updatedAt": "2026-11-20T21:54:31.899732Z",
+  "createdAt": "2026-11-20T22:05:45.430236Z",
+  "updatedAt": "2026-11-20T22:05:45.430236Z",
   "sentAt": null,
   "failedAt": null,
   "cancelledAt": null
 }
 
 {
-  "id": "01a1faf4-398c-77a5-bf25-415c08261a7c",
+  "id": "01a1fafe-8082-74d6-92c1-c03945d9f62d",
   "batchId": null,
   "recipient": "fcm-token-9b7a2c1e",
   "channel": "push",
@@ -540,8 +540,8 @@ Output:
   "nextAttemptAt": null,
   "providerMessageId": null,
   "lastError": null,
-  "createdAt": "2026-11-20T21:54:31.948617Z",
-  "updatedAt": "2026-11-20T21:54:31.948617Z",
+  "createdAt": "2026-11-20T22:05:45.474458Z",
+  "updatedAt": "2026-11-20T22:05:45.474458Z",
   "sentAt": null,
   "failedAt": null,
   "cancelledAt": null
@@ -560,7 +560,7 @@ Output:
 
 ```text
 {
-  "id": "01a1faf4-3868-7dbc-aa9c-d83d51f2ca26",
+  "id": "01a1fafe-7f45-7603-8cc0-8fb7aa9b854a",
   "batchId": null,
   "recipient": "+905551234567",
   "channel": "sms",
@@ -571,11 +571,11 @@ Output:
   "maxAttempts": 5,
   "scheduledAt": null,
   "nextAttemptAt": null,
-  "providerMessageId": "4cb0eabb-b4f1-42a9-b56a-28bd6e44b861",
+  "providerMessageId": "f935673b-7b4e-470c-ad15-04b3627e6b0e",
   "lastError": null,
-  "createdAt": "2026-11-20T21:54:31.65704Z",
-  "updatedAt": "2026-11-20T21:54:31.928201Z",
-  "sentAt": "2026-11-20T21:54:31.928201Z",
+  "createdAt": "2026-11-20T22:05:45.157646Z",
+  "updatedAt": "2026-11-20T22:05:45.332013Z",
+  "sentAt": "2026-11-20T22:05:45.332013Z",
   "failedAt": null,
   "cancelledAt": null,
   "deliveryAttempts": [
@@ -583,13 +583,13 @@ Output:
       "id": 1,
       "attemptNo": 1,
       "counted": true,
-      "startedAt": "2026-11-20T21:54:31.922326Z",
+      "startedAt": "2026-11-20T22:05:45.326116Z",
       "durationMs": 1,
       "httpStatus": 202,
       "outcome": "sent",
       "error": null,
-      "providerMessageId": "4cb0eabb-b4f1-42a9-b56a-28bd6e44b861",
-      "workerId": "worker-1"
+      "providerMessageId": "f935673b-7b4e-470c-ad15-04b3627e6b0e",
+      "workerId": "worker-2"
     }
   ]
 }
@@ -611,9 +611,9 @@ Output:
 
 ```text
 "status":"scheduled","content":"Flash sale starts now"
-"scheduledAt":"2026-11-20T22:54:34Z"
+"scheduledAt":"2026-11-20T23:05:47Z"
 "status":"cancelled"
-"cancelledAt":"2026-11-20T21:54:34.228852Z"
+"cancelledAt":"2026-11-20T22:05:47.791059Z"
 {
   "error": {
     "code": "not_cancellable",
@@ -626,7 +626,7 @@ Output:
       }
     ]
   },
-  "correlationId": "01a1faf4-429f-701b-b12d-8e9363162e15"
+  "correlationId": "01a1fafe-89bd-7c97-a80a-c1d36df17d11"
 }
 
 HTTP 409
@@ -657,25 +657,25 @@ Output:
 
 ```text
 {
-  "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+  "batchId": "01a1fafe-8a01-793f-a103-9e7b8987f2d2",
   "count": 3,
   "notificationIds": [
-    "01a1faf4-42d6-7a53-8adf-b6fad225b7b0",
-    "01a1faf4-42d6-7a56-bbfe-e6596d5f5d37",
-    "01a1faf4-42d6-7a58-9387-7dd97756f1fb"
+    "01a1fafe-8a01-7971-ac01-7d722ee694e6",
+    "01a1fafe-8a01-797a-9e59-e0787fd3eb50",
+    "01a1fafe-8a01-797d-95ca-5859c3363032"
   ]
 }
 {
-  "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+  "batchId": "01a1fafe-8a01-793f-a103-9e7b8987f2d2",
   "total": 3,
   "countsByStatus": {
     "sent": 3
   },
-  "createdAt": "2026-11-20T21:54:34.326822Z",
+  "createdAt": "2026-11-20T22:05:47.90581Z",
   "items": [
     {
-      "id": "01a1faf4-42d6-7a58-9387-7dd97756f1fb",
-      "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+      "id": "01a1fafe-8a01-797d-95ca-5859c3363032",
+      "batchId": "01a1fafe-8a01-793f-a103-9e7b8987f2d2",
       "recipient": "fcm-device-token-12345",
       "channel": "push",
       "priority": "low",
@@ -686,20 +686,20 @@ Output:
       "maxAttempts": 5,
       "scheduledAt": null,
       "nextAttemptAt": null,
-      "providerMessageId": "ec43c4c7-991d-4294-975a-57ed7e5c5f76",
+      "providerMessageId": "18966108-ead1-428e-bc91-d5833e77d5ba",
       "lastError": null,
-      "createdAt": "2026-11-20T21:54:34.326822Z",
-      "updatedAt": "2026-11-20T21:54:34.612212Z",
-      "sentAt": "2026-11-20T21:54:34.612212Z",
+      "createdAt": "2026-11-20T22:05:47.90581Z",
+      "updatedAt": "2026-11-20T22:05:48.118976Z",
+      "sentAt": "2026-11-20T22:05:48.118976Z",
       "failedAt": null,
       "cancelledAt": null
     }
   ],
-  "nextCursor": "eyJ0IjoiMjAyNi0xMS0yMFQyMTo1NDozNC4zMjY4MjJaIiwiaWQiOiIwMWExZmFmNC00MmQ2LTdhNTgtOTM4Ny03ZGQ5Nzc1NmYxZmIifQ"
+  "nextCursor": "eyJ0IjoiMjAyNi0xMS0yMFQyMjowNTo0Ny45MDU4MVoiLCJpZCI6IjAxYTFmYWZlLThhMDEtNzk3ZC05NWNhLTU4NTljMzM2MzAzMiJ9"
 }
 
 {
-  "batchId": "01a1faf4-42d6-7a03-86ae-2033d08103f4",
+  "batchId": "01a1fafe-8a01-793f-a103-9e7b8987f2d2",
   "cancelled": 0,
   "notCancellable": 3
 }
@@ -737,7 +737,7 @@ Output:
 
 ```text
 {
-  "id": "01a1faf4-4bb9-7109-9347-c4334eb86e6a",
+  "id": "01a1fafe-9307-7394-ab35-8e6cb1d95abf",
   "name": "otp_sms_tr",
   "channel": "sms",
   "body": "Merhaba {{name}}, doğrulama kodunuz: {{code}}",
@@ -745,8 +745,8 @@ Output:
     "name",
     "code"
   ],
-  "createdAt": "2026-11-20T21:54:36.601744Z",
-  "updatedAt": "2026-11-20T21:54:36.601744Z"
+  "createdAt": "2026-11-20T22:05:50.215831Z",
+  "updatedAt": "2026-11-20T22:05:50.215831Z"
 }
 "name":"otp_sms_tr"
 "variables":["name","code"]
@@ -766,11 +766,11 @@ Output:
 }
 
 {
-  "batchId": "01a1faf4-4cef-7d70-b9c4-3392a4e83200",
+  "batchId": "01a1fafe-9444-747b-95d1-9da32571baca",
   "count": 2,
   "notificationIds": [
-    "01a1faf4-4cef-7d8e-8799-cfdccbbb23d7",
-    "01a1faf4-4cef-7d92-b991-196e811d3ab6"
+    "01a1fafe-9444-7495-a439-e78adbd94413",
+    "01a1fafe-9444-7498-9f2d-04946c61c7d2"
   ]
 }
 
@@ -780,7 +780,7 @@ DELETE -> 204
     "code": "not_found",
     "message": "requested resource was not found"
   },
-  "correlationId": "01a1faf4-4d3b-76e2-a331-b79a8086aa56"
+  "correlationId": "01a1fafe-948f-7437-bb12-47a358edc02b"
 }
 
 HTTP 404
@@ -801,18 +801,18 @@ curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/notifications?cursor=not-a-curs
 Output:
 
 ```text
-"id":"01a1faf4-4cef-7d92-b991-196e811d3ab6","batchId":"01a1faf4-4cef-7d70-b9c4-3392a4e83200"
-"id":"01a1faf4-4cef-7d8e-8799-cfdccbbb23d7","batchId":"01a1faf4-4cef-7d70-b9c4-3392a4e83200"
-"nextCursor":"eyJ0IjoiMjAyNi0xMS0yMFQyMTo1NDozNi45MTE5NDlaIiwiaWQiOiIwMWExZmFmNC00Y2VmLTdkOGUtODc5OS1jZmRjY2JiYjIzZDcifQ"
-"id":"01a1faf4-42d6-7a53-8adf-b6fad225b7b0","batchId":"01a1faf4-42d6-7a03-86ae-2033d08103f4"
-"id":"01a1faf4-3868-7dbc-aa9c-d83d51f2ca26","batchId":null
+"id":"01a1fafe-9444-7498-9f2d-04946c61c7d2","batchId":"01a1fafe-9444-747b-95d1-9da32571baca"
+"id":"01a1fafe-9444-7495-a439-e78adbd94413","batchId":"01a1fafe-9444-747b-95d1-9da32571baca"
+"nextCursor":"eyJ0IjoiMjAyNi0xMS0yMFQyMjowNTo1MC41MzIzOVoiLCJpZCI6IjAxYTFmYWZlLTk0NDQtNzQ5NS1hNDM5LWU3OGFkYmQ5NDQxMyJ9"
+"id":"01a1fafe-8a01-7971-ac01-7d722ee694e6","batchId":"01a1fafe-8a01-793f-a103-9e7b8987f2d2"
+"id":"01a1fafe-7f45-7603-8cc0-8fb7aa9b854a","batchId":null
 "nextCursor":null
 {
   "error": {
     "code": "invalid_cursor",
     "message": "cursor parameter is malformed"
   },
-  "correlationId": "01a1faf4-524d-7787-a983-5393497a90a1"
+  "correlationId": "01a1fafe-998a-7962-8034-b9c4cab6f2ca"
 }
 
 HTTP 400
@@ -859,7 +859,7 @@ Output:
       }
     ]
   },
-  "correlationId": "01a1faf4-98d9-7916-9658-3f3ea710ad95"
+  "correlationId": "01a1fafe-e0f2-77f9-a31f-b7f57490cee2"
 }
 
 HTTP 409
@@ -884,16 +884,16 @@ Connection: Upgrade
 Sec-Websocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=
 Upgrade: websocket
 Vary: Origin
-X-Correlation-Id: 01a1faf4-98ff-7ead-ae8d-ab36c49f5152
-Date: Fri, 20 Nov 2026 21:54:56 GMT
+X-Correlation-Id: 01a1fafe-e119-7c5a-8fd1-1482ce8b849d
+Date: Fri, 20 Nov 2026 22:06:10 GMT
 
-.~..{"type":"snapshot","notification":{"id":"01a1faf4-3868-7dbc-aa9c-d83d51f2ca26","batchId":null,"recipient":"+905551234567","channel":"sms","priority":"high","sta
+.~..{"type":"snapshot","notification":{"id":"01a1fafe-7f45-7603-8cc0-8fb7aa9b854a","batchId":null,"recipient":"+905551234567","channel":"sms","priority":"high","sta
 {
   "error": {
     "code": "missing_ws_filter",
     "message": "at least one filter query parameter (notificationId, batchId, or channel) is required"
   },
-  "correlationId": "01a1faf4-a110-7252-8cf2-c767b84c615b"
+  "correlationId": "01a1fafe-e916-785e-82ec-3fdf5b02faa5"
 }
 
 HTTP 400
@@ -911,7 +911,7 @@ Output:
 
 ```text
 {
-  "generatedAt": "2026-11-20T21:54:58.481644842Z",
+  "generatedAt": "2026-11-20T22:06:12.280796769Z",
   "queues": {
     "sms": {
       "high": 0,
@@ -929,7 +929,7 @@ Output:
       "low": 0
     },
     "delayed": 0,
-    "dlq": 1,
+    "dlq": 0,
     "inflight": 0
   },
   "windows": {
@@ -1005,14 +1005,14 @@ Output:
   },
   "latencyMs": {
     "endToEnd": {
-      "p50": 174.07,
-      "p95": 5820.12,
-      "p99": 8563.92
+      "p50": 204.88,
+      "p95": 5792.1,
+      "p99": 8519.56
     },
     "providerCall": {
       "p50": 0,
-      "p95": 1,
-      "p99": 1
+      "p95": 1.55,
+      "p99": 1.91
     }
   }
 }
@@ -1053,7 +1053,7 @@ The API exposes them on `:8080/metrics` and each worker on `:9091/metrics`. Each
 | Metric | Type | Labels | Emitted by |
 |---|---|---|---|
 | `notifications_created_total` | counter | `channel, priority` | api |
-| `notifications_processed_total` | counter | `channel, status` (`sent`, `failed`, `retrying`) | worker |
+| `notifications_processed_total` | counter | `channel, status` (`sent`, `failed`, `retrying` from workers; `cancelled` from the API) | worker, api |
 | `provider_requests_total` | counter | `channel, code` | worker |
 | `delivery_duration_seconds` | histogram | `channel` | worker (provider HTTP call) |
 | `end_to_end_latency_seconds` | histogram | `channel` | worker (`created_at` → `sent_at`) |
@@ -1315,8 +1315,7 @@ What is deliberately missing or simplified, and what I would do with more time:
 - **Duplicates on provider timeouts.** At-least-once is the honest guarantee. Exactly-once would need a provider that deduplicates on `Idempotency-Key`.
 - **The circuit breaker is per replica.** With N replicas, a provider outage costs up to N × 10 failed calls before every breaker is open. A shared breaker in Redis is possible but adds a round trip per send and fails when Redis does.
 - **No Turkish national language shift table for SMS.** `ç ğ ı İ ş Ş` force UCS-2 (70/67 characters per segment) instead of the 3GPP TS 23.038 Turkish single-shift table that some carriers support.
-- **The DLQ list is capped at 100,000 IDs,** and a manual retry does not remove the ID from it, so `dlq_depth` counts every notification that has ever been dead-lettered rather than the ones currently failed. PostgreSQL (`status='failed'`) is the authoritative view.
-- **Invalid UTF-8 in request bodies is not rejected.** Go's JSON decoder replaces it with U+FFFD, so a client that sends Latin-5 bytes gets mangled text instead of a `400`.
+- **The Redis DLQ list is capped at 100,000 IDs.** PostgreSQL (`status='failed'` plus `delivery_attempts`) keeps the full history; the list only drives `dlq_depth`. A manual retry removes the ID from the list.
 - **The reconciler repair delay of up to 45s** is fine for this scale; at 100M/day I would switch to an outbox or CDC (section 6).
 - **One Redis instance.** Redis Sentinel or Cluster with per-channel hash tags would be next.
 - **Metrics windows are computed from PostgreSQL** (cached for 2s). At higher volume they should come from Prometheus recording rules instead.
@@ -1358,6 +1357,10 @@ Every item from the assignment, where it is implemented, and how it is tested. "
 | **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
 | **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
 | **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (17 scenarios), `make cover`, 10k load test | **DONE** |
+| **Context: burst traffic** | Flash sales / breaking news: absorb bursts without dropping or overrunning the provider | `POST /batch` (1000 items, one `CopyFrom`), Redis queues as buffer, per-channel GCRA limiter | Load test: 10,000 notifications accepted in 287ms (34,787/s), drained at ~95/s/channel with 0 failures; integration `c`, `g` | **DONE** |
+| **Context: intelligent retry** | Retry only what can succeed, back off, protect a failing provider | `internal/provider/client.go` (classification), `internal/worker/retry.go` (full jitter + `Retry-After`), `internal/worker/breaker.go` | `internal/worker/retry_test.go`, `internal/provider/client_test.go`, integration `e`, `n`, `q` | **DONE** |
+| **Context: visibility for internal teams** | Metrics, logs and traces for operators | Prometheus `/metrics` (API + workers), `slog` JSON with `correlation_id`/`trace_id`, OpenTelemetry → Jaeger | `internal/observability/*_test.go`, integration `m`, PromQL queries in section 8 run against Prometheus | **DONE** |
+| **Context: visibility for API consumers** | Delivery status for the clients that send notifications | `GET /notifications/{id}` (+ `deliveryAttempts`), `GET /batches/{id}` (`countsByStatus`), WebSocket `/api/v1/ws`, `/demo` | `internal/api/handlers_test.go`, `internal/realtime/hub_test.go`, integration `l` | **DONE** |
 
 ---
 

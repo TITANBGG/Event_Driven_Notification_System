@@ -1471,7 +1471,7 @@ components:
 
   responses:
     MalformedJSON:
-      description: Malformed JSON, trailing tokens, or unknown fields
+      description: Malformed JSON, invalid UTF-8, trailing tokens, or unknown fields
       content:
         application/json:
           schema:
