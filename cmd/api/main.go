@@ -1,0 +1,100 @@
+// Package main implements the cmd/api HTTP server entrypoint.
+//
+// WHY: Phase 1 establishes the production process lifecycle (config validation, masked structured
+// logging, /health/live probe, and SIGINT/SIGTERM graceful shutdown) before database and queue
+// layers are wired in Phases 2-4.
+//
+// Expected output example (GET /health/live):
+//
+//	HTTP/1.1 200 OK
+//	Content-Type: application/json
+//	{"status":"ok"}
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/TITANBGG/notification-system/internal/config"
+	"github.com/TITANBGG/notification-system/internal/observability"
+)
+
+func main() {
+	if err := run(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := config.Load()
+	if err != nil {
+		observability.NewLogger("error", os.Stderr).Error("invalid configuration", slog.String("error", err.Error()))
+		return err
+	}
+
+	logger := observability.NewLogger(cfg.LogLevel, os.Stdout).With(
+		slog.String("service", "notification-api"),
+	)
+	logger.Info("config loaded", slog.Any("config", cfg))
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if _, writeErr := w.Write([]byte(`{"status":"ok"}` + "\n")); writeErr != nil {
+			logger.Warn("failed to write health response", slog.String("error", writeErr.Error()))
+		}
+	})
+
+	srv := &http.Server{
+		Addr:              cfg.HTTPAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 1)
+	go func() {
+		logger.Info("api server listening", slog.String("addr", cfg.HTTPAddr))
+		if serveErr := srv.ListenAndServe(); serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			errCh <- serveErr
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case serveErr := <-errCh:
+		if serveErr != nil {
+			logger.Error("api server exited with error", slog.String("error", serveErr.Error()))
+		}
+		return serveErr
+	case <-ctx.Done():
+		logger.Info("shutdown signal received", slog.Duration("timeout", cfg.ShutdownTimeout))
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	defer cancel()
+
+	if shutdownErr := srv.Shutdown(shutdownCtx); shutdownErr != nil {
+		logger.Error("graceful shutdown failed", slog.String("error", shutdownErr.Error()))
+		return shutdownErr
+	}
+	if serveErr := <-errCh; serveErr != nil {
+		return serveErr
+	}
+
+	logger.Info("api server stopped cleanly")
+	return nil
+}
