@@ -1,0 +1,184 @@
+# Continuous integration: every branch push and pull request must pass lint, unit (+race, coverage),
+# integration (testcontainers), generated-code drift, migration reversibility, OpenAPI lint, and
+# image/compose validation before it can be merged.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# Least privilege: CI only needs to read the repository. The release workflow is the only place
+# that is granted packages: write.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes the older run obsolete; cancel it to save runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned tool versions (bump deliberately; sqlc must match the header of the committed generated code).
+  GOLANGCI_LINT_VERSION: v2.15.0
+  SQLC_VERSION: 1.28.0
+  MIGRATE_VERSION: v4.18.2
+  REDOCLY_CLI_VERSION: 2.82.0
+
+jobs:
+  lint:
+    name: Lint (gofmt, go vet, golangci-lint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt required for:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./... && go vet -tags=integration ./...
+      - name: go mod tidy is clean
+        run: go mod tidy -diff
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+          # Build the linter with the job's Go 1.27.4 toolchain: a prebuilt binary compiled with an
+          # older Go refuses to analyse a module that declares a newer `go` directive.
+          install-mode: goinstall
+
+  test:
+    name: Unit tests (-race, coverage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: make test
+        run: make test GOTESTFLAGS="-coverprofile=coverage.out -covermode=atomic"
+      - name: Coverage summary
+        run: |
+          total="$(go tool cover -func=coverage.out | awk '/^total:/ {print $3}')"
+          {
+            echo "### Unit test coverage"
+            echo ""
+            echo "**Total statement coverage:** ${total}"
+            echo ""
+            echo "<details><summary>Per-function coverage</summary>"
+            echo ""
+            echo '```'
+            go tool cover -func=coverage.out
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.out
+          retention-days: 14
+
+  integration:
+    name: Integration tests (testcontainers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      # ubuntu-latest ships a Docker daemon, so testcontainers can start postgres:16-alpine / redis:7-alpine.
+      - name: make test-integration
+        run: make test-integration
+
+  sqlc-check:
+    name: sqlc generated code is up to date
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: sqlc-dev/setup-sqlc@v5
+        with:
+          sqlc-version: ${{ env.SQLC_VERSION }}
+      - name: sqlc generate + drift check
+        run: |
+          sqlc generate
+          git diff --exit-code -- internal/repository/sqlc \
+            || { echo "::error::sqlc output differs from the committed code; run 'make sqlc' and commit."; exit 1; }
+
+  migrations-check:
+    name: Migrations up -> down -> up
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: notif
+          POSTGRES_PASSWORD: notif
+          POSTGRES_DB: notif
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U notif -d notif"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://notif:notif@localhost:5432/notif?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install golang-migrate CLI (same version as docker-compose)
+        run: |
+          curl -fsSL "https://github.com/golang-migrate/migrate/releases/download/${MIGRATE_VERSION}/migrate.linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin migrate
+          migrate -version
+      # Proves every .down.sql really reverses its .up.sql and the chain can be re-applied cleanly.
+      - name: up
+        run: migrate -path migrations -database "$DATABASE_URL" up
+      - name: down (all)
+        run: migrate -path migrations -database "$DATABASE_URL" down -all
+      - name: up again
+        run: migrate -path migrations -database "$DATABASE_URL" up
+      - name: version
+        run: migrate -path migrations -database "$DATABASE_URL" version
+
+  openapi-lint:
+    name: OpenAPI lint (Redocly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: redocly lint
+        run: npx --yes "@redocly/cli@${REDOCLY_CLI_VERSION}" lint api/openapi.yaml
+
+  docker:
+    name: Docker image build + compose validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: notification-system:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Validate docker-compose.yml (no .env present)
+        run: docker compose -f docker-compose.yml config --quiet

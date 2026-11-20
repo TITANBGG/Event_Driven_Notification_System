@@ -1,0 +1,63 @@
+# Continuous delivery: pushing a semver tag (v1.2.3) builds the multi-binary image and publishes it to
+# GitHub Container Registry as ghcr.io/<owner>/notification-system.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# Never cancel a half-pushed release; queue a second tag behind the first instead.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build and push image to GHCR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # GHCR repository names must be lowercase, but the GitHub owner (TITANBGG) is not.
+      - name: Compute lowercase image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/notification-system" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+          labels: |
+            org.opencontainers.image.title=notification-system
+            org.opencontainers.image.description=Event-driven multi-channel notification system (api, worker, mockprovider, healthcheck)
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          # The Dockerfile builds for the runner arch; arm64 is produced under QEMU (slower, release-only).
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
