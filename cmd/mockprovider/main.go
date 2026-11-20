@@ -1,15 +1,5 @@
-// Package main implements cmd/mockprovider, a deterministic fake external notification provider
-// matching the EXT-1 webhook.site HTTP contract (202 Accepted) plus fault/latency injection.
-//
-// WHY: Free webhook.site endpoints impose request and rate caps; mockprovider lets us run
-// 100 msg/s/channel rate-limit proofs, failure/circuit-breaker scenarios, and duplicate detection
-// locally with zero external quota risk.
-//
-// Expected output example (POST /):
-//
-//	HTTP/1.1 202 Accepted
-//	Content-Type: application/json
-//	{"messageId":"3f1c2b9e-8a7d-4c1e-9b2a-1d2e3f4a5b6c","status":"accepted","timestamp":"2026-11-20T19:50:00Z"}
+// Package main implements cmd/mockprovider, a configurable external HTTP provider
+// mirroring the EXT-1 webhook.site 202 Accepted contract for deterministic load and fault testing.
 package main
 
 import (
@@ -33,6 +23,8 @@ import (
 	"github.com/TITANBGG/notification-system/internal/observability"
 )
 
+const maxStoredTimestamps = 100000
+
 type mockConfig struct {
 	Port            string
 	LatencyMS       int
@@ -41,6 +33,14 @@ type mockConfig struct {
 	Rate429         float64
 	PermanentRate   float64
 	Seed            int64
+}
+
+type providerPayload struct {
+	To      string  `json:"to"`
+	Channel string  `json:"channel"`
+	Content string  `json:"content"`
+	Subject *string `json:"subject,omitempty"`
+	Title   *string `json:"title,omitempty"`
 }
 
 type acceptedResponse struct {
@@ -56,9 +56,10 @@ type statsResponse struct {
 }
 
 type mockServer struct {
-	cfg    mockConfig
-	logger *slog.Logger
-	nowFn  func() time.Time
+	cfg           mockConfig
+	logger        *slog.Logger
+	nowFn         func() time.Time
+	maxTimestamps int
 
 	mu         sync.Mutex
 	rng        *rand.Rand
@@ -79,11 +80,12 @@ func newMockServer(cfg mockConfig, logger *slog.Logger, nowFn func() time.Time) 
 		nowFn = func() time.Time { return time.Now().UTC() }
 	}
 	return &mockServer{
-		cfg:    cfg,
-		logger: logger,
-		nowFn:  nowFn,
-		rng:    rand.New(rand.NewSource(seed)),
-		byKey:  make(map[string]int),
+		cfg:           cfg,
+		logger:        logger,
+		nowFn:         nowFn,
+		maxTimestamps: maxStoredTimestamps,
+		rng:           rand.New(rand.NewSource(seed)),
+		byKey:         make(map[string]int),
 	}
 }
 
@@ -129,9 +131,9 @@ func (s *mockServer) handleReset(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *mockServer) handleSend(w http.ResponseWriter, r *http.Request) {
-	bodyBytes, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-	if err != nil {
-		writeJSON(w, s.logger, http.StatusBadRequest, map[string]string{"error": "failed to read body"})
+	payload, errMsg := parseAndValidatePayload(r.Body)
+	if errMsg != "" {
+		writeJSON(w, s.logger, http.StatusBadRequest, map[string]string{"error": errMsg})
 		return
 	}
 
@@ -153,10 +155,12 @@ func (s *mockServer) handleSend(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.Info("mockprovider received request",
 		slog.Int("status", status),
+		slog.String("channel", payload.Channel),
+		slog.String("recipient", maskRecipient(payload.Channel, payload.To)),
+		slog.Int("content_bytes", len(payload.Content)),
 		slog.String("idempotency_key", idemKey),
 		slog.String("correlation_id", corrID),
 		slog.String("traceparent", traceparent),
-		slog.String("body", string(bodyBytes)),
 	)
 
 	switch status {
@@ -176,9 +180,45 @@ func (s *mockServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func parseAndValidatePayload(body io.Reader) (providerPayload, string) {
+	var payload providerPayload
+	dec := json.NewDecoder(io.LimitReader(body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&payload); err != nil {
+		return providerPayload{}, "invalid JSON payload: " + err.Error()
+	}
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return providerPayload{}, "unexpected trailing JSON data"
+	}
+	if strings.TrimSpace(payload.To) == "" {
+		return providerPayload{}, "missing required field: to"
+	}
+	switch payload.Channel {
+	case "sms", "email", "push":
+	default:
+		return providerPayload{}, "invalid or missing field: channel (expected sms, email, or push)"
+	}
+	if strings.TrimSpace(payload.Content) == "" {
+		return providerPayload{}, "missing required field: content"
+	}
+	return payload, ""
+}
+
+func maskRecipient(channel, recipient string) string {
+	switch channel {
+	case "sms":
+		return observability.MaskPhone(recipient)
+	case "email":
+		return observability.MaskEmail(recipient)
+	case "push":
+		return observability.MaskToken(recipient)
+	default:
+		return "***"
+	}
+}
+
 // recordAndDecide atomically records request statistics and picks latency + fault outcome.
-// WHY: Grouping RNG sampling and stat updates under one mutex makes concurrent HTTP handling
-// race-free under `go test -race` without spawning per-request RNG instances.
+// Protected by one mutex so concurrent requests stay race-free without per-request RNG allocations.
 func (s *mockServer) recordAndDecide(idemKey string) (time.Duration, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -187,7 +227,16 @@ func (s *mockServer) recordAndDecide(idemKey string) (time.Duration, int) {
 	if idemKey != "" {
 		s.byKey[idemKey]++
 	}
-	s.timestamps = append(s.timestamps, s.nowFn())
+	now := s.nowFn()
+	if s.maxTimestamps > 0 {
+		if len(s.timestamps) >= s.maxTimestamps {
+			// Retain the most recent window in-place to cap memory during long load runs.
+			copy(s.timestamps, s.timestamps[1:])
+			s.timestamps[len(s.timestamps)-1] = now
+		} else {
+			s.timestamps = append(s.timestamps, now)
+		}
+	}
 
 	delayMS := s.cfg.LatencyMS
 	if s.cfg.LatencyJitterMS > 0 {
