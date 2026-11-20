@@ -43,6 +43,8 @@ func (r iteratorForCopyNotifications) Values() ([]interface{}, error) {
 		r.rows[0].ScheduledAt,
 		r.rows[0].CorrelationID,
 		r.rows[0].Traceparent,
+		r.rows[0].TemplateID,
+		r.rows[0].TemplateVars,
 	}, nil
 }
 
@@ -51,5 +53,5 @@ func (r iteratorForCopyNotifications) Err() error {
 }
 
 func (q *Queries) CopyNotifications(ctx context.Context, arg []CopyNotificationsParams) (int64, error) {
-	return q.db.CopyFrom(ctx, []string{"notifications"}, []string{"id", "batch_id", "channel", "priority", "status", "recipient", "subject", "title", "content", "idempotency_key", "max_attempts", "scheduled_at", "correlation_id", "traceparent"}, &iteratorForCopyNotifications{rows: arg})
+	return q.db.CopyFrom(ctx, []string{"notifications"}, []string{"id", "batch_id", "channel", "priority", "status", "recipient", "subject", "title", "content", "idempotency_key", "max_attempts", "scheduled_at", "correlation_id", "traceparent", "template_id", "template_vars"}, &iteratorForCopyNotifications{rows: arg})
 }

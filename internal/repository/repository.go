@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -31,6 +32,13 @@ type ListFilter struct {
 	To       *time.Time
 	Cursor   *Cursor
 	Limit    int
+}
+
+// TemplateListFilter configures optional channel filtering and keyset pagination for ListTemplates.
+type TemplateListFilter struct {
+	Channel *domain.Channel
+	Cursor  *Cursor
+	Limit   int
 }
 
 // MetricsWindowRow represents aggregated delivery counts for a single (window, channel) pair.
@@ -208,6 +216,10 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 	if s.q == nil {
 		return nil, errors.New("repository store is not initialized")
 	}
+	varsRaw, err := marshalTemplateVars(n.TemplateVars)
+	if err != nil {
+		return nil, err
+	}
 	row, err := s.q.InsertNotification(ctx, sqlc.InsertNotificationParams{
 		ID:             n.ID,
 		BatchID:        n.BatchID,
@@ -223,6 +235,8 @@ func (s *Store) InsertNotification(ctx context.Context, n domain.Notification) (
 		ScheduledAt:    normalizeNullUTC(n.ScheduledAt),
 		CorrelationID:  n.CorrelationID,
 		Traceparent:    n.TraceParent,
+		TemplateID:     n.TemplateID,
+		TemplateVars:   varsRaw,
 	})
 	if err != nil {
 		return nil, MapError(err)
@@ -238,6 +252,10 @@ func (s *Store) CopyNotifications(ctx context.Context, items []domain.Notificati
 	}
 	params := make([]sqlc.CopyNotificationsParams, 0, len(items))
 	for _, n := range items {
+		varsRaw, err := marshalTemplateVars(n.TemplateVars)
+		if err != nil {
+			return 0, err
+		}
 		params = append(params, sqlc.CopyNotificationsParams{
 			ID:             n.ID,
 			BatchID:        n.BatchID,
@@ -253,6 +271,8 @@ func (s *Store) CopyNotifications(ctx context.Context, items []domain.Notificati
 			ScheduledAt:    normalizeNullUTC(n.ScheduledAt),
 			CorrelationID:  n.CorrelationID,
 			Traceparent:    n.TraceParent,
+			TemplateID:     n.TemplateID,
+			TemplateVars:   varsRaw,
 		})
 	}
 	count, err := s.q.CopyNotifications(ctx, params)
@@ -683,6 +703,131 @@ func (s *Store) LatencyPercentiles(ctx context.Context) (LatencyStats, error) {
 	}, nil
 }
 
+// InsertTemplate creates a new active message template row.
+func (s *Store) InsertTemplate(ctx context.Context, t domain.Template) (*domain.Template, error) {
+	if s.q == nil {
+		return nil, errors.New("repository store is not initialized")
+	}
+	vars := t.Variables
+	if vars == nil {
+		vars = []string{}
+	}
+	row, err := s.q.InsertTemplate(ctx, sqlc.InsertTemplateParams{
+		ID:        t.ID,
+		Name:      t.Name,
+		Channel:   t.Channel.String(),
+		Subject:   t.Subject,
+		Title:     t.Title,
+		Body:      t.Body,
+		Variables: vars,
+	})
+	if err != nil {
+		return nil, MapError(err)
+	}
+	out := toDomainTemplate(row)
+	return &out, nil
+}
+
+// GetTemplate retrieves an active (non-deleted) template by ID.
+func (s *Store) GetTemplate(ctx context.Context, id uuid.UUID) (*domain.Template, error) {
+	if s.q == nil {
+		return nil, errors.New("repository store is not initialized")
+	}
+	row, err := s.q.GetTemplate(ctx, id)
+	if err != nil {
+		return nil, MapError(err)
+	}
+	out := toDomainTemplate(row)
+	return &out, nil
+}
+
+// GetTemplatesByIDs retrieves all active templates matching ids.
+func (s *Store) GetTemplatesByIDs(ctx context.Context, ids []uuid.UUID) ([]domain.Template, error) {
+	if s.q == nil {
+		return nil, errors.New("repository store is not initialized")
+	}
+	if len(ids) == 0 {
+		return []domain.Template{}, nil
+	}
+	rows, err := s.q.GetTemplatesByIDs(ctx, ids)
+	if err != nil {
+		return nil, MapError(err)
+	}
+	out := make([]domain.Template, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, toDomainTemplate(r))
+	}
+	return out, nil
+}
+
+// ListTemplates returns keyset-paginated active templates optionally filtered by channel.
+func (s *Store) ListTemplates(ctx context.Context, f TemplateListFilter) ([]domain.Template, error) {
+	if s.q == nil {
+		return nil, errors.New("repository store is not initialized")
+	}
+	var chPtr *string
+	if f.Channel != nil {
+		ch := f.Channel.String()
+		chPtr = &ch
+	}
+	var cursorTS *time.Time
+	var cursorID *uuid.UUID
+	if f.Cursor != nil {
+		u := f.Cursor.CreatedAt.UTC()
+		cursorTS = &u
+		idCopy := f.Cursor.ID
+		cursorID = &idCopy
+	}
+	rows, err := s.q.ListTemplates(ctx, sqlc.ListTemplatesParams{
+		Channel:         chPtr,
+		CursorCreatedAt: cursorTS,
+		CursorID:        cursorID,
+		PageLimit:       clampInt32(f.Limit),
+	})
+	if err != nil {
+		return nil, MapError(err)
+	}
+	out := make([]domain.Template, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, toDomainTemplate(r))
+	}
+	return out, nil
+}
+
+// UpdateTemplate updates an active template row by ID.
+func (s *Store) UpdateTemplate(ctx context.Context, t domain.Template) (*domain.Template, error) {
+	if s.q == nil {
+		return nil, errors.New("repository store is not initialized")
+	}
+	vars := t.Variables
+	if vars == nil {
+		vars = []string{}
+	}
+	row, err := s.q.UpdateTemplate(ctx, sqlc.UpdateTemplateParams{
+		ID:        t.ID,
+		Name:      t.Name,
+		Channel:   t.Channel.String(),
+		Subject:   t.Subject,
+		Title:     t.Title,
+		Body:      t.Body,
+		Variables: vars,
+	})
+	if err != nil {
+		return nil, MapError(err)
+	}
+	out := toDomainTemplate(row)
+	return &out, nil
+}
+
+// SoftDeleteTemplate marks an active template as deleted (deleted_at = now()).
+func (s *Store) SoftDeleteTemplate(ctx context.Context, id uuid.UUID) error {
+	if s.q == nil {
+		return errors.New("repository store is not initialized")
+	}
+	_, err := s.q.SoftDeleteTemplate(ctx, id)
+	return MapError(err)
+}
+
 func mapFencedError(err error) error {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrLeaseLost
@@ -729,12 +874,53 @@ func toDomainNotification(n sqlc.Notification) domain.Notification {
 		ProviderMessageID:   n.ProviderMessageID,
 		CorrelationID:       n.CorrelationID,
 		TraceParent:         n.Traceparent,
+		TemplateID:          n.TemplateID,
+		TemplateVars:        unmarshalTemplateVars(n.TemplateVars),
 		CreatedAt:           n.CreatedAt.UTC(),
 		UpdatedAt:           n.UpdatedAt.UTC(),
 		SentAt:              normalizeNullUTC(n.SentAt),
 		FailedAt:            normalizeNullUTC(n.FailedAt),
 		CancelledAt:         normalizeNullUTC(n.CancelledAt),
 	}
+}
+
+func toDomainTemplate(t sqlc.Template) domain.Template {
+	vars := make([]string, len(t.Variables))
+	copy(vars, t.Variables)
+	return domain.Template{
+		ID:        t.ID,
+		Name:      t.Name,
+		Channel:   domain.Channel(t.Channel),
+		Subject:   t.Subject,
+		Title:     t.Title,
+		Body:      t.Body,
+		Variables: vars,
+		CreatedAt: t.CreatedAt.UTC(),
+		UpdatedAt: t.UpdatedAt.UTC(),
+		DeletedAt: normalizeNullUTC(t.DeletedAt),
+	}
+}
+
+func marshalTemplateVars(vars map[string]any) ([]byte, error) {
+	if len(vars) == 0 {
+		return nil, nil
+	}
+	raw, err := json.Marshal(vars)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling template variables: %w", err)
+	}
+	return raw, nil
+}
+
+func unmarshalTemplateVars(raw []byte) map[string]any {
+	if len(raw) == 0 {
+		return nil
+	}
+	var out map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 func toDomainAttempt(a sqlc.DeliveryAttempt) domain.DeliveryAttempt {

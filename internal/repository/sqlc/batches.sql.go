@@ -118,7 +118,7 @@ func (q *Queries) InsertBatch(ctx context.Context, arg InsertBatchParams) (Batch
 }
 
 const listBatchItems = `-- name: ListBatchItems :many
-SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 FROM notifications
 WHERE batch_id = $1::uuid
   AND (
@@ -176,6 +176,8 @@ func (q *Queries) ListBatchItems(ctx context.Context, arg ListBatchItemsParams) 
 			&i.SentAt,
 			&i.FailedAt,
 			&i.CancelledAt,
+			&i.TemplateID,
+			&i.TemplateVars,
 		); err != nil {
 			return nil, err
 		}

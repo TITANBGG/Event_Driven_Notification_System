@@ -195,11 +195,27 @@ type Notification struct {
 	ProviderMessageID   *string
 	CorrelationID       *string
 	TraceParent         *string
+	TemplateID          *uuid.UUID
+	TemplateVars        map[string]any
 	CreatedAt           time.Time
 	UpdatedAt           time.Time
 	SentAt              *time.Time
 	FailedAt            *time.Time
 	CancelledAt         *time.Time
+}
+
+// Template represents an active or soft-deleted message template in PostgreSQL.
+type Template struct {
+	ID        uuid.UUID
+	Name      string
+	Channel   Channel
+	Subject   *string
+	Title     *string
+	Body      string
+	Variables []string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	DeletedAt *time.Time
 }
 
 // Batch represents a grouped submission of up to 1000 notifications.

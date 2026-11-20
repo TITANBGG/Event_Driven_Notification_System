@@ -1,20 +1,24 @@
 -- name: InsertNotification :one
 INSERT INTO notifications (
   id, batch_id, channel, priority, status, recipient, subject, title, content,
-  idempotency_key, max_attempts, scheduled_at, correlation_id, traceparent
+  idempotency_key, max_attempts, scheduled_at, correlation_id, traceparent,
+  template_id, template_vars
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8, $9,
-  $10, $11, $12, $13, $14
+  $10, $11, $12, $13, $14,
+  $15, $16
 )
 RETURNING *;
 
 -- name: CopyNotifications :copyfrom
 INSERT INTO notifications (
   id, batch_id, channel, priority, status, recipient, subject, title, content,
-  idempotency_key, max_attempts, scheduled_at, correlation_id, traceparent
+  idempotency_key, max_attempts, scheduled_at, correlation_id, traceparent,
+  template_id, template_vars
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8, $9,
-  $10, $11, $12, $13, $14
+  $10, $11, $12, $13, $14,
+  $15, $16
 );
 
 -- name: GetNotification :one

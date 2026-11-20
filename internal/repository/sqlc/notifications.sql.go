@@ -19,7 +19,7 @@ SET status = 'cancelled',
     updated_at = now()
 WHERE id = $1
   AND status IN ('scheduled', 'pending', 'retrying')
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 func (q *Queries) Cancel(ctx context.Context, id uuid.UUID) (Notification, error) {
@@ -51,6 +51,8 @@ func (q *Queries) Cancel(ctx context.Context, id uuid.UUID) (Notification, error
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -67,7 +69,7 @@ WHERE id = $1
     OR (status = 'retrying' AND next_attempt_at <= now() + make_interval(secs => $2::double precision))
     OR (status = 'scheduled' AND scheduled_at <= now() + make_interval(secs => $2::double precision))
   )
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type ClaimParams struct {
@@ -105,6 +107,8 @@ func (q *Queries) Claim(ctx context.Context, arg ClaimParams) (Notification, err
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -124,6 +128,8 @@ type CopyNotificationsParams struct {
 	ScheduledAt    *time.Time `json:"scheduled_at"`
 	CorrelationID  *string    `json:"correlation_id"`
 	Traceparent    *string    `json:"traceparent"`
+	TemplateID     *uuid.UUID `json:"template_id"`
+	TemplateVars   []byte     `json:"template_vars"`
 }
 
 const deferCircuitOpen = `-- name: DeferCircuitOpen :one
@@ -137,7 +143,7 @@ SET status = 'retrying',
 WHERE id = $3
   AND status = 'processing'
   AND attempts = $4
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type DeferCircuitOpenParams struct {
@@ -182,6 +188,8 @@ func (q *Queries) DeferCircuitOpen(ctx context.Context, arg DeferCircuitOpenPara
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -195,7 +203,7 @@ SET status = 'failed',
 WHERE id = $2
   AND status = 'processing'
   AND attempts = $3
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type FailAbandonedParams struct {
@@ -233,12 +241,14 @@ func (q *Queries) FailAbandoned(ctx context.Context, arg FailAbandonedParams) (N
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
 
 const findAbandonedProcessing = `-- name: FindAbandonedProcessing :many
-SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 FROM notifications
 WHERE status = 'processing'
   AND processing_started_at < now() - make_interval(secs => $1::double precision)
@@ -288,6 +298,8 @@ func (q *Queries) FindAbandonedProcessing(ctx context.Context, arg FindAbandoned
 			&i.SentAt,
 			&i.FailedAt,
 			&i.CancelledAt,
+			&i.TemplateID,
+			&i.TemplateVars,
 		); err != nil {
 			return nil, err
 		}
@@ -300,7 +312,7 @@ func (q *Queries) FindAbandonedProcessing(ctx context.Context, arg FindAbandoned
 }
 
 const findDelayedDueSoon = `-- name: FindDelayedDueSoon :many
-SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 FROM notifications
 WHERE status IN ('retrying', 'scheduled')
   AND updated_at < now() - make_interval(secs => $1::double precision)
@@ -357,6 +369,8 @@ func (q *Queries) FindDelayedDueSoon(ctx context.Context, arg FindDelayedDueSoon
 			&i.SentAt,
 			&i.FailedAt,
 			&i.CancelledAt,
+			&i.TemplateID,
+			&i.TemplateVars,
 		); err != nil {
 			return nil, err
 		}
@@ -369,7 +383,7 @@ func (q *Queries) FindDelayedDueSoon(ctx context.Context, arg FindDelayedDueSoon
 }
 
 const findStalePending = `-- name: FindStalePending :many
-SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 FROM notifications
 WHERE status = 'pending'
   AND updated_at < now() - make_interval(secs => $1::double precision)
@@ -419,6 +433,8 @@ func (q *Queries) FindStalePending(ctx context.Context, arg FindStalePendingPara
 			&i.SentAt,
 			&i.FailedAt,
 			&i.CancelledAt,
+			&i.TemplateID,
+			&i.TemplateVars,
 		); err != nil {
 			return nil, err
 		}
@@ -431,7 +447,7 @@ func (q *Queries) FindStalePending(ctx context.Context, arg FindStalePendingPara
 }
 
 const getNotification = `-- name: GetNotification :one
-SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 FROM notifications
 WHERE id = $1
 `
@@ -465,6 +481,8 @@ func (q *Queries) GetNotification(ctx context.Context, id uuid.UUID) (Notificati
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -472,12 +490,14 @@ func (q *Queries) GetNotification(ctx context.Context, id uuid.UUID) (Notificati
 const insertNotification = `-- name: InsertNotification :one
 INSERT INTO notifications (
   id, batch_id, channel, priority, status, recipient, subject, title, content,
-  idempotency_key, max_attempts, scheduled_at, correlation_id, traceparent
+  idempotency_key, max_attempts, scheduled_at, correlation_id, traceparent,
+  template_id, template_vars
 ) VALUES (
   $1, $2, $3, $4, $5, $6, $7, $8, $9,
-  $10, $11, $12, $13, $14
+  $10, $11, $12, $13, $14,
+  $15, $16
 )
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type InsertNotificationParams struct {
@@ -495,6 +515,8 @@ type InsertNotificationParams struct {
 	ScheduledAt    *time.Time `json:"scheduled_at"`
 	CorrelationID  *string    `json:"correlation_id"`
 	Traceparent    *string    `json:"traceparent"`
+	TemplateID     *uuid.UUID `json:"template_id"`
+	TemplateVars   []byte     `json:"template_vars"`
 }
 
 func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotificationParams) (Notification, error) {
@@ -513,6 +535,8 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		arg.ScheduledAt,
 		arg.CorrelationID,
 		arg.Traceparent,
+		arg.TemplateID,
+		arg.TemplateVars,
 	)
 	var i Notification
 	err := row.Scan(
@@ -541,12 +565,14 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
 
 const listNotifications = `-- name: ListNotifications :many
-SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+SELECT id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 FROM notifications
 WHERE ($1::text[] IS NULL OR status = ANY($1::text[]))
   AND ($2::text IS NULL OR channel = $2::text)
@@ -616,6 +642,8 @@ func (q *Queries) ListNotifications(ctx context.Context, arg ListNotificationsPa
 			&i.SentAt,
 			&i.FailedAt,
 			&i.CancelledAt,
+			&i.TemplateID,
+			&i.TemplateVars,
 		); err != nil {
 			return nil, err
 		}
@@ -638,7 +666,7 @@ SET status = 'pending',
     updated_at = now()
 WHERE id = $1
   AND status = 'failed'
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 func (q *Queries) ManualRetry(ctx context.Context, id uuid.UUID) (Notification, error) {
@@ -670,6 +698,8 @@ func (q *Queries) ManualRetry(ctx context.Context, id uuid.UUID) (Notification, 
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -683,7 +713,7 @@ SET status = 'failed',
 WHERE id = $2
   AND status = 'processing'
   AND attempts = $3
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type MarkFailedParams struct {
@@ -721,6 +751,8 @@ func (q *Queries) MarkFailed(ctx context.Context, arg MarkFailedParams) (Notific
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -735,7 +767,7 @@ SET status = 'sent',
 WHERE id = $2
   AND status = 'processing'
   AND attempts = $3
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type MarkSentParams struct {
@@ -774,6 +806,8 @@ func (q *Queries) MarkSent(ctx context.Context, arg MarkSentParams) (Notificatio
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -786,7 +820,7 @@ SET status = 'pending',
 WHERE id = $1
   AND status = 'processing'
   AND attempts = $2
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type RequeueAbandonedParams struct {
@@ -823,6 +857,8 @@ func (q *Queries) RequeueAbandoned(ctx context.Context, arg RequeueAbandonedPara
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }
@@ -836,7 +872,7 @@ SET status = 'retrying',
 WHERE id = $3
   AND status = 'processing'
   AND attempts = $4
-RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 type ScheduleRetryParams struct {
@@ -880,6 +916,8 @@ func (q *Queries) ScheduleRetry(ctx context.Context, arg ScheduleRetryParams) (N
 		&i.SentAt,
 		&i.FailedAt,
 		&i.CancelledAt,
+		&i.TemplateID,
+		&i.TemplateVars,
 	)
 	return i, err
 }

@@ -67,4 +67,19 @@ type Notification struct {
 	SentAt              *time.Time `json:"sent_at"`
 	FailedAt            *time.Time `json:"failed_at"`
 	CancelledAt         *time.Time `json:"cancelled_at"`
+	TemplateID          *uuid.UUID `json:"template_id"`
+	TemplateVars        []byte     `json:"template_vars"`
+}
+
+type Template struct {
+	ID        uuid.UUID  `json:"id"`
+	Name      string     `json:"name"`
+	Channel   string     `json:"channel"`
+	Subject   *string    `json:"subject"`
+	Title     *string    `json:"title"`
+	Body      string     `json:"body"`
+	Variables []string   `json:"variables"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	DeletedAt *time.Time `json:"deleted_at"`
 }
