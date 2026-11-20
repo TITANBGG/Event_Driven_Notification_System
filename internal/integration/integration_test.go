@@ -59,6 +59,10 @@ type mockProviderServer struct {
 	byID       map[string][]recordedProviderCall
 	seqByRecip map[string][]int
 	delay      time.Duration
+	// forceStatus, when non-zero, overrides every response (outage simulation).
+	forceStatus int
+	// requests counts every request including non-2xx ones, so outage tests can bound provider load.
+	requests int
 }
 
 func newMockProviderServer(t *testing.T) *mockProviderServer {
@@ -90,6 +94,10 @@ func (m *mockProviderServer) handle(w http.ResponseWriter, r *http.Request) {
 		status = seq[0]
 		m.seqByRecip[recip] = seq[1:]
 	}
+	if m.forceStatus != 0 {
+		status = m.forceStatus
+	}
+	m.requests++
 	call := recordedProviderCall{
 		Body:          body,
 		RawBody:       strings.TrimSpace(string(raw)),
@@ -130,6 +138,20 @@ func (m *mockProviderServer) reset() {
 	m.byID = make(map[string][]recordedProviderCall)
 	m.seqByRecip = make(map[string][]int)
 	m.delay = 0
+	m.forceStatus = 0
+	m.requests = 0
+}
+
+func (m *mockProviderServer) setForceStatus(status int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forceStatus = status
+}
+
+func (m *mockProviderServer) requestCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.requests
 }
 
 func (m *mockProviderServer) setSequence(recipient string, statuses []int) {
@@ -349,6 +371,13 @@ func (inf *testInfra) resetState(t *testing.T) {
 
 func (inf *testInfra) startWorker(t *testing.T, cfgOverride func(*config.Config), ratePerSec, burst int) func() {
 	t.Helper()
+	return inf.startWorkerWithDeps(t, cfgOverride, ratePerSec, burst, nil)
+}
+
+// startWorkerWithDeps is startWorker plus a hook to override injected worker dependencies
+// (e.g. a zero jitter source so circuit-breaker deferrals are deterministic).
+func (inf *testInfra) startWorkerWithDeps(t *testing.T, cfgOverride func(*config.Config), ratePerSec, burst int, mutate func(*worker.Deps)) func() {
+	t.Helper()
 	cfg := inf.cfg
 	if cfgOverride != nil {
 		cfgOverride(&cfg)
@@ -374,7 +403,7 @@ func (inf *testInfra) startWorker(t *testing.T, cfgOverride func(*config.Config)
 	})
 	require.NoError(t, err)
 
-	w, err := worker.New(worker.Deps{
+	deps := worker.Deps{
 		Config:      cfg,
 		Logger:      logger,
 		Store:       inf.repo,
@@ -385,7 +414,11 @@ func (inf *testInfra) startWorker(t *testing.T, cfgOverride func(*config.Config)
 		Breaker:     breaker,
 		Reconciler:  rec,
 		Publisher:   realtime.NewRedisPublisher(inf.rdb),
-	})
+	}
+	if mutate != nil {
+		mutate(&deps)
+	}
+	w, err := worker.New(deps)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(t.Context())
@@ -721,11 +754,11 @@ func TestCoreIntegration(t *testing.T) {
 		assert.Less(t, meanHigh, meanLow, "expected meanHigh (%.1f) < meanLow (%.1f)", meanHigh, meanLow)
 	})
 
-	t.Run("g_distributed_rate_limit_500_sms_across_two_workers", func(t *testing.T) {
+	t.Run("g_distributed_rate_limit_1000_sms_across_two_workers", func(t *testing.T) {
 		inf.resetState(t)
 
-		items := make([]map[string]any, 500)
-		for i := 0; i < 500; i++ {
+		items := make([]map[string]any, 1000)
+		for i := 0; i < 1000; i++ {
 			items[i] = map[string]any{
 				"recipient": fmt.Sprintf("+90555%07d", 5000000+i),
 				"channel":   "sms",
@@ -750,14 +783,14 @@ func TestCoreIntegration(t *testing.T) {
 		defer stopW2()
 
 		require.Eventually(t, func() bool {
-			return len(inf.provider.allCalls()) == 500
-		}, 20*time.Second, 50*time.Millisecond)
+			return len(inf.provider.allCalls()) == 1000
+		}, 30*time.Second, 50*time.Millisecond)
 
 		calls := inf.provider.allCalls()
 		first := calls[0].ReceivedAt
 		last := calls[len(calls)-1].ReceivedAt
 		totalSpan := last.Sub(first)
-		assert.GreaterOrEqual(t, totalSpan, 4850*time.Millisecond, "500 messages at 100/s Burst=1 must take >= ~4.9s, took %s", totalSpan)
+		assert.GreaterOrEqual(t, totalSpan, 9850*time.Millisecond, "1000 messages at 100/s Burst=1 must take >= ~9.9s, took %s", totalSpan)
 
 		// Verify no 1-second sliding window [t_i, t_i + 1s) contains more than 101 requests.
 		maxInWindow := 0
@@ -772,6 +805,7 @@ func TestCoreIntegration(t *testing.T) {
 			}
 		}
 		assert.LessOrEqual(t, maxInWindow, 101, "sliding 1s window exceeded 101 requests: %d", maxInWindow)
+		t.Logf("rate limit: 1000 sends over %s, max %d in any 1s sliding window", totalSpan, maxInWindow)
 	})
 
 	t.Run("h_reconciler_repairs_untracked_pending_and_simulated_redis_loss", func(t *testing.T) {
@@ -1152,4 +1186,6 @@ func TestCoreIntegration(t *testing.T) {
 		require.Len(t, calls, 1)
 		assert.Contains(t, calls[0].TraceParent, incomingTraceID, "provider HTTP request must carry W3C traceparent with original trace ID")
 	})
+
+	runExtendedScenarios(t, inf)
 }
