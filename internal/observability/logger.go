@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Unexported empty-struct keys prevent collisions across unrelated context consumers.
@@ -17,7 +19,40 @@ type (
 	fieldsKey        struct{}
 )
 
-// NewLogger constructs a structured JSON slog.Logger configured at the requested log level.
+// traceHandler wraps an inner slog.Handler and automatically appends trace_id and span_id
+// whenever ctx carries a valid OpenTelemetry span context.
+type traceHandler struct {
+	inner slog.Handler
+}
+
+func (h traceHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.inner.Enabled(ctx, level)
+}
+
+func (h traceHandler) Handle(ctx context.Context, rec slog.Record) error {
+	if ctx != nil {
+		sc := trace.SpanContextFromContext(ctx)
+		if sc.IsValid() {
+			rec = rec.Clone()
+			rec.AddAttrs(
+				slog.String("trace_id", sc.TraceID().String()),
+				slog.String("span_id", sc.SpanID().String()),
+			)
+		}
+	}
+	return h.inner.Handle(ctx, rec)
+}
+
+func (h traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return traceHandler{inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h traceHandler) WithGroup(name string) slog.Handler {
+	return traceHandler{inner: h.inner.WithGroup(name)}
+}
+
+// NewLogger constructs a structured JSON slog.Logger configured at the requested log level
+// and wrapped with OpenTelemetry trace_id/span_id context enrichment.
 func NewLogger(level string, w io.Writer) *slog.Logger {
 	if w == nil {
 		w = os.Stdout
@@ -25,7 +60,7 @@ func NewLogger(level string, w io.Writer) *slog.Logger {
 	opts := &slog.HandlerOptions{
 		Level: parseLevel(level),
 	}
-	return slog.New(slog.NewJSONHandler(w, opts))
+	return slog.New(traceHandler{inner: slog.NewJSONHandler(w, opts)})
 }
 
 func parseLevel(level string) slog.Level {
@@ -112,6 +147,12 @@ func LoggerFrom(ctx context.Context, base *slog.Logger) *slog.Logger {
 	var args []any
 	if cid := CorrelationID(ctx); cid != "" {
 		args = append(args, slog.String("correlation_id", cid))
+	}
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() {
+		args = append(args,
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()),
+		)
 	}
 	if attrs, ok := ctx.Value(fieldsKey{}).([]slog.Attr); ok {
 		for _, a := range attrs {
