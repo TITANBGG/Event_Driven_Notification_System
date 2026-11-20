@@ -15,6 +15,15 @@ run_req() {
 run_req "GET /health/live" \
   curl "${API_URL}/health/live"
 
+run_req "GET /health/ready" \
+  curl "${API_URL}/health/ready"
+
+run_req "GET /health (alias for /health/ready)" \
+  curl "${API_URL}/health"
+
+run_req "GET /metrics (Prometheus scrape headers + status check)" \
+  curl -o /dev/null -D - "${API_URL}/metrics"
+
 run_req "GET /openapi.yaml (headers + status check)" \
   curl -o /dev/null -D - "${API_URL}/openapi.yaml"
 
@@ -93,6 +102,9 @@ run_req "GET /api/v1/batches/${E2E_BATCH_ID} (all 10 sent)" \
 
 run_req "POST /api/v1/batches/${E2E_BATCH_ID}/cancel (after completion: cancelled=0, notCancellable=10)" \
   curl -X POST "${API_URL}/api/v1/batches/${E2E_BATCH_ID}/cancel"
+
+run_req "GET /api/v1/metrics (real-time JSON observability snapshot)" \
+  curl "${API_URL}/api/v1/metrics"
 
 run_req "GET ${MOCK_URL}/stats" \
   curl "${MOCK_URL}/stats"
