@@ -168,6 +168,18 @@ func MaskToken(token string) string {
 	return string(r[:4]) + "***" + string(r[n-4:])
 }
 
+// MaskRecipient masks a recipient identifier according to channel rules so PII is never logged raw.
+func MaskRecipient(channel, recipient string) string {
+	switch strings.ToLower(strings.TrimSpace(channel)) {
+	case "sms":
+		return MaskPhone(recipient)
+	case "email":
+		return MaskEmail(recipient)
+	default:
+		return MaskToken(recipient)
+	}
+}
+
 // MaskDatabaseURL redacts the password segment of a Postgres DSN for safe startup logging.
 func MaskDatabaseURL(raw string) string {
 	schemeIdx := strings.Index(raw, "://")

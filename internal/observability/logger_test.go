@@ -135,3 +135,11 @@ func TestLoggerContextEnrichmentAndLevels(t *testing.T) {
 	assert.Equal(t, "sms", record["channel"])
 	assert.Equal(t, float64(2), record["attempt"])
 }
+
+func TestMaskRecipient(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "+90555***4567", observability.MaskRecipient("sms", "+905551234567"))
+	assert.Equal(t, "a***@example.com", observability.MaskRecipient("email", "ali@example.com"))
+	assert.Equal(t, "fcm_***0xyz", observability.MaskRecipient("push", "fcm_abcdef1234567890xyz"))
+}
