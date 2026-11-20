@@ -40,7 +40,20 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to parse database URL",
+			slog.String("database_url", observability.MaskDatabaseURL(cfg.DatabaseURL)),
+		)
+		return errors.New("invalid DATABASE_URL configuration")
+	}
+	poolCfg.MaxConns = 25
+	poolCfg.MinConns = 2
+	poolCfg.MaxConnLifetime = 30 * time.Minute
+	poolCfg.MaxConnIdleTime = 5 * time.Minute
+	poolCfg.HealthCheckPeriod = 30 * time.Second
+
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		logger.Error("failed to create postgres pool", slog.String("error", err.Error()))
 		return err

@@ -115,6 +115,8 @@ paths:
           $ref: "#/components/responses/ValidationFailed"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
     get:
       tags: [Notifications]
@@ -178,6 +180,8 @@ paths:
           $ref: "#/components/responses/ValidationFailed"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/notifications/batch:
     post:
@@ -227,6 +231,8 @@ paths:
           $ref: "#/components/responses/ValidationFailed"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/notifications/{id}:
     get:
@@ -341,6 +347,8 @@ paths:
           $ref: "#/components/responses/ValidationFailed"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/batches/{id}/cancel:
     post:
@@ -448,6 +456,7 @@ components:
           type: string
           minLength: 1
           maxLength: 255
+          description: Supported only for items inside POST /api/v1/notifications/batch; single notifications use the Idempotency-Key header.
         templateId:
           type: string
           format: uuid
@@ -781,6 +790,12 @@ components:
             correlationId: 01936f7e-0000-7000-8000-000000000002
     InternalError:
       description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServiceUnavailable:
+      description: PostgreSQL is temporarily unavailable
       content:
         application/json:
           schema:

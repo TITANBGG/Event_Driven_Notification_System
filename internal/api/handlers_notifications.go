@@ -42,6 +42,9 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 	}
 
 	addPhase3UnsupportedErrors("", in, ve)
+	if in.IdempotencyKey != nil {
+		ve.Add("idempotencyKey", "unsupported_field", "use the Idempotency-Key header for single notifications; body idempotencyKey is only supported for batch items")
+	}
 	opts := domain.ValidationOptions{
 		AllowEmptyContent:      in.TemplateID != nil,
 		CheckScheduledAt:       false,
@@ -211,14 +214,12 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		ve.Add("Idempotency-Key", "invalid_idempotency_key", "must be 1..255 printable ASCII characters")
 	}
 
-	rawInputs := make([]domain.CreateNotificationInput, len(req.Notifications))
 	normalizedItems := make([]domain.CreateNotificationInput, len(req.Notifications))
 	itemKeyIndexes := make(map[string][]int)
 
 	for i, itemReq := range req.Notifications {
 		prefix := fmt.Sprintf("notifications[%d].", i)
 		in := itemReq.toDomainInput()
-		rawInputs[i] = in
 
 		addPhase3UnsupportedErrors(prefix, in, ve)
 		opts := domain.ValidationOptions{

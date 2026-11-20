@@ -66,6 +66,8 @@ type mockServer struct {
 	received   int
 	byKey      map[string]int
 	timestamps []time.Time
+	tsHead     int
+	tsCount    int
 }
 
 func newMockServer(cfg mockConfig, logger *slog.Logger, nowFn func() time.Time) *mockServer {
@@ -108,8 +110,14 @@ func (s *mockServer) handleStats(w http.ResponseWriter, _ *http.Request) {
 	for k, v := range s.byKey {
 		byKeyCopy[k] = v
 	}
-	tsCopy := make([]time.Time, len(s.timestamps))
-	copy(tsCopy, s.timestamps)
+	tsCopy := make([]time.Time, s.tsCount)
+	if s.tsCount > 0 {
+		capLen := len(s.timestamps)
+		start := (s.tsHead - s.tsCount + capLen) % capLen
+		for i := 0; i < s.tsCount; i++ {
+			tsCopy[i] = s.timestamps[(start+i)%capLen]
+		}
+	}
 	received := s.received
 	s.mu.Unlock()
 
@@ -125,6 +133,8 @@ func (s *mockServer) handleReset(w http.ResponseWriter, _ *http.Request) {
 	s.received = 0
 	s.byKey = make(map[string]int)
 	s.timestamps = nil
+	s.tsHead = 0
+	s.tsCount = 0
 	s.mu.Unlock()
 
 	writeJSON(w, s.logger, http.StatusOK, map[string]string{"status": "reset"})
@@ -229,12 +239,15 @@ func (s *mockServer) recordAndDecide(idemKey string) (time.Duration, int) {
 	}
 	now := s.nowFn()
 	if s.maxTimestamps > 0 {
-		if len(s.timestamps) >= s.maxTimestamps {
-			// Retain the most recent window in-place to cap memory during long load runs.
-			copy(s.timestamps, s.timestamps[1:])
-			s.timestamps[len(s.timestamps)-1] = now
-		} else {
+		if len(s.timestamps) < s.maxTimestamps {
 			s.timestamps = append(s.timestamps, now)
+			s.tsCount = len(s.timestamps)
+			s.tsHead = s.tsCount % s.maxTimestamps
+		} else {
+			// O(1) circular ring buffer retains the most recent window without shifting memory under lock.
+			s.timestamps[s.tsHead] = now
+			s.tsHead = (s.tsHead + 1) % s.maxTimestamps
+			s.tsCount = s.maxTimestamps
 		}
 	}
 

@@ -23,14 +23,14 @@ run_req "POST /api/v1/notifications (Turkish SMS, high priority)" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: smoke-single-${RUN_TAG}" \
   -H "X-Correlation-ID: smoke-corr-${RUN_TAG}" \
-  -d '{"recipient":"+905551234567","channel":"sms","content":"Siparişiniz kargoya verildi","priority":"high"}'
+  -d '{"recipient":"+905551234567","channel":"sms","content":"Sipari\u015finiz kargoya verildi","priority":"high"}'
 
 run_req "POST /api/v1/notifications (idempotent replay)" \
   curl -X POST "${API_URL}/api/v1/notifications" \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: smoke-single-${RUN_TAG}" \
   -H "X-Correlation-ID: smoke-replay-${RUN_TAG}" \
-  -d '{"priority":"high","content":"Siparişiniz kargoya verildi","channel":"sms","recipient":"+905551234567"}'
+  -d '{"priority":"high","content":"Sipari\u015finiz kargoya verildi","channel":"sms","recipient":"+905551234567"}'
 
 SINGLE_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/notifications" \
   -H "Content-Type: application/json" \

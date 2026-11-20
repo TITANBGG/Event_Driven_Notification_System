@@ -17,7 +17,7 @@ func (h *handler) handleGetBatch(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	ve := &domain.ValidationError{}
-	limit, limitOK := parsePageLimit(q.Get("limit"), h.cfg.PageLimitDefault, h.cfg.PageLimitMax, ve)
+	limit, _ := parsePageLimit(q.Get("limit"), h.cfg.PageLimitDefault, h.cfg.PageLimitMax, ve)
 	if ve.HasErrors() {
 		writeError(w, r, h.logger, ve)
 		return
@@ -45,11 +45,7 @@ func (h *handler) handleGetBatch(w http.ResponseWriter, r *http.Request) {
 		countsByStatus[st.String()] = cnt
 	}
 
-	fetchLimit := limit
-	if limitOK {
-		fetchLimit = limit + 1
-	}
-	rows, err := h.store.ListBatchItems(r.Context(), id, cursor, fetchLimit)
+	rows, err := h.store.ListBatchItems(r.Context(), id, cursor, limit+1)
 	if err != nil {
 		writeError(w, r, h.logger, err)
 		return

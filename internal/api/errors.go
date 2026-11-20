@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strings"
+	"syscall"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
@@ -130,15 +134,22 @@ func writeError(w http.ResponseWriter, r *http.Request, logger *slog.Logger, err
 			},
 			CorrelationID: cid,
 		})
+	case isDatabaseUnavailable(err):
+		observability.LoggerFrom(r.Context(), logger).Error("database unavailable during request",
+			slog.String("route", routePattern(r)),
+			slog.String("method", r.Method),
+			slog.String("error", err.Error()),
+		)
+		writeJSON(w, logger, http.StatusServiceUnavailable, ErrorResponse{
+			Error: ErrorBody{
+				Code:    "service_unavailable",
+				Message: "database temporarily unavailable",
+			},
+			CorrelationID: cid,
+		})
 	default:
-		route := "unmatched"
-		if rctx := chi.RouteContext(r.Context()); rctx != nil {
-			if pat := rctx.RoutePattern(); pat != "" {
-				route = pat
-			}
-		}
 		observability.LoggerFrom(r.Context(), logger).Error("unhandled api error",
-			slog.String("route", route),
+			slog.String("route", routePattern(r)),
 			slog.String("method", r.Method),
 			slog.String("error", err.Error()),
 		)
@@ -150,6 +161,40 @@ func writeError(w http.ResponseWriter, r *http.Request, logger *slog.Logger, err
 			CorrelationID: cid,
 		})
 	}
+}
+
+func routePattern(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil {
+		if pat := rctx.RoutePattern(); pat != "" {
+			return pat
+		}
+	}
+	return "unmatched"
+}
+
+func isDatabaseUnavailable(err error) bool {
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
+		return true
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if strings.HasPrefix(pgErr.Code, "08") {
+			return true
+		}
+		switch pgErr.Code {
+		case "57P01", "57P02", "57P03":
+			return true
+		}
+	}
+	return false
 }
 
 func notFoundHandler(logger *slog.Logger) http.HandlerFunc {

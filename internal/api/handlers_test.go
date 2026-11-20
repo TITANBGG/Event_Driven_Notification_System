@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -587,4 +589,53 @@ func TestCorrelationIDEchoHeaderAndErrorBodyAndCORSPreflight(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, recPre.Code)
 	assert.Equal(t, "http://localhost:8081", recPre.Header().Get("Access-Control-Allow-Origin"))
 	assert.Equal(t, "Idempotent-Replayed, X-Correlation-ID", recPre.Header().Get("Access-Control-Expose-Headers"))
+}
+
+func TestCreateNotificationRejectsBodyIdempotencyKey(t *testing.T) {
+	t.Parallel()
+
+	h, store, _ := newTestRouter(t)
+	rec := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"hi","idempotencyKey":"body-only-key"}`,
+		nil,
+	)
+
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+	var errResp api.ErrorResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &errResp))
+	require.Len(t, errResp.Error.Details, 1)
+	assert.Equal(t, "idempotencyKey", errResp.Error.Details[0].Field)
+	assert.Equal(t, "unsupported_field", errResp.Error.Details[0].Code)
+	assert.Equal(t, 0, store.NotificationCount())
+}
+
+func TestDatabaseUnavailableReturns503(t *testing.T) {
+	t.Parallel()
+
+	t.Run("pgconn SQLSTATE 57P03 maps to 503", func(t *testing.T) {
+		t.Parallel()
+		h, store, _ := newTestRouter(t)
+		store.SetForcedError(&pgconn.PgError{Code: "57P03", Message: "the database system is starting up"})
+
+		rec := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+			`{"recipient":"+905551234567","channel":"sms","content":"hi"}`,
+			nil,
+		)
+		require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		assert.Contains(t, rec.Body.String(), "service_unavailable")
+		assert.NotContains(t, rec.Body.String(), "starting up")
+	})
+
+	t.Run("net.OpError maps to 503 on read", func(t *testing.T) {
+		t.Parallel()
+		h, store, _ := newTestRouter(t)
+		store.SetForcedError(&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connection refused")})
+
+		id, err := uuid.NewV7()
+		require.NoError(t, err)
+		rec := doJSONRequest(t, h, http.MethodGet, "/api/v1/notifications/"+id.String(), "", nil)
+		require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+		assert.Contains(t, rec.Body.String(), "service_unavailable")
+		assert.NotContains(t, rec.Body.String(), "connection refused")
+	})
 }

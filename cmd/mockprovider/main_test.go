@@ -223,5 +223,44 @@ func TestMockProviderTimestampsBoundedAndRaceFree(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, 16, stats.Received)
 	assert.Equal(t, 16, stats.ByKey["k"])
-	assert.Len(t, stats.Timestamps, 10, "timestamps buffer must stay bounded to maxTimestamps")
+	require.Len(t, stats.Timestamps, 10, "timestamps buffer must stay bounded to maxTimestamps")
+	for i := 1; i < len(stats.Timestamps); i++ {
+		assert.False(t, stats.Timestamps[i].Before(stats.Timestamps[i-1]), "timestamps from ring buffer must stay chronological")
+	}
+}
+
+func TestMockProviderRingBufferEvictionOrder(t *testing.T) {
+	t.Parallel()
+
+	t.Run("retains newest timestamps in chronological order on wraparound", func(t *testing.T) {
+		t.Parallel()
+		tick := time.Date(2026, 11, 20, 20, 0, 0, 0, time.UTC)
+		ms := newMockServer(mockConfig{Seed: 1}, observability.NewLogger("error", io.Discard), func() time.Time {
+			tick = tick.Add(time.Second)
+			return tick
+		})
+		ms.maxTimestamps = 4
+
+		// Alternate recordAndDecide (+1,+3,+5,...) and acceptedResponse formatting (+2,+4,+6,...).
+		var expected []time.Time
+		for i := 0; i < 6; i++ {
+			_, _ = ms.recordAndDecide("k")
+			_ = ms.nowFn()
+			expected = append(expected, tick.Add(-time.Second))
+		}
+
+		ts := httptest.NewServer(ms.routes())
+		t.Cleanup(ts.Close)
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+"/stats", nil)
+		require.NoError(t, err)
+		resp, err := ts.Client().Do(req)
+		require.NoError(t, err)
+		var stats statsResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&stats))
+		require.NoError(t, resp.Body.Close())
+
+		assert.Equal(t, 6, stats.Received)
+		assert.Equal(t, expected[2:], stats.Timestamps)
+	})
 }

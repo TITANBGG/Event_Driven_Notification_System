@@ -53,11 +53,18 @@ func (s *fakeDBState) clone() *fakeDBState {
 // fakeStore is an in-memory transactional Store implementing Postgres semantics
 // (atomic rollback in WithTx, expired idempotency key reclaim, fenced transitions, keyset pagination).
 type fakeStore struct {
-	txMu sync.Mutex
-	mu   sync.RWMutex
-	now  func() time.Time
-	seq  time.Time
-	st   *fakeDBState
+	txMu      sync.Mutex
+	mu        sync.RWMutex
+	now       func() time.Time
+	seq       time.Time
+	forcedErr error
+	st        *fakeDBState
+}
+
+func (f *fakeStore) SetForcedError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forcedErr = err
 }
 
 func newFakeStore() *fakeStore {
@@ -74,6 +81,13 @@ func (f *fakeStore) Ping(_ context.Context) error {
 }
 
 func (f *fakeStore) WithTx(ctx context.Context, fn func(ctx context.Context, tx api.Store) error) error {
+	f.mu.RLock()
+	ferr := f.forcedErr
+	f.mu.RUnlock()
+	if ferr != nil {
+		return ferr
+	}
+
 	// txMu serializes write transactions cleanly just like Postgres row/PK locks.
 	f.txMu.Lock()
 	defer f.txMu.Unlock()
@@ -145,6 +159,9 @@ func (f *fakeStore) CopyNotifications(_ context.Context, items []domain.Notifica
 func (f *fakeStore) GetNotification(_ context.Context, id uuid.UUID) (*domain.Notification, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
+	if f.forcedErr != nil {
+		return nil, f.forcedErr
+	}
 	return (&fakeTxStore{root: f, st: f.st}).getNotificationLocked(id)
 }
 
