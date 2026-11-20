@@ -3,6 +3,7 @@
 !.env.example
 .notes/
 coverage.*
+coverage-all.*
 bin/
 PROMPTS.md
 go-warmup/

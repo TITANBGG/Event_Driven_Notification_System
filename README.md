@@ -440,9 +440,85 @@ make test-all
 # Run static analysis & linter:
 make lint
 
+# Unit coverage -> coverage.html + per-package table (no Docker):
+make cover
+# Unit + integration coverage attributed to every internal package (-coverpkg):
+make cover-all
+
 # Run 2,000-notification batch load test against running stack:
 make load
 ```
+
+### Integration scenarios (`internal/integration`, one Testcontainers PostgreSQL + Redis per run)
+
+| Subtest | What it proves |
+|---|---|
+| `a_single_notification_end_to_end` | API -> Postgres -> Redis -> worker -> provider (`EXT-1` body + `Idempotency-Key`) -> `sent` |
+| `b_idempotent_create_replay_and_conflict` | Same key + same body -> original `202` + `Idempotent-Replayed`; different body -> `409` |
+| `c_batch_1000_and_batch_key_replay` | 1000-item batch, batch-level replay returns the same `batchId` |
+| `d_cancel_race_no_cancelled_notification_reaches_provider` | 100 concurrent cancels vs. running workers: no cancelled ID is ever sent |
+| `e_retry_500_500_202_and_permanent_400_to_dlq` | Transient retries with backoff, permanent `400` straight to DLQ |
+| `f_priority_high_completes_ahead_of_low` | Weighted 6:3:1 dequeue: high finishes ahead of an older low backlog |
+| `g_distributed_rate_limit_1000_sms_across_two_workers` | 1000 SMS, 2 workers sharing one GCRA key: **max 97 sends in any 1s sliding window** (limit 101) |
+| `h_reconciler_repairs_untracked_pending_and_simulated_redis_loss` | Redis keys wiped mid-run (pending + retrying + scheduled rows) -> reconciler (a)/(b) repairs all |
+| `i_list_filters_and_three_page_keyset_pagination` | Status/channel/date filters and opaque keyset cursor over 3 pages |
+| `j_scheduled_due_in_2s_sent_after_due_and_cancelled_never_sent` | `scheduledAt` never sent early; cancelled scheduled item never sent |
+| `k_template_create_preview_and_batch_personalized_sms_delivery` | Template render-at-create; provider bodies contain the rendered text |
+| `l_websocket_batch_subscription_receives_snapshot_and_live_sent_events` | WebSocket snapshot + live `sent` events for a batch |
+| `m_tracing_traceparent_propagates_from_api_through_redis_to_provider` | Incoming W3C `traceparent` trace ID reaches the provider request |
+| `n_circuit_breaker_opens_on_503_outage_without_burning_attempts_then_recovers` | Permanent `503`: breaker opens after 3 failures, **4 provider requests for 10 notifications**, `circuit_open` attempts are `counted=false`, nothing dead-lettered; provider recovers -> 10/10 sent |
+| `o_worker_crash_mid_batch_recovered_by_reconciler_with_bounded_duplicates` | Exact state of a SIGKILLed worker (10 items in its inflight list + claimed, 5 already accepted by the provider, heartbeat gone): reconciler (d) drains the orphan list, (c) reclaims 10 `abandoned` rows -> 30/30 sent; **duplicates = 5 = sends in flight at crash**, all with the same `Idempotency-Key` |
+| `p_idempotency_20_concurrent_posts_same_key_create_exactly_one_row` | 20 simultaneous POSTs with one key: all `202`, one id, exactly one non-replayed response, one DB row |
+| `q_manual_retry_failed_to_sent` | `failed` (DLQ) -> `POST /retry` resets attempts -> `sent`; retrying a `sent` row -> `409` |
+
+The full suite (17 scenarios) runs in ~25s locally and in the CI `integration` job.
+
+### Coverage
+
+Measured on 2026-11-21 (`make cover` for unit tests, `make cover-all` for unit + integration with `-coverpkg=./internal/...`):
+
+| Package | Unit | Unit + integration |
+|---|---:|---:|
+| `internal/domain` | 85.7% | 89.0% |
+| `internal/worker` | 78.4% | 80.9% |
+| `internal/api` | 72.7% | 75.9% |
+| `internal/api/middleware` | 79.8% | 89.9% |
+| `internal/queue` | 91.8% | 92.7% |
+| `internal/ratelimit` | 85.3% | 88.2% |
+| `internal/provider` | 80.7% | 85.3% |
+| `internal/realtime` | 76.8% | 83.2% |
+| `internal/template` | 79.6% | 81.0% |
+| `internal/config` | 80.0% | 80.0% |
+| `internal/observability` | 69.9% | 71.7% |
+| `internal/repository` (+ `sqlc`) | 7.1% | 62.7% (63.5%) |
+| **`internal/...` total** | | **78.3%** |
+
+`internal/repository` is intentionally exercised by the integration suite (real PostgreSQL), not by mocks.
+
+### Load test results
+
+`cmd/loadgen` creates batches concurrently, waits until every notification is terminal, then pages through the batches to compute per-channel send rates from the persisted `sentAt` timestamps:
+
+```bash
+MOCK_LATENCY_MS=50 docker compose up -d --build
+go run ./cmd/loadgen -n 10000 -batch 500 -concurrency 8 -channel mixed -channel-mix 34:33:33 -priority-mix 20:60:20
+```
+
+Flags: `-n` total, `-batch` items per request (`<= 1000`), `-concurrency` parallel submitters, `-channel` (`mixed|sms|email|push`), `-channel-mix sms:email:push`, `-priority-mix high:normal:low`, `-poll-timeout`, `-channel-stats`. Exit code is `1` if anything is still non-terminal.
+
+| Metric | Result (10,000 notifications, 34/33/33 channel mix, mock latency 50ms) |
+|---|---|
+| Batch create (20 x 500 items, 8 concurrent) | 287ms total, **34,787 notifications/s** accepted |
+| Batch create latency | p50 89.7ms, p95 164.7ms, p99 165.1ms |
+| Time to all terminal | **36.8s** (theoretical floor at 100/s/channel: ~34s) |
+| End-to-end throughput | 271.9 sent/s across 3 channels |
+| Effective send rate per channel | sms 94.9/s, email 94.9/s, push 95.0/s (limit 100/s) |
+| Final statuses | 10,000 `sent`, 0 failed |
+| Provider requests / unique `Idempotency-Key`s | 10,000 / 10,000 (no duplicate sends) |
+
+Hardware: Intel Core i7-11800H (8C/16T), 32 GB RAM, Windows 11 + Docker Desktop 29.9.3 (Linux VM: 16 vCPU, 15.5 GB); API, 2 workers, PostgreSQL, Redis and the mock provider all on the same machine.
+
+The effective rate is ~5% below the configured 100/s because a denied worker sleeps for the GCRA `RetryAfter` and then needs another Redis round trip before it can send, so slots are occasionally missed; the requirement (never more than 100/s per channel) is the hard bound and is asserted separately by integration test `g`.
 
 ### CI/CD (GitHub Actions, `B-6`)
 
@@ -499,16 +575,16 @@ By default, `docker-compose.yml` points `PROVIDER_URL` at the in-cluster `http:/
 | **FR-1.5** | Cancel pending notifications (`pending`/`retrying`/`scheduled` -> `cancelled`, `409 Conflict`) | `internal/api/handlers_notifications.go`, `internal/api/handlers_batches.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/d_cancel_race_no_cancelled_notification_reaches_provider` | **DONE** |
 | **FR-1.6** | List notifications with filtering (`status`, `channel`, `priority`, `from`/`to`) & keyset pagination | `internal/api/handlers_notifications.go`, `internal/api/cursor.go` | `internal/api/handlers_test.go`, `TestCoreIntegration/i_list_filters_and_three_page_keyset_pagination` | **DONE** |
 | **FR-2.1** | Process notifications asynchronously via queue workers with atomic `Claim` & fencing | `internal/worker/worker.go`, `internal/queue/queue.go`, `cmd/worker/main.go` | `internal/worker/worker_test.go`, `TestCoreIntegration/a_single_notification_end_to_end` | **DONE** |
-| **FR-2.2** | Distributed rate limiting: max `100` messages/sec per channel (`Burst=1`) | `internal/ratelimit/limiter.go` | `internal/ratelimit/limiter_test.go`, `TestCoreIntegration/g_distributed_rate_limit_500_sms_across_two_workers` | **DONE** |
+| **FR-2.2** | Distributed rate limiting: max `100` messages/sec per channel (`Burst=1`) | `internal/ratelimit/limiter.go` | `internal/ratelimit/limiter_test.go`, `TestCoreIntegration/g_distributed_rate_limit_1000_sms_across_two_workers` | **DONE** |
 | **FR-2.3** | Priority queue support (`high`, `normal`, `low`, 6:3:1 weighted anti-starvation) | `internal/queue/queue.go`, `internal/queue/lua/dequeue.lua` | `internal/queue/queue_test.go`, `TestCoreIntegration/f_priority_high_completes_ahead_of_low` | **DONE** |
 | **FR-2.4** | Content & recipient validation (E.164, GSM-7/UCS-2 SMS segments, Email, Push) | `internal/domain/validation.go`, `internal/domain/sms.go` | `internal/domain/validation_test.go`, `internal/domain/sms_test.go`, `internal/api/handlers_test.go` | **DONE** |
-| **FR-2.5** | Idempotency support (API `idempotency_keys` + SHA-256 canonical hash; provider `Idempotency-Key`) | `internal/domain/hash.go`, `internal/api/handlers_notifications.go`, `internal/provider/client.go` | `internal/domain/hash_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/b_idempotent_create_replay_and_conflict` | **DONE** |
+| **FR-2.5** | Idempotency support (API `idempotency_keys` + SHA-256 canonical hash; provider `Idempotency-Key`) | `internal/domain/hash.go`, `internal/api/handlers_notifications.go`, `internal/provider/client.go` | `internal/domain/hash_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/b_idempotent_create_replay_and_conflict`, `p_idempotency_20_concurrent_posts_same_key_create_exactly_one_row` | **DONE** |
 | **FR-3** | Delivery & retry logic (outcome classification, full-jitter exponential backoff, `Retry-After`) | `internal/worker/retry.go`, `internal/worker/worker.go`, `internal/provider/client.go` | `internal/worker/retry_test.go`, `internal/worker/worker_phase5_test.go`, `TestCoreIntegration/e_retry_500_500_202_and_permanent_400_to_dlq` | **DONE** |
 | **FR-4.1** | Real-time metrics (`/metrics` Prometheus custom registry + `/api/v1/metrics` 2s cached JSON) | `internal/observability/metrics.go`, `internal/api/handlers_metrics.go`, `internal/api/middleware/metrics.go` | `internal/observability/metrics_test.go`, `internal/api/observability_test.go` | **DONE** |
 | **FR-4.2** | Structured JSON logging (`log/slog`) with `correlation_id` propagation & PII masking | `internal/observability/logger.go`, `internal/api/middleware/correlation.go`, `internal/api/middleware/logger.go` | `internal/observability/logger_test.go`, `internal/api/middleware/middleware_test.go`, `internal/worker/observability_hooks_test.go` | **DONE** |
 | **FR-4.3** | Health check endpoints (`/health/live`, `/health/ready`, `/health` with 1s DB/Redis timeout & `503`) | `internal/api/handlers_system.go`, `cmd/worker/main.go`, `cmd/healthcheck/main.go` | `internal/api/observability_test.go`, `cmd/healthcheck/main_test.go`, `scripts/smoke.sh` | **DONE** |
 | **EXT-1** | External provider HTTP contract (`POST {to,channel,content}` -> `202 {messageId,status,timestamp}`) | `internal/provider/client.go`, `cmd/mockprovider/main.go` | `internal/provider/client_test.go`, `cmd/mockprovider/main_test.go`, `TestCoreIntegration/a_single_notification_end_to_end` | **DONE** |
-| **B-1** | Failure handling (per-channel `gobreaker/v2`, DLQ, 5-step Reconciler, Inflight Sweeper, manual `/retry`) | `internal/worker/breaker.go`, `internal/worker/reconciler.go`, `internal/worker/worker.go` | `internal/worker/breaker_test.go`, `internal/worker/reconciler_test.go`, `internal/worker/stranded_repair_test.go`, `TestCoreIntegration/h_reconciler_repairs_untracked_pending_and_simulated_redis_loss` | **DONE** |
+| **B-1** | Failure handling (per-channel `gobreaker/v2`, DLQ, 5-step Reconciler, Inflight Sweeper, manual `/retry`) | `internal/worker/breaker.go`, `internal/worker/reconciler.go`, `internal/worker/worker.go` | `internal/worker/breaker_test.go`, `internal/worker/reconciler_test.go`, `internal/worker/stranded_repair_test.go`, `TestCoreIntegration/h_reconciler_repairs_untracked_pending_and_simulated_redis_loss`, `n_circuit_breaker_opens_on_503_outage_without_burning_attempts_then_recovers`, `o_worker_crash_mid_batch_recovered_by_reconciler_with_bounded_duplicates`, `q_manual_retry_failed_to_sent` | **DONE** |
 | **B-2** | Scheduled notifications (`scheduledAt` RFC3339 -> UTC, shared `{notif}:delayed` ZSET + `Claim` clock-skew guard, cancel-before-due) | `internal/api/handlers_notifications.go`, `internal/domain/validation.go`, `internal/queue/queue.go`, `internal/worker/reconciler.go` | `internal/api/handlers_test.go`, `internal/worker/worker_test.go`, `TestCoreIntegration/j_scheduled_due_in_2s_sent_after_due_and_cancelled_never_sent` | **DONE** |
 | **B-3** | Message templates with safe `{{variable}}` substitution, preview endpoint, soft-delete, and render-at-create | `internal/template/template.go`, `internal/api/handlers_templates.go`, `migrations/000002_templates.up.sql` | `internal/template/template_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/k_template_create_preview_and_batch_personalized_sms_delivery` | **DONE** |
 | **B-4** | Real-time WebSocket status updates (`GET /api/v1/ws`, Redis Pub/Sub `notif:events`, initial DB snapshot, `/demo` UI) | `internal/realtime/hub.go`, `internal/api/handlers_ws.go`, `internal/api/static/demo.html` | `internal/realtime/hub_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/l_websocket_batch_subscription_receives_snapshot_and_live_sent_events` | **DONE** |
@@ -519,6 +595,6 @@ By default, `docker-compose.yml` points `PROVIDER_URL` at the in-cluster `http:/
 | **D-3** | One-command zero-config Docker Compose (`docker compose up` & `docker-compose up`) | `docker-compose.yml`, `Dockerfile`, `.env.example` | Live Docker Compose build + `scripts/smoke.sh` | **DONE** |
 | **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
 | **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
-| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go` | `go test -race ./...` + `go test -race -tags=integration ./...` | **DONE** |
+| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (17 scenarios), `make cover`, 10k load test | **DONE** |
 
 

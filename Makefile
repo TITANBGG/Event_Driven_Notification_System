@@ -4,7 +4,7 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
-.PHONY: up down logs build test test-integration test-all cover lint fmt migrate-up migrate-down sqlc smoke load run-api run-worker
+.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke load run-api run-worker
 
 up:
 	$(COMPOSE) up --build -d
@@ -31,10 +31,17 @@ test-integration:
 
 test-all: test test-integration
 
+# Unit-test coverage (no Docker): coverage.html + per-package table.
 cover:
-	go test -race -coverprofile=coverage.out ./...
+	go test -race -covermode=atomic -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
-	go tool cover -func=coverage.out
+	sh scripts/coverage-by-package.sh coverage.out
+
+# Unit + integration coverage attributed to every internal package (-coverpkg), e.g. repository SQL paths.
+cover-all:
+	go test -race -tags=integration -covermode=atomic -coverpkg=./internal/... -coverprofile=coverage-all.out ./...
+	go tool cover -html=coverage-all.out -o coverage-all.html
+	sh scripts/coverage-by-package.sh coverage-all.out
 
 lint:
 	gofmt -l .
