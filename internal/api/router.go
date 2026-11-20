@@ -11,6 +11,7 @@ import (
 	"github.com/TITANBGG/notification-system/internal/api/middleware"
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/observability"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 )
 
 const (
@@ -25,6 +26,8 @@ type Deps struct {
 	Store          Store
 	Enqueuer       Enqueuer
 	QueueInspector QueueInspector
+	Hub            *realtime.Hub
+	Publisher      realtime.Publisher
 	Metrics        *observability.Metrics
 	Now            func() time.Time
 }
@@ -35,6 +38,8 @@ type handler struct {
 	store          Store
 	enqueuer       Enqueuer
 	queueInspector QueueInspector
+	hub            *realtime.Hub
+	publisher      realtime.Publisher
 	metrics        *observability.Metrics
 	nowFn          func() time.Time
 
@@ -62,6 +67,10 @@ func NewRouter(deps Deps) chi.Router {
 	if metrics == nil {
 		metrics = observability.NewAPIMetrics()
 	}
+	pub := deps.Publisher
+	if pub == nil {
+		pub = realtime.NoopPublisher{}
+	}
 
 	h := &handler{
 		cfg:            deps.Config,
@@ -69,6 +78,8 @@ func NewRouter(deps Deps) chi.Router {
 		store:          deps.Store,
 		enqueuer:       enq,
 		queueInspector: deps.QueueInspector,
+		hub:            deps.Hub,
+		publisher:      pub,
 		metrics:        metrics,
 		nowFn:          nowFn,
 	}
@@ -93,6 +104,7 @@ func NewRouter(deps Deps) chi.Router {
 	r.Get("/health/ready", h.handleHealthReady)
 	r.Get("/metrics", h.metrics.Handler().ServeHTTP)
 	r.Get("/openapi.yaml", h.handleOpenAPISpec)
+	r.Get("/demo", h.handleDemoPage)
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/notifications", h.handleCreateNotification)
@@ -112,6 +124,7 @@ func NewRouter(deps Deps) chi.Router {
 		r.Delete("/templates/{id}", h.handleDeleteTemplate)
 		r.Post("/templates/{id}/preview", h.handlePreviewTemplate)
 
+		r.Get("/ws", h.handleWebSocket)
 		r.Get("/metrics", h.handleMetricsSnapshot)
 	})
 

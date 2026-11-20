@@ -7,6 +7,7 @@ import (
 
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 	"github.com/TITANBGG/notification-system/internal/repository"
 )
 
@@ -101,6 +102,29 @@ func (h *handler) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
 				slog.Int("count", len(cancelledIDs)),
 				slog.String("error", cancelErr.Error()),
 			)
+		}
+		cid := observability.CorrelationID(r.Context())
+		now := h.nowFn().UTC()
+		cancelledItems, listErr := h.listAllBatchItemsOrdered(r.Context(), id, batch.Total)
+		if listErr == nil {
+			cancelSet := make(map[string]struct{}, len(cancelledIDs))
+			for _, cidUUID := range cancelledIDs {
+				cancelSet[cidUUID.String()] = struct{}{}
+			}
+			var events []realtime.Event
+			for _, item := range cancelledItems {
+				if _, ok := cancelSet[item.ID.String()]; ok {
+					events = append(events, realtime.NewEvent(item, now, cid))
+				}
+			}
+			if len(events) > 0 && h.publisher != nil {
+				if pubErr := h.publisher.Publish(r.Context(), events...); pubErr != nil {
+					observability.LoggerFrom(r.Context(), h.logger).Warn("failed publishing batch cancel events",
+						slog.String("batch_id", id.String()),
+						slog.String("error", pubErr.Error()),
+					)
+				}
+			}
 		}
 	}
 

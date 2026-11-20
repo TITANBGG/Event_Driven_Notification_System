@@ -17,6 +17,7 @@ import (
 
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 	"github.com/TITANBGG/notification-system/internal/repository"
 	"github.com/TITANBGG/notification-system/internal/template"
 )
@@ -117,6 +118,7 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 	}
 
 	h.metrics.IncNotificationCreated(created.Channel.String(), created.Priority.String())
+	h.publishStatusEvents(r.Context(), cid, *created)
 
 	// Commit to PostgreSQL completed before pushing queue hint to Redis so reconciler repairs enqueue failures.
 	if enqErr := h.enqueuer.Enqueue(r.Context(), []QueueItem{{
@@ -363,6 +365,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	for _, n := range notifications {
 		h.metrics.IncNotificationCreated(n.Channel.String(), n.Priority.String())
 	}
+	h.publishStatusEvents(r.Context(), cid, notifications...)
 
 	queueItems := make([]QueueItem, len(notifications))
 	for i, n := range notifications {
@@ -701,6 +704,7 @@ func (h *handler) handleCancelNotification(w http.ResponseWriter, r *http.Reques
 			slog.String("error", cancelErr.Error()),
 		)
 	}
+	h.publishStatusEvents(r.Context(), observability.CorrelationID(r.Context()), *updated)
 
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
 }
@@ -751,6 +755,7 @@ func (h *handler) handleRetryNotification(w http.ResponseWriter, r *http.Request
 			slog.String("error", enqErr.Error()),
 		)
 	}
+	h.publishStatusEvents(r.Context(), cid, *updated)
 
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
 }
@@ -944,6 +949,23 @@ func newUUIDv7() (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 	return id, nil
+}
+
+func (h *handler) publishStatusEvents(ctx context.Context, correlationID string, items ...domain.Notification) {
+	if h.publisher == nil || len(items) == 0 {
+		return
+	}
+	now := h.nowFn().UTC()
+	events := make([]realtime.Event, len(items))
+	for i, n := range items {
+		events[i] = realtime.NewEvent(n, now, correlationID)
+	}
+	if err := h.publisher.Publish(ctx, events...); err != nil {
+		observability.LoggerFrom(ctx, h.logger).Warn("failed publishing realtime status events",
+			slog.Int("count", len(events)),
+			slog.String("error", err.Error()),
+		)
+	}
 }
 
 func optionalNonEmpty(s string) *string {

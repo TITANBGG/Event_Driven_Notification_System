@@ -22,6 +22,8 @@ tags:
     description: Batch status aggregation and bulk cancellation
   - name: Templates
     description: Message template management and variable substitution preview
+  - name: Realtime
+    description: WebSocket live status updates and interactive demo dashboard
 
 paths:
   /health/live:
@@ -59,6 +61,22 @@ paths:
               $ref: "#/components/headers/CorrelationIDResponse"
           content:
             application/yaml:
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/MalformedJSON"
+
+  /demo:
+    get:
+      operationId: getDemoDashboard
+      tags: [Realtime]
+      summary: Interactive live WebSocket demo dashboard
+      description: Serves a single-page HTML dashboard (`go:embed`) that creates notification batches and streams live status updates over `GET /api/v1/ws`.
+      responses:
+        "200":
+          description: Interactive HTML dashboard
+          content:
+            text/html:
               schema:
                 type: string
         "400":
@@ -612,6 +630,60 @@ paths:
           $ref: "#/components/responses/InternalError"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/ws:
+    get:
+      operationId: streamNotificationEventsWS
+      tags: [Realtime]
+      summary: WebSocket stream for real-time notification status transitions
+      description: |
+        Upgrades the HTTP connection to a WebSocket (`101 Switching Protocols`).
+        At least one filter query parameter (`notificationId`, `batchId`, or `channel`) is required; multiple filters are AND-combined.
+        On connect, the server subscribes to the Hub first, then sends a `WSSnapshotMessage` (`{"type":"snapshot",...}`) for `notificationId` or `batchId`,
+        and finally streams live `RealtimeStatusEvent` JSON frames from Redis pub/sub (`notif:events`).
+        Slow clients whose 64-message send buffer fills up are disconnected with WebSocket close code `1008` (Policy Violation).
+      parameters:
+        - name: notificationId
+          in: query
+          description: Filter events for a single notification UUID
+          schema:
+            type: string
+            format: uuid
+        - name: batchId
+          in: query
+          description: Filter events for all notifications belonging to a batch UUID
+          schema:
+            type: string
+            format: uuid
+        - name: channel
+          in: query
+          description: Filter events by delivery channel (`sms`, `email`, `push`)
+          schema:
+            type: string
+            enum: [sms, email, push]
+      responses:
+        "101":
+          description: Switching Protocols to WebSocket stream (sends `WSSnapshotMessage` followed by `RealtimeStatusEvent` JSON frames)
+        "200":
+          description: WebSocket frame payload schema reference (`WSSnapshotMessage` initial snapshot followed by `RealtimeStatusEvent` frames)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/WSSnapshotMessage"
+                  - $ref: "#/components/schemas/RealtimeStatusEvent"
+        "400":
+          description: Missing filter query parameter or invalid UUID/channel before WebSocket upgrade
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Maximum concurrent WebSocket clients (`MAX_WS_CLIENTS`) exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /health:
     get:
@@ -1233,6 +1305,49 @@ components:
           type: array
           items:
             type: string
+
+    RealtimeStatusEvent:
+      type: object
+      required: [type, notificationId, batchId, channel, status, attempt, error, occurredAt]
+      properties:
+        type:
+          type: string
+          enum: [event]
+        notificationId:
+          type: string
+          format: uuid
+        batchId:
+          type: string
+          format: uuid
+          nullable: true
+        channel:
+          type: string
+          enum: [sms, email, push]
+        status:
+          type: string
+          enum: [scheduled, pending, processing, retrying, sent, failed, cancelled]
+        attempt:
+          type: integer
+        error:
+          type: string
+          nullable: true
+        occurredAt:
+          type: string
+          format: date-time
+        correlationId:
+          type: string
+
+    WSSnapshotMessage:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [snapshot]
+        notification:
+          $ref: "#/components/schemas/NotificationResponse"
+        batch:
+          $ref: "#/components/schemas/BatchDetailResponse"
 
     FieldError:
       type: object

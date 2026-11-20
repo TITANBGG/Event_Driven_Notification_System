@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Event-Driven Notification System — Live WebSocket Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --panel: #1e293b;
+      --border: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --scheduled: #a855f7;
+      --pending: #64748b;
+      --processing: #3b82f6;
+      --retrying: #f59e0b;
+      --sent: #10b981;
+      --failed: #ef4444;
+      --cancelled: #6b7280;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    h1 { margin: 0 0 6px 0; font-size: 22px; }
+    p.sub { margin: 0 0 20px 0; color: var(--muted); font-size: 14px; }
+    .grid {
+      display: grid;
+      grid-template-columns: 340px 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+    }
+    .card h2 {
+      margin: 0 0 14px 0;
+      font-size: 16px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 4px;
+      margin-top: 10px;
+    }
+    input, select, button {
+      width: 100%;
+      padding: 9px 11px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #0b1120;
+      color: var(--text);
+      font-size: 14px;
+    }
+    button {
+      margin-top: 16px;
+      background: #2563eb;
+      border-color: #3b82f6;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #1d4ed8; }
+    button.secondary {
+      background: #334155;
+      border-color: #475569;
+      margin-top: 8px;
+    }
+    .counters {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+    }
+    .status-scheduled  { background: rgba(168,85,247,0.2); color: #d8b4fe; border: 1px solid var(--scheduled); }
+    .status-pending    { background: rgba(100,116,139,0.2); color: #cbd5e1; border: 1px solid var(--pending); }
+    .status-processing { background: rgba(59,130,246,0.25); color: #93c5fd; border: 1px solid var(--processing); }
+    .status-retrying   { background: rgba(245,158,11,0.25); color: #fde68a; border: 1px solid var(--retrying); }
+    .status-sent       { background: rgba(16,185,129,0.25); color: #6ee7b7; border: 1px solid var(--sent); }
+    .status-failed     { background: rgba(239,68,68,0.25);  color: #fca5a5; border: 1px solid var(--failed); }
+    .status-cancelled  { background: rgba(107,114,128,0.25); color: #d1d5db; border: 1px solid var(--cancelled); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    th { color: var(--muted); font-family: inherit; }
+    .log-panel {
+      margin-top: 18px;
+      background: #0b1120;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      height: 220px;
+      overflow-y: auto;
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .log-line { margin-bottom: 4px; border-bottom: 1px dashed #1e293b; padding-bottom: 2px; }
+    .ws-state { font-size: 12px; float: right; font-weight: normal; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <h1>Event-Driven Notification System — Live Status Stream</h1>
+  <p class="sub">Real-time WebSocket stream (<code>GET /api/v1/ws</code>) backed by Redis Pub/Sub (<code>notif:events</code>) + PostgreSQL initial snapshot</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Dispatch Batch</h2>
+      <form id="batchForm">
+        <label for="count">Batch Size (N)</label>
+        <input id="count" type="number" min="1" max="200" value="20" required>
+
+        <label for="channel">Channel</label>
+        <select id="channel">
+          <option value="sms">sms</option>
+          <option value="email">email</option>
+          <option value="push">push</option>
+        </select>
+
+        <label for="priority">Priority</label>
+        <select id="priority">
+          <option value="high">high</option>
+          <option value="normal" selected>normal</option>
+          <option value="low">low</option>
+        </select>
+
+        <button type="submit">Create Batch &amp; Stream Live</button>
+        <button type="button" id="cancelBtn" class="secondary" disabled>Cancel Remaining in Batch</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>
+        Batch Notifications
+        <span id="wsState" class="ws-state">WebSocket: idle</span>
+      </h2>
+      <div id="counters" class="counters"></div>
+      <div style="max-height: 360px; overflow-y: auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Notification ID</th>
+              <th>Channel</th>
+              <th>Status</th>
+              <th>Attempt</th>
+              <th>Last Error / Info</th>
+            </tr>
+          </thead>
+          <tbody id="tableBody">
+            <tr><td colspan="6" style="color: var(--muted);">Submit a batch on the left to watch live status updates.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 style="margin-top: 20px;">WebSocket Event Log</h2>
+      <div id="logPanel" class="log-panel"></div>
+    </div>
+  </div>
+
+  <script>
+    let activeWS = null;
+    let activeBatchId = null;
+    const rowsById = new Map();
+    const orderIds = [];
+
+    const tableBody = document.getElementById('tableBody');
+    const logPanel = document.getElementById('logPanel');
+    const countersEl = document.getElementById('counters');
+    const wsStateEl = document.getElementById('wsState');
+    const cancelBtn = document.getElementById('cancelBtn');
+
+    function appendLog(msg) {
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.textContent = '[' + new Date().toISOString().split('T')[1].replace('Z','') + '] ' + msg;
+      logPanel.prepend(div);
+    }
+
+    function renderTable() {
+      const counts = {};
+      tableBody.innerHTML = '';
+      orderIds.forEach((id, idx) => {
+        const item = rowsById.get(id);
+        counts[item.status] = (counts[item.status] || 0) + 1;
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td>' + (idx + 1) + '</td>' +
+          '<td>' + id + '</td>' +
+          '<td>' + item.channel + '</td>' +
+          '<td><span class="badge status-' + item.status + '">' + item.status + '</span></td>' +
+          '<td>' + item.attempt + '</td>' +
+          '<td>' + (item.error ? item.error : '-') + '</td>';
+        tableBody.appendChild(tr);
+      });
+
+      countersEl.innerHTML = '';
+      ['scheduled','pending','processing','retrying','sent','failed','cancelled'].forEach(st => {
+        if (counts[st]) {
+          const span = document.createElement('span');
+          span.className = 'badge status-' + st;
+          span.textContent = st + ': ' + counts[st];
+          countersEl.appendChild(span);
+        }
+      });
+    }
+
+    function connectBatchWS(batchId) {
+      if (activeWS) {
+        activeWS.close();
+      }
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const url = proto + '//' + location.host + '/api/v1/ws?batchId=' + encodeURIComponent(batchId);
+      wsStateEl.textContent = 'WebSocket: connecting...';
+      appendLog('Connecting ' + url);
+
+      const ws = new WebSocket(url);
+      activeWS = ws;
+
+      ws.onopen = () => {
+        wsStateEl.textContent = 'WebSocket: connected (batchId=' + batchId.slice(0, 8) + '…)';
+        appendLog('WebSocket connected');
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'snapshot' && msg.batch) {
+            appendLog('Received initial DB snapshot: total=' + msg.batch.total + ' counts=' + JSON.stringify(msg.batch.countsByStatus));
+            (msg.batch.items || []).forEach(it => {
+              if (!rowsById.has(it.id)) {
+                orderIds.push(it.id);
+              }
+              rowsById.set(it.id, {
+                id: it.id,
+                channel: it.channel,
+                status: it.status,
+                attempt: it.attempts || 0,
+                error: it.lastError || null
+              });
+            });
+            renderTable();
+            return;
+          }
+          if (msg.notificationId) {
+            const cur = rowsById.get(msg.notificationId) || { id: msg.notificationId, channel: msg.channel, attempt: 0, error: null };
+            if (!rowsById.has(msg.notificationId)) {
+              orderIds.push(msg.notificationId);
+            }
+            cur.channel = msg.channel || cur.channel;
+            cur.status = msg.status;
+            cur.attempt = msg.attempt;
+            cur.error = msg.error || null;
+            rowsById.set(msg.notificationId, cur);
+            appendLog('Event ' + msg.notificationId.slice(0, 8) + '… -> ' + msg.status + ' (attempt ' + msg.attempt + ')' + (msg.error ? ' err=' + msg.error : ''));
+            renderTable();
+          }
+        } catch (err) {
+          appendLog('Parse error: ' + err);
+        }
+      };
+
+      ws.onclose = (e) => {
+        wsStateEl.textContent = 'WebSocket: closed (code ' + e.code + ')';
+        appendLog('WebSocket closed (code=' + e.code + ' reason=' + (e.reason || 'none') + ')');
+      };
+    }
+
+    document.getElementById('batchForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const count = parseInt(document.getElementById('count').value, 10) || 20;
+      const ch = document.getElementById('channel').value;
+      const prio = document.getElementById('priority').value;
+
+      rowsById.clear();
+      orderIds.length = 0;
+      logPanel.innerHTML = '';
+
+      const notifications = [];
+      for (let i = 0; i < count; i++) {
+        let recipient = '+90555' + String(1000000 + i).padStart(7, '0');
+        if (ch === 'email') recipient = 'demo-user-' + i + '@example.com';
+        if (ch === 'push') recipient = 'demo-device-token-' + i;
+        notifications.push({
+          recipient: recipient,
+          channel: ch,
+          priority: prio,
+          content: 'Live demo notification #' + (i + 1)
+        });
+      }
+
+      appendLog('POST /api/v1/notifications/batch (' + count + ' ' + ch + ' items)...');
+      const res = await fetch('/api/v1/notifications/batch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notifications })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        appendLog('Error creating batch: ' + JSON.stringify(data));
+        return;
+      }
+
+      activeBatchId = data.batchId;
+      cancelBtn.disabled = false;
+      (data.notificationIds || []).forEach(id => {
+        orderIds.push(id);
+        rowsById.set(id, { id, channel: ch, status: 'pending', attempt: 0, error: null });
+      });
+      renderTable();
+      connectBatchWS(activeBatchId);
+    });
+
+    cancelBtn.addEventListener('click', async () => {
+      if (!activeBatchId) return;
+      const res = await fetch('/api/v1/batches/' + encodeURIComponent(activeBatchId) + '/cancel', {
+        method: 'POST'
+      });
+      const data = await res.json();
+      appendLog('Batch cancel response: ' + JSON.stringify(data));
+    });
+  </script>
+</body>
+</html>
+

@@ -38,6 +38,12 @@ run_req "GET /metrics (Prometheus scrape endpoint)" "200" \
 run_req "GET /openapi.yaml (OpenAPI specification)" "200" \
   curl "${API_URL}/openapi.yaml"
 
+run_req "GET /demo (interactive WebSocket demo page)" "200" \
+  curl "${API_URL}/demo"
+
+run_req "GET /api/v1/ws (without filter -> expect HTTP 400 missing_ws_filter)" "400" \
+  curl "${API_URL}/api/v1/ws"
+
 run_req "POST /api/v1/notifications (Turkish SMS, high priority)" "202" \
   curl -X POST "${API_URL}/api/v1/notifications" \
   -H "Content-Type: application/json" \

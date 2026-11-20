@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
@@ -35,6 +36,7 @@ import (
 	"github.com/TITANBGG/notification-system/internal/provider"
 	"github.com/TITANBGG/notification-system/internal/queue"
 	"github.com/TITANBGG/notification-system/internal/ratelimit"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 	"github.com/TITANBGG/notification-system/internal/repository"
 	"github.com/TITANBGG/notification-system/internal/worker"
 	"github.com/TITANBGG/notification-system/migrations"
@@ -276,12 +278,29 @@ func startTestInfra(t *testing.T) *testInfra {
 	cfg.RetryAfterMax = time.Second
 
 	logger := observability.NewLogger("error", io.Discard)
+	hub := realtime.NewHub(realtime.HubConfig{
+		Redis:      rdb,
+		Logger:     logger,
+		MaxClients: cfg.MaxWSClients,
+	})
+	hubCtx, cancelHub := context.WithCancel(context.Background())
+	hubDone := make(chan error, 1)
+	go func() {
+		hubDone <- hub.Run(hubCtx)
+	}()
+	t.Cleanup(func() {
+		cancelHub()
+		assert.NoError(t, <-hubDone)
+	})
+
 	router := api.NewRouter(api.Deps{
 		Config:         cfg,
 		Logger:         logger,
 		Store:          api.NewRepositoryStore(repo),
 		Enqueuer:       queueEnqueuer{q: q},
 		QueueInspector: q,
+		Hub:            hub,
+		Publisher:      realtime.NewRedisPublisher(rdb),
 		Metrics:        observability.NewAPIMetrics(),
 	})
 	apiSrv := httptest.NewServer(router)
@@ -362,6 +381,7 @@ func (inf *testInfra) startWorker(t *testing.T, cfgOverride func(*config.Config)
 		RetryPolicy: policy,
 		Breaker:     breaker,
 		Reconciler:  rec,
+		Publisher:   realtime.NewRedisPublisher(inf.rdb),
 	})
 	require.NoError(t, err)
 
@@ -1040,5 +1060,62 @@ func TestCoreIntegration(t *testing.T) {
 			require.Len(t, calls, 1)
 			assert.Equal(t, wantBody, calls[0].Body["content"])
 		}
+	})
+
+	t.Run("l_websocket_batch_subscription_receives_snapshot_and_live_sent_events", func(t *testing.T) {
+		inf.resetState(t)
+
+		// Create a 5-item batch while worker is paused so initial snapshot shows pending items,
+		// then start worker and verify live processing/sent events stream over WebSocket via Redis pub/sub.
+		items := make([]map[string]any, 5)
+		for i := 0; i < 5; i++ {
+			items[i] = map[string]any{
+				"recipient": fmt.Sprintf("+90555%07d", 9100000+i),
+				"channel":   "sms",
+				"priority":  "high",
+				"content":   fmt.Sprintf("WS batch item %d", i),
+			}
+		}
+		var batch api.BatchCreateResponse
+		code, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/notifications/batch", nil, map[string]any{"notifications": items}, &batch)
+		require.Equal(t, http.StatusAccepted, code)
+
+		wsURL := "ws" + strings.TrimPrefix(inf.apiSrv.URL, "http") + "/api/v1/ws?batchId=" + batch.BatchID.String()
+		conn, resp, err := websocket.Dial(t.Context(), wsURL, nil)
+		require.NoError(t, err)
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		defer func() { _ = conn.CloseNow() }()
+
+		// 1. First frame must be the initial batch snapshot.
+		readCtx, cancelRead := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancelRead()
+		_, snapBytes, err := conn.Read(readCtx)
+		require.NoError(t, err)
+		var snap api.WSSnapshotMessage
+		require.NoError(t, json.Unmarshal(snapBytes, &snap))
+		assert.Equal(t, "snapshot", snap.Type)
+		require.NotNil(t, snap.Batch)
+		assert.Equal(t, batch.BatchID, snap.Batch.BatchID)
+		assert.Equal(t, 5, snap.Batch.Total)
+
+		// 2. Start worker and collect streamed status events until all 5 notifications report status="sent".
+		stopWorker := inf.startWorker(t, nil, 500, 10)
+		defer stopWorker()
+
+		sentIDs := make(map[uuid.UUID]bool)
+		for len(sentIDs) < 5 {
+			_, rawFrame, rErr := conn.Read(readCtx)
+			require.NoError(t, rErr)
+			var ev realtime.Event
+			require.NoError(t, json.Unmarshal(rawFrame, &ev))
+			require.NotNil(t, ev.BatchID)
+			assert.Equal(t, batch.BatchID, *ev.BatchID)
+			if ev.Status == domain.StatusSent {
+				sentIDs[ev.NotificationID] = true
+			}
+		}
+		assert.Len(t, sentIDs, 5)
 	})
 }

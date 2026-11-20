@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
@@ -22,6 +24,7 @@ import (
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 )
 
 func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *fakeStore, *api.MemoryEnqueuer) {
@@ -856,4 +859,97 @@ func TestDatabaseUnavailableReturns503(t *testing.T) {
 		assert.Contains(t, rec.Body.String(), "service_unavailable")
 		assert.NotContains(t, rec.Body.String(), "connection refused")
 	})
+}
+
+type hubPublisher struct {
+	hub *realtime.Hub
+}
+
+func (p hubPublisher) Publish(ctx context.Context, events ...realtime.Event) error {
+	for _, ev := range events {
+		if err := p.hub.Broadcast(ctx, ev); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestWebSocketConnectSnapshotReceiveEventsAndValidation(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := config.LoadFrom(func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+
+	store := newFakeStore()
+	enq := api.NewMemoryEnqueuer()
+	hub := realtime.NewHub(realtime.HubConfig{MaxClients: 10})
+	hubCtx, cancelHub := context.WithCancel(t.Context())
+	defer cancelHub()
+	hubDone := make(chan error, 1)
+	go func() { hubDone <- hub.Run(hubCtx) }()
+	t.Cleanup(func() {
+		cancelHub()
+		assert.NoError(t, <-hubDone)
+	})
+
+	router := api.NewRouter(api.Deps{
+		Config:    cfg,
+		Logger:    observability.NewLogger("error", &bytes.Buffer{}),
+		Store:     store,
+		Enqueuer:  enq,
+		Hub:       hub,
+		Publisher: hubPublisher{hub: hub},
+		Now:       func() time.Time { return time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC) },
+	})
+	srv := httptest.NewServer(router)
+	t.Cleanup(srv.Close)
+
+	// 1. GET /api/v1/ws without filters returns 400 missing_ws_filter before upgrade.
+	recNoFilter := doJSONRequest(t, router, http.MethodGet, "/api/v1/ws", "", nil)
+	require.Equal(t, http.StatusBadRequest, recNoFilter.Code)
+	assert.Contains(t, recNoFilter.Body.String(), "missing_ws_filter")
+
+	// 2. GET /demo serves the embedded live HTML dashboard.
+	recDemo := doJSONRequest(t, router, http.MethodGet, "/demo", "", nil)
+	require.Equal(t, http.StatusOK, recDemo.Code)
+	assert.Contains(t, recDemo.Header().Get("Content-Type"), "text/html")
+	assert.Contains(t, recDemo.Body.String(), "/api/v1/ws")
+
+	// 3. Create a notification via HTTP POST.
+	recCreate := doJSONRequest(t, router, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"ws test"}`,
+		nil,
+	)
+	require.Equal(t, http.StatusAccepted, recCreate.Code)
+	var created api.NotificationResponse
+	require.NoError(t, json.Unmarshal(recCreate.Body.Bytes(), &created))
+
+	// 4. Connect to WebSocket filtered by notificationId -> receive snapshot first, then live event when cancelled.
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/v1/ws?notificationId=" + created.ID.String()
+	conn, resp, err := websocket.Dial(t.Context(), wsURL, nil)
+	require.NoError(t, err)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+	defer func() { _ = conn.CloseNow() }()
+
+	_, snapBytes, err := conn.Read(t.Context())
+	require.NoError(t, err)
+	var snap api.WSSnapshotMessage
+	require.NoError(t, json.Unmarshal(snapBytes, &snap))
+	assert.Equal(t, "snapshot", snap.Type)
+	require.NotNil(t, snap.Notification)
+	assert.Equal(t, created.ID, snap.Notification.ID)
+	assert.Equal(t, "pending", snap.Notification.Status)
+
+	// Trigger cancellation via HTTP POST -> live event arrives over WebSocket.
+	recCancel := doJSONRequest(t, router, http.MethodPost, "/api/v1/notifications/"+created.ID.String()+"/cancel", "", nil)
+	require.Equal(t, http.StatusOK, recCancel.Code)
+
+	_, evBytes, err := conn.Read(t.Context())
+	require.NoError(t, err)
+	var ev realtime.Event
+	require.NoError(t, json.Unmarshal(evBytes, &ev))
+	assert.Equal(t, created.ID, ev.NotificationID)
+	assert.Equal(t, domain.StatusCancelled, ev.Status)
 }

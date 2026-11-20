@@ -20,6 +20,7 @@ import (
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/queue"
+	"github.com/TITANBGG/notification-system/internal/realtime"
 	"github.com/TITANBGG/notification-system/internal/repository"
 )
 
@@ -135,6 +136,12 @@ func run() error {
 
 	store := api.NewRepositoryStore(repository.New(pool))
 	metrics := observability.NewAPIMetrics()
+	hub := realtime.NewHub(realtime.HubConfig{
+		Redis:      rdb,
+		Logger:     logger,
+		MaxClients: cfg.MaxWSClients,
+	})
+	publisher := realtime.NewRedisPublisher(rdb)
 
 	router := api.NewRouter(api.Deps{
 		Config:         cfg,
@@ -142,16 +149,22 @@ func run() error {
 		Store:          store,
 		Enqueuer:       redisEnqueuer{q: q},
 		QueueInspector: q,
+		Hub:            hub,
+		Publisher:      publisher,
 		Metrics:        metrics,
 	})
 
 	samplerCtx, stopSampler := context.WithCancel(context.Background())
 	defer stopSampler()
 	var samplerWg sync.WaitGroup
-	samplerWg.Add(1)
+	samplerWg.Add(2)
 	go func() {
 		defer samplerWg.Done()
 		runQueueDepthSampler(samplerCtx, logger, q, metrics)
+	}()
+	go func() {
+		defer samplerWg.Done()
+		_ = hub.Run(samplerCtx)
 	}()
 
 	srv := &http.Server{
