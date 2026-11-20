@@ -51,6 +51,8 @@ x-worker: &worker
       condition: service_healthy
     redis:
       condition: service_healthy
+    migrate:
+      condition: service_completed_successfully
   healthcheck:
     test: ["CMD", "/app/healthcheck", "http://localhost:9091/health/live"]
     interval: 5s
@@ -90,6 +92,21 @@ services:
       timeout: 3s
       retries: 10
     restart: unless-stopped
+
+  migrate:
+    image: migrate/migrate:v4.18.2
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - -path
+      - /migrations
+      - -database
+      - ${DATABASE_URL:-postgres://notif:notif@postgres:5432/notif?sslmode=disable}
+      - up
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   mockprovider:
     image: notification-system:local
@@ -148,6 +165,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "/app/healthcheck", "http://localhost:8080/health/live"]
       interval: 5s
