@@ -11,8 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/TITANBGG/notification-system/internal/api"
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/observability"
+	"github.com/TITANBGG/notification-system/internal/repository"
 )
 
 func main() {
@@ -33,26 +37,42 @@ func run() error {
 	)
 	logger.Info("config loaded", slog.Any("config", cfg))
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		if _, writeErr := w.Write([]byte(`{"status":"ok"}` + "\n")); writeErr != nil {
-			logger.Warn("failed to write health response", slog.String("error", writeErr.Error()))
-		}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Error("failed to create postgres pool", slog.String("error", err.Error()))
+		return err
+	}
+	defer pool.Close()
+
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
+	pingErr := pool.Ping(pingCtx)
+	cancelPing()
+	if pingErr != nil {
+		logger.Error("failed to ping postgres at startup", slog.String("error", pingErr.Error()))
+		return pingErr
+	}
+
+	store := api.NewRepositoryStore(repository.New(pool))
+	enqueuer := api.NewMemoryEnqueuer()
+
+	router := api.NewRouter(api.Deps{
+		Config:   cfg,
+		Logger:   logger,
+		Store:    store,
+		Enqueuer: enqueuer,
 	})
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           mux,
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
+		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {
