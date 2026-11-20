@@ -1,5 +1,9 @@
 # Event-Driven Notification System
 
+[![CI](https://github.com/TITANBGG/Event_Driven_Notification_System/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/TITANBGG/Event_Driven_Notification_System/actions/workflows/ci.yml)
+[![Release](https://github.com/TITANBGG/Event_Driven_Notification_System/actions/workflows/release.yml/badge.svg)](https://github.com/TITANBGG/Event_Driven_Notification_System/actions/workflows/release.yml)
+![Go](https://img.shields.io/badge/Go-1.27.4-00ADD8?logo=go)
+
 A production-grade, horizontally scalable multi-channel notification management and delivery service (**SMS**, **Email**, **Push**) written in **Go 1.27.4**, backed by **PostgreSQL 16** (authoritative system of record) and **Redis 7** (weighted priority queues, delayed retry/schedule set, distributed GCRA rate limiter, and reconciler lease).
 
 ---
@@ -440,6 +444,24 @@ make lint
 make load
 ```
 
+### CI/CD (GitHub Actions, `B-6`)
+
+`.github/workflows/ci.yml` runs on every branch push and pull request (`permissions: contents: read`, superseded runs on the same ref are cancelled):
+
+| Job | What it proves |
+|---|---|
+| `lint` | `gofmt`, `go vet` (with and without the `integration` tag), `go mod tidy -diff`, `golangci-lint` v2 (built with Go 1.27.4 via `install-mode: goinstall`) |
+| `test` | `make test` with `-race` and `-coverprofile`; total coverage in the job summary, `coverage.out` uploaded as an artifact |
+| `integration` | `make test-integration` (testcontainers PostgreSQL 16 + Redis 7 on the runner's Docker daemon) |
+| `sqlc-check` | Pinned `sqlc` 1.28.0 regenerates `internal/repository/sqlc`; `git diff --exit-code` fails on drift |
+| `migrations-check` | Postgres service container; `migrate up` -> `down -all` -> `up` proves every `.down.sql` reverses its `.up.sql` |
+| `openapi-lint` | `@redocly/cli` (pinned) lints `api/openapi.yaml` using `redocly.yaml` |
+| `docker` | Builds the image with `docker/build-push-action` (no push, GHA layer cache) and validates `docker compose config` without any `.env` |
+
+`.github/workflows/release.yml` is the CD part: pushing a tag such as `v1.0.0` builds `linux/amd64` + `linux/arm64` images and pushes them to `ghcr.io/titanbgg/notification-system` (`{{version}}`, `{{major}}.{{minor}}`, `sha-<short>` tags) using `GITHUB_TOKEN`, with `packages: write` granted only to that job.
+
+Actions are pinned to **major versions** (`actions/checkout@v7`): they receive security/bug fixes automatically while breaking changes require a deliberate bump. Pinning to full commit SHAs is the stricter supply-chain alternative (immutable, typically paired with Dependabot/Renovate to keep them current). Tool versions (`golangci-lint`, `sqlc`, `migrate`, Redocly) are pinned exactly in the workflow `env:` block so CI results are reproducible.
+
 ---
 
 ## 11. Live `webhook.site` (`EXT-1`) Setup
@@ -491,11 +513,12 @@ By default, `docker-compose.yml` points `PROVIDER_URL` at the in-cluster `http:/
 | **B-3** | Message templates with safe `{{variable}}` substitution, preview endpoint, soft-delete, and render-at-create | `internal/template/template.go`, `internal/api/handlers_templates.go`, `migrations/000002_templates.up.sql` | `internal/template/template_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/k_template_create_preview_and_batch_personalized_sms_delivery` | **DONE** |
 | **B-4** | Real-time WebSocket status updates (`GET /api/v1/ws`, Redis Pub/Sub `notif:events`, initial DB snapshot, `/demo` UI) | `internal/realtime/hub.go`, `internal/api/handlers_ws.go`, `internal/api/static/demo.html` | `internal/realtime/hub_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/l_websocket_batch_subscription_receives_snapshot_and_live_sent_events` | **DONE** |
 | **B-5** | Distributed tracing with OpenTelemetry (`otlptracehttp` to Jaeger `:4318`, `otelhttp`, `otelpgx`, Redis `traceparent` propagation, `trace_id`/`span_id` in `slog`) | `internal/observability/tracing.go`, `internal/api/middleware/tracing.go`, `internal/worker/worker.go`, `internal/provider/client.go` | `internal/observability/tracing_test.go`, `TestCoreIntegration/m_tracing_traceparent_propagates_from_api_through_redis_to_provider` | **DONE** |
+| **B-6** | GitHub Actions CI/CD (lint, race + coverage, integration, sqlc drift, migrations up/down/up, OpenAPI lint, image build; GHCR release on `v*` tags) | `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `.golangci.yml`, `redocly.yaml` | `actionlint`; CI run on every push / PR | **DONE** |
 | **D-1** | GitHub repository with clean Conventional Commits history | Git repository | `git log`, `.gitignore` | **DONE** |
 | **D-2** | `README.md` with setup instructions, architecture overview, Mermaid diagrams, and API examples | `README.md` | `scripts/smoke.sh` | **DONE** |
 | **D-3** | One-command zero-config Docker Compose (`docker compose up` & `docker-compose up`) | `docker-compose.yml`, `Dockerfile`, `.env.example` | Live Docker Compose build + `scripts/smoke.sh` | **DONE** |
 | **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
-| **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service | **DONE** |
+| **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
 | **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go` | `go test -race ./...` + `go test -race -tags=integration ./...` | **DONE** |
 
 
