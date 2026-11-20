@@ -12,6 +12,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/domain"
@@ -270,29 +273,61 @@ func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, 
 func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Channel, meta *queue.Meta) {
 	itemCtx := observability.WithCorrelationID(ctx, meta.CorrelationID)
 	itemDrainCtx := observability.WithCorrelationID(drainCtx, meta.CorrelationID)
-	itemLogger := observability.LoggerFrom(itemCtx, w.logger).With(
+
+	itemCtx = observability.ExtractTraceParent(itemCtx, meta.TraceParent)
+	itemDrainCtx = observability.ExtractTraceParent(itemDrainCtx, meta.TraceParent)
+
+	tracer := observability.Tracer("notification-worker")
+	baseAttrs := []attribute.KeyValue{
+		attribute.String("notification.id", meta.ID.String()),
+		attribute.String("notification.channel", ch.String()),
+		attribute.String("notification.priority", meta.Priority.String()),
+	}
+
+	itemDrainCtx, procSpan := tracer.Start(itemDrainCtx, "worker.process_notification", trace.WithAttributes(baseAttrs...))
+	defer procSpan.End()
+	itemCtx = trace.ContextWithSpan(itemCtx, procSpan)
+
+	_, dqSpan := tracer.Start(itemDrainCtx, "dequeue", trace.WithAttributes(baseAttrs...))
+	dqSpan.End()
+
+	itemLogger := observability.LoggerFrom(itemDrainCtx, w.logger).With(
 		slog.String("notification_id", meta.ID.String()),
 		slog.String("channel", ch.String()),
 		slog.String("priority", meta.Priority.String()),
 	)
 
 	// Acquire GCRA rate-limit token BEFORE Claim so rate-limit wait time never eats VISIBILITY_TIMEOUT.
+	rlCtx, rlSpan := tracer.Start(itemCtx, "ratelimit.wait", trace.WithAttributes(baseAttrs...))
 	for {
-		err := w.limiter.Wait(itemCtx, ch)
+		err := w.limiter.Wait(rlCtx, ch)
 		if err == nil {
 			break
 		}
 		if ctx.Err() != nil {
+			rlSpan.RecordError(err)
+			rlSpan.SetStatus(codes.Error, err.Error())
+			rlSpan.End()
 			return
 		}
 		itemLogger.Warn("rate limiter error; failing closed and backing off before claim", slog.String("error", err.Error()))
 		if !waitWithContext(ctx, limiterErrorBackoff) {
+			rlSpan.RecordError(ctx.Err())
+			rlSpan.SetStatus(codes.Error, "context cancelled during rate limit backoff")
+			rlSpan.End()
 			return
 		}
 	}
+	rlSpan.End()
 
-	n, claimed, err := w.store.Claim(itemDrainCtx, meta.ID, w.cfg.ClockSkewTolerance)
+	claimCtx, claimSpan := tracer.Start(itemDrainCtx, "claim", trace.WithAttributes(baseAttrs...))
+	n, claimed, err := w.store.Claim(claimCtx, meta.ID, w.cfg.ClockSkewTolerance)
 	if err != nil {
+		claimSpan.RecordError(err)
+		claimSpan.SetStatus(codes.Error, err.Error())
+		claimSpan.End()
+		procSpan.RecordError(err)
+		procSpan.SetStatus(codes.Error, err.Error())
 		itemLogger.Error("database claim failed; deferring item out of inflight list", slog.String("error", err.Error()))
 		if schedErr := w.queue.Schedule(itemDrainCtx, *meta, w.nowFn().Add(time.Second), w.cfg.WorkerID); schedErr != nil {
 			itemLogger.Warn("failed to defer unclaimed item", slog.String("error", schedErr.Error()))
@@ -300,12 +335,20 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 		return
 	}
 	if !claimed {
+		claimSpan.SetAttributes(attribute.Bool("notification.claimed", false))
+		claimSpan.End()
 		// Cancelled, already finished by another actor, or scheduled due time not yet reached.
 		if ackErr := w.queue.Ack(itemDrainCtx, w.cfg.WorkerID, meta.ID); ackErr != nil {
 			itemLogger.Warn("failed to ack unclaimed notification", slog.String("error", ackErr.Error()))
 		}
 		return
 	}
+	claimSpan.SetAttributes(
+		attribute.Bool("notification.claimed", true),
+		attribute.Int("notification.attempt", n.Attempts),
+	)
+	claimSpan.End()
+	procSpan.SetAttributes(attribute.Int("notification.attempt", n.Attempts))
 
 	w.publishEvent(itemDrainCtx, itemLogger, *n, meta.CorrelationID)
 
@@ -318,17 +361,42 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 	}
 
 	startedAt := w.nowFn()
+	sendSpanCtx, sendSpan := tracer.Start(itemDrainCtx, "provider.send", trace.WithAttributes(
+		attribute.String("notification.id", n.ID.String()),
+		attribute.String("notification.channel", ch.String()),
+		attribute.String("notification.priority", n.Priority.String()),
+		attribute.Int("notification.attempt", n.Attempts),
+	))
 	res, sendErr := w.breaker.Execute(ch, func() (provider.Result, error) {
-		return w.sender.Send(itemDrainCtx, *n)
+		return w.sender.Send(sendSpanCtx, *n)
 	})
 	if errors.Is(sendErr, ErrCircuitOpen) {
+		sendSpan.RecordError(sendErr)
+		sendSpan.SetStatus(codes.Error, sendErr.Error())
+		sendSpan.SetAttributes(attribute.String("outcome", domain.OutcomeCircuitOpen.String()))
+		sendSpan.End()
 		w.handleCircuitOpen(itemDrainCtx, attemptLogger, ch, n, meta, startedAt)
 		return
 	}
 	if sendErr != nil {
+		sendSpan.RecordError(sendErr)
+		sendSpan.SetStatus(codes.Error, sendErr.Error())
+		sendSpan.End()
 		attemptLogger.Warn("provider execution aborted by context cancellation", slog.String("error", sendErr.Error()))
 		return
 	}
+	if res.HTTPStatus != nil {
+		sendSpan.SetAttributes(attribute.Int("http.response.status_code", *res.HTTPStatus))
+		procSpan.SetAttributes(attribute.Int("http.response.status_code", *res.HTTPStatus))
+	}
+	sendSpan.SetAttributes(attribute.String("outcome", string(res.Outcome)))
+	procSpan.SetAttributes(attribute.String("outcome", string(res.Outcome)))
+	if res.Err != nil {
+		sendSpan.RecordError(res.Err)
+		sendSpan.SetStatus(codes.Error, res.Err.Error())
+		procSpan.RecordError(res.Err)
+	}
+	sendSpan.End()
 
 	if w.hooks.OnProviderRequest != nil {
 		w.hooks.OnProviderRequest(ch, res.HTTPStatus, res.Err, res.Duration)
@@ -353,11 +421,19 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 
 	switch res.Outcome {
 	case provider.OutcomeSent:
-		sentRow, err := w.store.MarkSent(itemDrainCtx, n.ID, n.Attempts, res.ProviderMessageID)
+		stCtx, stSpan := tracer.Start(itemDrainCtx, "status.update", trace.WithAttributes(
+			attribute.String("notification.id", n.ID.String()),
+			attribute.String("notification.status", domain.StatusSent.String()),
+		))
+		sentRow, err := w.store.MarkSent(stCtx, n.ID, n.Attempts, res.ProviderMessageID)
 		if err != nil {
+			stSpan.RecordError(err)
+			stSpan.SetStatus(codes.Error, err.Error())
+			stSpan.End()
 			w.handleFencedError(itemDrainCtx, attemptLogger, n.ID, "MarkSent", err)
 			return
 		}
+		stSpan.End()
 		if ackErr := w.queue.Ack(itemDrainCtx, w.cfg.WorkerID, n.ID); ackErr != nil {
 			attemptLogger.Warn("failed acking sent notification", slog.String("error", ackErr.Error()))
 		}
@@ -460,14 +536,24 @@ func (w *Worker) handleTransientOutcome(
 	if n.Attempts < n.MaxAttempts {
 		delay := w.retryPolicy.NextDelay(n.Attempts, res.RetryAfter)
 		nextAt := w.nowFn().Add(delay)
-		updated, err := w.store.ScheduleRetry(drainCtx, n.ID, n.Attempts, nextAt, errText)
+		retryCtx, retrySpan := observability.Tracer("notification-worker").Start(drainCtx, "schedule.retry", trace.WithAttributes(
+			attribute.String("notification.id", n.ID.String()),
+			attribute.String("notification.channel", ch.String()),
+			attribute.Int("notification.attempt", n.Attempts),
+		))
+		updated, err := w.store.ScheduleRetry(retryCtx, n.ID, n.Attempts, nextAt, errText)
 		if err != nil {
+			retrySpan.RecordError(err)
+			retrySpan.SetStatus(codes.Error, err.Error())
+			retrySpan.End()
 			w.handleFencedError(drainCtx, logger, n.ID, "ScheduleRetry", err)
 			return
 		}
-		if schedErr := w.queue.Schedule(drainCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
+		if schedErr := w.queue.Schedule(retryCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
+			retrySpan.RecordError(schedErr)
 			logger.Warn("failed scheduling notification retry", slog.String("error", schedErr.Error()))
 		}
+		retrySpan.End()
 		w.publishEvent(drainCtx, logger, *updated, meta.CorrelationID)
 		w.emitProcessed(ch, domain.StatusRetrying)
 		if w.hooks.OnRetryScheduled != nil {
@@ -509,11 +595,20 @@ func (w *Worker) failNotification(
 	durationMS int,
 	correlationID string,
 ) {
-	failedRow, err := w.store.MarkFailed(drainCtx, id, claimedAttempts, lastError)
+	stCtx, stSpan := observability.Tracer("notification-worker").Start(drainCtx, "status.update", trace.WithAttributes(
+		attribute.String("notification.id", id.String()),
+		attribute.String("notification.status", domain.StatusFailed.String()),
+		attribute.String("outcome", outcome.String()),
+	))
+	failedRow, err := w.store.MarkFailed(stCtx, id, claimedAttempts, lastError)
 	if err != nil {
+		stSpan.RecordError(err)
+		stSpan.SetStatus(codes.Error, err.Error())
+		stSpan.End()
 		w.handleFencedError(drainCtx, logger, id, "MarkFailed", err)
 		return
 	}
+	stSpan.End()
 	if dlqErr := w.queue.DeadLetter(drainCtx, w.cfg.WorkerID, id); dlqErr != nil {
 		logger.Warn("failed deadlettering failed notification", slog.String("error", dlqErr.Error()))
 	}

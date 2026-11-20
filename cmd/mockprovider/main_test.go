@@ -244,7 +244,7 @@ func TestMockProviderRingBufferEvictionOrder(t *testing.T) {
 		// Alternate recordAndDecide (+1,+3,+5,...) and acceptedResponse formatting (+2,+4,+6,...).
 		var expected []time.Time
 		for i := 0; i < 6; i++ {
-			_, _ = ms.recordAndDecide("k")
+			_, _ = ms.recordAndDecide("k", 0)
 			_ = ms.nowFn()
 			expected = append(expected, tick.Add(-time.Second))
 		}

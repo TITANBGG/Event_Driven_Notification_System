@@ -92,6 +92,7 @@ paths:
         then enqueues it for asynchronous worker processing.
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
         - $ref: "#/components/parameters/IdempotencyKeyHeader"
       requestBody:
         required: true
@@ -230,6 +231,7 @@ paths:
       summary: Create a batch of notifications (up to 1000 items, all-or-nothing)
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
+        - $ref: "#/components/parameters/TraceparentHeader"
         - $ref: "#/components/parameters/IdempotencyKeyHeader"
       requestBody:
         required: true
@@ -786,6 +788,14 @@ components:
         type: string
         maxLength: 128
         pattern: "^[A-Za-z0-9._-]{1,128}$"
+    TraceparentHeader:
+      name: traceparent
+      in: header
+      required: false
+      description: Optional W3C TraceContext header (`00-<32hex-trace-id>-<16hex-span-id>-<2hex-flags>`) propagated through PostgreSQL, Redis queues, worker processing spans, and outgoing provider HTTP calls.
+      schema:
+        type: string
+        example: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
     IdempotencyKeyHeader:
       name: Idempotency-Key
       in: header

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/TITANBGG/notification-system/internal/observability"
 )
@@ -61,13 +62,14 @@ type mockServer struct {
 	nowFn         func() time.Time
 	maxTimestamps int
 
-	mu         sync.Mutex
-	rng        *rand.Rand
-	received   int
-	byKey      map[string]int
-	timestamps []time.Time
-	tsHead     int
-	tsCount    int
+	mu            sync.Mutex
+	rng           *rand.Rand
+	received      int
+	byKey         map[string]int
+	remainingFail map[string]int
+	timestamps    []time.Time
+	tsHead        int
+	tsCount       int
 }
 
 func newMockServer(cfg mockConfig, logger *slog.Logger, nowFn func() time.Time) *mockServer {
@@ -88,6 +90,7 @@ func newMockServer(cfg mockConfig, logger *slog.Logger, nowFn func() time.Time) 
 		maxTimestamps: maxStoredTimestamps,
 		rng:           rand.New(rand.NewSource(seed)),
 		byKey:         make(map[string]int),
+		remainingFail: make(map[string]int),
 	}
 }
 
@@ -132,6 +135,7 @@ func (s *mockServer) handleReset(w http.ResponseWriter, _ *http.Request) {
 	s.mu.Lock()
 	s.received = 0
 	s.byKey = make(map[string]int)
+	s.remainingFail = make(map[string]int)
 	s.timestamps = nil
 	s.tsHead = 0
 	s.tsCount = 0
@@ -150,8 +154,9 @@ func (s *mockServer) handleSend(w http.ResponseWriter, r *http.Request) {
 	idemKey := r.Header.Get("Idempotency-Key")
 	corrID := r.Header.Get("X-Correlation-ID")
 	traceparent := r.Header.Get("traceparent")
+	failTimes, _ := strconv.Atoi(strings.TrimSpace(r.Header.Get("X-Mock-Fail-Times")))
 
-	delay, status := s.recordAndDecide(idemKey)
+	delay, status := s.recordAndDecide(idemKey, failTimes)
 
 	if delay > 0 {
 		timer := time.NewTimer(delay)
@@ -163,7 +168,7 @@ func (s *mockServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.logger.Info("mockprovider received request",
+	observability.LoggerFrom(r.Context(), s.logger).Info("mockprovider received request",
 		slog.Int("status", status),
 		slog.String("channel", payload.Channel),
 		slog.String("recipient", maskRecipient(payload.Channel, payload.To)),
@@ -229,13 +234,16 @@ func maskRecipient(channel, recipient string) string {
 
 // recordAndDecide atomically records request statistics and picks latency + fault outcome.
 // Protected by one mutex so concurrent requests stay race-free without per-request RNG allocations.
-func (s *mockServer) recordAndDecide(idemKey string) (time.Duration, int) {
+func (s *mockServer) recordAndDecide(idemKey string, failTimes int) (time.Duration, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	s.received++
 	if idemKey != "" {
 		s.byKey[idemKey]++
+		if s.byKey[idemKey] == 1 && failTimes > 0 {
+			s.remainingFail[idemKey] = failTimes
+		}
 	}
 	now := s.nowFn()
 	if s.maxTimestamps > 0 {
@@ -256,6 +264,11 @@ func (s *mockServer) recordAndDecide(idemKey string) (time.Duration, int) {
 		delayMS += s.rng.Intn(s.cfg.LatencyJitterMS + 1)
 	}
 	delay := time.Duration(delayMS) * time.Millisecond
+
+	if idemKey != "" && s.remainingFail[idemKey] > 0 {
+		s.remainingFail[idemKey]--
+		return delay, http.StatusInternalServerError
+	}
 
 	roll := s.rng.Float64()
 	if roll < s.cfg.PermanentRate {
@@ -356,18 +369,35 @@ func run() error {
 		slog.Float64("permanent_rate", cfg.PermanentRate),
 	)
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	otelEndpoint := strings.TrimSpace(os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"))
+	samplerRatio := parseEnvFloat("OTEL_SAMPLER_RATIO", 1.0)
+	shutdownTracing, err := observability.InitTracing(ctx, observability.TracingConfig{
+		ServiceName:  "notification-mockprovider",
+		Endpoint:     otelEndpoint,
+		SamplerRatio: samplerRatio,
+	})
+	if err != nil {
+		logger.Warn("failed to initialize OpenTelemetry tracing in mockprovider", slog.String("error", err.Error()))
+	} else {
+		defer func() {
+			flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelFlush()
+			_ = shutdownTracing(flushCtx)
+		}()
+	}
+
 	ms := newMockServer(cfg, logger, nil)
 	srv := &http.Server{
 		Addr:              cfg.Port,
-		Handler:           ms.routes(),
+		Handler:           otelhttp.NewHandler(ms.routes(), "notification-mockprovider"),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {

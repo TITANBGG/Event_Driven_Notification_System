@@ -47,6 +47,7 @@ type recordedProviderCall struct {
 	RawBody       string
 	IdempotencyID string
 	CorrelationID string
+	TraceParent   string
 	ReceivedAt    time.Time
 }
 
@@ -80,6 +81,7 @@ func (m *mockProviderServer) handle(w http.ResponseWriter, r *http.Request) {
 	recip, _ := body["to"].(string)
 	idemID := r.Header.Get("Idempotency-Key")
 	corrID := r.Header.Get("X-Correlation-ID")
+	traceParent := r.Header.Get("traceparent")
 
 	m.mu.Lock()
 	delay := m.delay
@@ -93,6 +95,7 @@ func (m *mockProviderServer) handle(w http.ResponseWriter, r *http.Request) {
 		RawBody:       strings.TrimSpace(string(raw)),
 		IdempotencyID: idemID,
 		CorrelationID: corrID,
+		TraceParent:   traceParent,
 		ReceivedAt:    time.Now().UTC(),
 	}
 	if status >= 200 && status < 300 {
@@ -1117,5 +1120,36 @@ func TestCoreIntegration(t *testing.T) {
 			}
 		}
 		assert.Len(t, sentIDs, 5)
+	})
+
+	t.Run("m_tracing_traceparent_propagates_from_api_through_redis_to_provider", func(t *testing.T) {
+		inf.resetState(t)
+		stopWorker := inf.startWorker(t, nil, 500, 10)
+		defer stopWorker()
+
+		const incomingTraceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+		const incomingTraceparent = "00-" + incomingTraceID + "-00f067aa0ba902b7-01"
+
+		var created api.NotificationResponse
+		code, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/notifications", map[string]string{
+			"traceparent":      incomingTraceparent,
+			"X-Correlation-ID": "corr-trace-m1",
+		}, map[string]any{
+			"recipient": "+905559200001",
+			"channel":   "sms",
+			"priority":  "high",
+			"content":   "W3C traceparent end-to-end propagation",
+		}, &created)
+		require.Equal(t, http.StatusAccepted, code)
+
+		var detail api.NotificationDetailResponse
+		require.Eventually(t, func() bool {
+			c, _ := doJSON(t, http.MethodGet, inf.apiSrv.URL+"/api/v1/notifications/"+created.ID.String(), nil, nil, &detail)
+			return c == http.StatusOK && detail.Status == "sent"
+		}, 10*time.Second, 25*time.Millisecond)
+
+		calls := inf.provider.callsForID(created.ID.String())
+		require.Len(t, calls, 1)
+		assert.Contains(t, calls[0].TraceParent, incomingTraceID, "provider HTTP request must carry W3C traceparent with original trace ID")
 	})
 }

@@ -85,10 +85,11 @@ func NewRouter(deps Deps) chi.Router {
 	}
 
 	r := chi.NewRouter()
-	// Order is significant: Recoverer wraps CorrelationID so panics still carry request correlation;
-	// BodyLimit runs before Content-Type/handler decode so huge bodies fail fast with 413.
+	// Order is significant: Recoverer wraps CorrelationID and Tracing so panics and access logs
+	// still carry request correlation_id, trace_id, and span_id; BodyLimit runs before decode.
 	r.Use(middleware.Recoverer(h.logger))
 	r.Use(middleware.CorrelationID(h.logger))
+	r.Use(middleware.Tracing("notification-api"))
 	r.Use(middleware.RequestLogger(h.logger))
 	r.Use(middleware.Metrics(h.metrics))
 	r.Use(middleware.CORS(h.cfg.CORSAllowedOrigins))

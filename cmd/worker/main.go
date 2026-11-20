@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/TITANBGG/notification-system/internal/config"
@@ -47,6 +48,21 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	shutdownTracing, err := observability.InitTracing(ctx, observability.TracingConfig{
+		ServiceName:  "notification-worker",
+		Endpoint:     cfg.OTELEndpoint,
+		SamplerRatio: cfg.OTELSamplerRatio,
+	})
+	if err != nil {
+		logger.Warn("failed to initialize OpenTelemetry tracing; continuing without exporter", slog.String("error", err.Error()))
+	} else {
+		defer func() {
+			flushCtx, cancelFlush := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelFlush()
+			_ = shutdownTracing(flushCtx)
+		}()
+	}
+
 	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("failed to parse database URL",
@@ -59,6 +75,7 @@ func run() error {
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 30 * time.Second
+	poolCfg.ConnConfig.Tracer = otelpgx.NewTracer()
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {

@@ -19,6 +19,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 )
@@ -118,7 +120,7 @@ func NewClient(cfg ClientConfig) *Client {
 		logger:         logger,
 		nowFn:          func() time.Time { return time.Now().UTC() },
 		httpClient: &http.Client{
-			Transport: transport,
+			Transport: otelhttp.NewTransport(transport),
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -184,6 +186,11 @@ func (c *Client) Send(ctx context.Context, n domain.Notification) (Result, error
 	req.Header.Set("Idempotency-Key", n.ID.String())
 	if cid != "" {
 		req.Header.Set("X-Correlation-ID", cid)
+	}
+	if tp := observability.InjectTraceParent(sendCtx); tp != "" {
+		req.Header.Set("traceparent", tp)
+	} else if n.TraceParent != nil && strings.TrimSpace(*n.TraceParent) != "" {
+		req.Header.Set("traceparent", strings.TrimSpace(*n.TraceParent))
 	}
 
 	//nolint:gosec // G704: provider endpoint URL comes from validated startup configuration.

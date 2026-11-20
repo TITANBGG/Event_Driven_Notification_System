@@ -14,6 +14,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
@@ -67,6 +69,10 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 
 	norm := rawIn.Normalize()
 	cid := observability.CorrelationID(r.Context())
+	tp := observability.InjectTraceParent(r.Context())
+	if tp == "" {
+		tp = strings.TrimSpace(r.Header.Get("traceparent"))
+	}
 	reqHash, err := domain.RequestHash(norm)
 	if err != nil {
 		writeError(w, r, h.logger, fmt.Errorf("computing request hash: %w", err))
@@ -101,6 +107,7 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 		MaxAttempts:    h.cfg.MaxAttempts,
 		ScheduledAt:    scheduledAt,
 		CorrelationID:  optionalNonEmpty(cid),
+		TraceParent:    optionalNonEmpty(tp),
 		TemplateID:     norm.TemplateID,
 		TemplateVars:   norm.TemplateVars,
 	}
@@ -121,11 +128,12 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 	h.publishStatusEvents(r.Context(), cid, *created)
 
 	// Commit to PostgreSQL completed before pushing queue hint to Redis so reconciler repairs enqueue failures.
-	if enqErr := h.enqueuer.Enqueue(r.Context(), []QueueItem{{
+	if enqErr := h.enqueueWithSpan(r.Context(), []QueueItem{{
 		ID:            created.ID,
 		Channel:       created.Channel,
 		Priority:      created.Priority,
 		CorrelationID: cid,
+		TraceParent:   tp,
 		ScheduledAt:   created.ScheduledAt,
 	}}); enqErr != nil {
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to enqueue notification; reconciler will recover",
@@ -290,6 +298,10 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cid := observability.CorrelationID(r.Context())
+	tp := observability.InjectTraceParent(r.Context())
+	if tp == "" {
+		tp = strings.TrimSpace(r.Header.Get("traceparent"))
+	}
 	notifications := make([]domain.Notification, len(renderedItems))
 	itemKeys := make([]string, 0)
 	itemKeyRecords := make([]domain.IdempotencyKey, 0)
@@ -317,6 +329,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			MaxAttempts:    h.cfg.MaxAttempts,
 			ScheduledAt:    scheduledAt,
 			CorrelationID:  optionalNonEmpty(cid),
+			TraceParent:    optionalNonEmpty(tp),
 			TemplateID:     normRaw.TemplateID,
 			TemplateVars:   normRaw.TemplateVars,
 		}
@@ -374,10 +387,11 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			Channel:       n.Channel,
 			Priority:      n.Priority,
 			CorrelationID: cid,
+			TraceParent:   tp,
 			ScheduledAt:   n.ScheduledAt,
 		}
 	}
-	if enqErr := h.enqueuer.Enqueue(r.Context(), queueItems); enqErr != nil {
+	if enqErr := h.enqueueWithSpan(r.Context(), queueItems); enqErr != nil {
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to enqueue batch items; reconciler will recover",
 			slog.String("batch_id", batchID.String()),
 			slog.Int("count", len(queueItems)),
@@ -744,11 +758,16 @@ func (h *handler) handleRetryNotification(w http.ResponseWriter, r *http.Request
 	if cid == "" && updated.CorrelationID != nil {
 		cid = *updated.CorrelationID
 	}
-	if enqErr := h.enqueuer.Enqueue(r.Context(), []QueueItem{{
+	tp := observability.InjectTraceParent(r.Context())
+	if tp == "" && updated.TraceParent != nil {
+		tp = *updated.TraceParent
+	}
+	if enqErr := h.enqueueWithSpan(r.Context(), []QueueItem{{
 		ID:            updated.ID,
 		Channel:       updated.Channel,
 		Priority:      updated.Priority,
 		CorrelationID: cid,
+		TraceParent:   tp,
 	}}); enqErr != nil {
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to enqueue manual retry; reconciler will recover",
 			slog.String("notification_id", updated.ID.String()),
@@ -949,6 +968,25 @@ func newUUIDv7() (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 	return id, nil
+}
+
+func (h *handler) enqueueWithSpan(ctx context.Context, items []QueueItem) error {
+	enqCtx, span := observability.Tracer("notification-api").Start(ctx, "queue.enqueue")
+	span.SetAttributes(attribute.Int("notification.count", len(items)))
+	if len(items) == 1 {
+		span.SetAttributes(
+			attribute.String("notification.id", items[0].ID.String()),
+			attribute.String("notification.channel", items[0].Channel.String()),
+			attribute.String("notification.priority", items[0].Priority.String()),
+		)
+	}
+	err := h.enqueuer.Enqueue(enqCtx, items)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.End()
+	return err
 }
 
 func (h *handler) publishStatusEvents(ctx context.Context, correlationID string, items ...domain.Notification) {
