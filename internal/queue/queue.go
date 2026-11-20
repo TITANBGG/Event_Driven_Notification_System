@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,13 +31,16 @@ func mustLoadScript(name string) *redis.Script {
 }
 
 var (
-	enqueueScript    = mustLoadScript("enqueue.lua")
-	scheduleScript   = mustLoadScript("schedule.lua")
-	dequeueScript    = mustLoadScript("dequeue.lua")
-	ackScript        = mustLoadScript("ack.lua")
-	deadletterScript = mustLoadScript("deadletter.lua")
-	requeueScript    = mustLoadScript("requeue.lua")
-	moveDueScript    = mustLoadScript("move_due.lua")
+	enqueueScript      = mustLoadScript("enqueue.lua")
+	forceEnqueueScript = mustLoadScript("force_enqueue.lua")
+	scheduleScript     = mustLoadScript("schedule.lua")
+	dequeueScript      = mustLoadScript("dequeue.lua")
+	ackScript          = mustLoadScript("ack.lua")
+	deadletterScript   = mustLoadScript("deadletter.lua")
+	requeueScript      = mustLoadScript("requeue.lua")
+	requeueIDsScript   = mustLoadScript("requeue_ids.lua")
+	moveDueScript      = mustLoadScript("move_due.lua")
+	unlockScript       = mustLoadScript("unlock.lua")
 )
 
 var weightedSlotSchedule = [10]domain.Priority{
@@ -131,6 +135,16 @@ func (q *Queue) Ping(ctx context.Context) error {
 // Enqueue idempotently pushes one or more notification IDs onto their target channel/priority
 // queues in a single pipelined round trip, retrying once after SCRIPT LOAD on cold Redis nodes.
 func (q *Queue) Enqueue(ctx context.Context, items ...Meta) error {
+	return q.enqueueBatch(ctx, enqueueScript, "enqueue", items)
+}
+
+// ForceEnqueue unconditionally sets tracking metadata and pushes one or more notification IDs onto
+// their target channel/priority queues. Used by reconciler recovery when PostgreSQL shows stale pending.
+func (q *Queue) ForceEnqueue(ctx context.Context, items ...Meta) error {
+	return q.enqueueBatch(ctx, forceEnqueueScript, "force_enqueue", items)
+}
+
+func (q *Queue) enqueueBatch(ctx context.Context, script *redis.Script, opName string, items []Meta) error {
 	if len(items) == 0 {
 		return nil
 	}
@@ -142,7 +156,7 @@ func (q *Queue) Enqueue(ctx context.Context, items ...Meta) error {
 	qKeys := make([]string, len(items))
 	for i, item := range items {
 		if !item.Channel.Valid() {
-			return fmt.Errorf("enqueue invalid channel %q for %s", item.Channel, item.ID)
+			return fmt.Errorf("%s invalid channel %q for %s", opName, item.Channel, item.ID)
 		}
 		if !item.Priority.Valid() {
 			item.Priority = domain.PriorityNormal
@@ -159,7 +173,7 @@ func (q *Queue) Enqueue(ctx context.Context, items ...Meta) error {
 		pipe := q.rdb.Pipeline()
 		cmds := make([]*redis.Cmd, len(items))
 		for i, item := range items {
-			cmds[i] = enqueueScript.EvalSha(ctx, pipe, []string{MsgHashKey, qKeys[i]}, item.ID.String(), string(payloads[i]))
+			cmds[i] = script.EvalSha(ctx, pipe, []string{MsgHashKey, qKeys[i]}, item.ID.String(), string(payloads[i]))
 		}
 		_, err := pipe.Exec(ctx)
 		return cmds, err
@@ -167,13 +181,13 @@ func (q *Queue) Enqueue(ctx context.Context, items ...Meta) error {
 
 	cmds, err := runPipe()
 	if err != nil && isNoScriptError(err, cmds) {
-		if loadErr := enqueueScript.Load(ctx, q.rdb).Err(); loadErr != nil {
-			return fmt.Errorf("loading enqueue script: %w", loadErr)
+		if loadErr := script.Load(ctx, q.rdb).Err(); loadErr != nil {
+			return fmt.Errorf("loading %s script: %w", opName, loadErr)
 		}
 		_, err = runPipe()
 	}
 	if err != nil {
-		return fmt.Errorf("executing enqueue pipeline: %w", err)
+		return fmt.Errorf("executing %s pipeline: %w", opName, err)
 	}
 	return nil
 }
@@ -301,6 +315,47 @@ func (q *Queue) RequeueInflight(ctx context.Context, workerID string) (int64, er
 	return n, nil
 }
 
+// InflightIDs lists the IDs currently parked in workerID's inflight list.
+func (q *Queue) InflightIDs(ctx context.Context, workerID string) ([]uuid.UUID, error) {
+	if q.rdb == nil {
+		return nil, errors.New("redis client is nil")
+	}
+	raw, err := q.rdb.LRange(ctx, InflightKey(workerID), 0, -1).Result()
+	if err != nil {
+		return nil, fmt.Errorf("listing inflight for worker %s: %w", workerID, err)
+	}
+	ids := make([]uuid.UUID, 0, len(raw))
+	for _, s := range raw {
+		id, parseErr := uuid.Parse(s)
+		if parseErr != nil {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// RequeueInflightIDs moves only the given IDs from workerID's inflight list back to their queues.
+// IDs no longer present in the inflight list (acked meanwhile) are skipped.
+func (q *Queue) RequeueInflightIDs(ctx context.Context, workerID string, ids []uuid.UUID) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	if q.rdb == nil {
+		return 0, errors.New("redis client is nil")
+	}
+	args := make([]any, 0, len(ids)+1)
+	args = append(args, QueuePrefix)
+	for _, id := range ids {
+		args = append(args, id.String())
+	}
+	n, err := requeueIDsScript.Run(ctx, q.rdb, []string{MsgHashKey, InflightKey(workerID)}, args...).Int64()
+	if err != nil {
+		return 0, fmt.Errorf("requeueing leftover inflight ids for worker %s: %w", workerID, err)
+	}
+	return n, nil
+}
+
 // MoveDue atomically promotes up to limit delayed notification IDs with score <= nowMs to their priority queues.
 func (q *Queue) MoveDue(ctx context.Context, now time.Time, limit int) (int64, error) {
 	if q.rdb == nil {
@@ -404,18 +459,9 @@ func (q *Queue) Depths(ctx context.Context) (MetricsDepths, error) {
 	depths.Delayed = delayedCmd.Val()
 	depths.DLQ = dlqCmd.Val()
 
-	var inflightKeys []string
-	var cursor uint64
-	for {
-		keys, next, err := q.rdb.Scan(ctx, cursor, InflightScanPattern, 200).Result()
-		if err != nil {
-			return MetricsDepths{}, fmt.Errorf("scanning inflight lists: %w", err)
-		}
-		inflightKeys = append(inflightKeys, keys...)
-		cursor = next
-		if cursor == 0 {
-			break
-		}
+	inflightKeys, err := q.scanKeys(ctx, InflightScanPattern)
+	if err != nil {
+		return MetricsDepths{}, fmt.Errorf("scanning inflight lists: %w", err)
 	}
 	if len(inflightKeys) > 0 {
 		inPipe := q.rdb.Pipeline()
@@ -432,6 +478,116 @@ func (q *Queue) Depths(ctx context.Context) (MetricsDepths, error) {
 	}
 
 	return depths, nil
+}
+
+// AcquireReconcilerLock attempts to take the singleton distributed reconciler lease for ttl.
+func (q *Queue) AcquireReconcilerLock(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+	if q.rdb == nil {
+		return false, errors.New("redis client is nil")
+	}
+	if owner == "" {
+		return false, errors.New("lock owner must not be empty")
+	}
+	ok, err := q.rdb.SetNX(ctx, ReconcilerLockKey, owner, ttl).Result()
+	if err != nil {
+		return false, fmt.Errorf("acquiring reconciler lock: %w", err)
+	}
+	return ok, nil
+}
+
+// ReleaseReconcilerLock releases the reconciler lease only if owner still holds the token.
+func (q *Queue) ReleaseReconcilerLock(ctx context.Context, owner string) (bool, error) {
+	if q.rdb == nil {
+		return false, errors.New("redis client is nil")
+	}
+	if owner == "" {
+		return false, errors.New("lock owner must not be empty")
+	}
+	res, err := unlockScript.Run(ctx, q.rdb, []string{ReconcilerLockKey}, owner).Int64()
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return false, nil
+		}
+		return false, fmt.Errorf("releasing reconciler lock: %w", err)
+	}
+	return res == 1, nil
+}
+
+// ScanInflightWorkerIDs returns sorted worker IDs that currently have an inflight list key in Redis.
+func (q *Queue) ScanInflightWorkerIDs(ctx context.Context) ([]string, error) {
+	if q.rdb == nil {
+		return nil, errors.New("redis client is nil")
+	}
+	keys, err := q.scanKeys(ctx, InflightScanPattern)
+	if err != nil {
+		return nil, fmt.Errorf("scanning inflight worker keys: %w", err)
+	}
+	seen := make(map[string]struct{}, len(keys))
+	ids := make([]string, 0, len(keys))
+	for _, k := range keys {
+		id := strings.TrimPrefix(k, InflightPrefix)
+		if id == "" || id == k {
+			continue
+		}
+		if _, exists := seen[id]; !exists {
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	return ids, nil
+}
+
+// HasHeartbeats reports which worker IDs currently have an active heartbeat key in Redis.
+func (q *Queue) HasHeartbeats(ctx context.Context, workerIDs []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(workerIDs))
+	if len(workerIDs) == 0 {
+		return out, nil
+	}
+	if q.rdb == nil {
+		return nil, errors.New("redis client is nil")
+	}
+
+	pipe := q.rdb.Pipeline()
+	cmds := make([]*redis.IntCmd, len(workerIDs))
+	for i, id := range workerIDs {
+		cmds[i] = pipe.Exists(ctx, HeartbeatKey(id))
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		return nil, fmt.Errorf("checking worker heartbeats: %w", err)
+	}
+	for i, id := range workerIDs {
+		out[id] = cmds[i].Val() > 0
+	}
+	return out, nil
+}
+
+// DeleteInflightKey deletes workerID's inflight list key after its entries have been requeued.
+func (q *Queue) DeleteInflightKey(ctx context.Context, workerID string) error {
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+	if err := q.rdb.Del(ctx, InflightKey(workerID)).Err(); err != nil {
+		return fmt.Errorf("deleting inflight key for %s: %w", workerID, err)
+	}
+	return nil
+}
+
+func (q *Queue) scanKeys(ctx context.Context, pattern string) ([]string, error) {
+	var keys []string
+	var cursor uint64
+	for {
+		batch, next, err := q.rdb.Scan(ctx, cursor, pattern, 200).Result()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return keys, nil
 }
 
 func (q *Queue) nextSlot(ch domain.Channel) int {

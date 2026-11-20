@@ -241,3 +241,70 @@ func TestHeartbeatLifecycle(t *testing.T) {
 	require.NoError(t, q.DeleteHeartbeat(ctx, "worker-1"))
 	assert.False(t, mr.Exists(queue.HeartbeatKey("worker-1")))
 }
+
+func TestReconcilerLockForceEnqueueAndOrphanHelpers(t *testing.T) {
+	t.Parallel()
+	mr, _, q := newTestQueue(t)
+	ctx := t.Context()
+
+	// Lock acquisition must reject competing owner and owner-checked release must preserve live owner.
+	acquired, err := q.AcquireReconcilerLock(ctx, "worker-1", 30*time.Second)
+	require.NoError(t, err)
+	assert.True(t, acquired)
+
+	contended, err := q.AcquireReconcilerLock(ctx, "worker-2", 30*time.Second)
+	require.NoError(t, err)
+	assert.False(t, contended)
+
+	wrongRelease, err := q.ReleaseReconcilerLock(ctx, "worker-2")
+	require.NoError(t, err)
+	assert.False(t, wrongRelease)
+	assert.True(t, mr.Exists(queue.ReconcilerLockKey))
+
+	rightRelease, err := q.ReleaseReconcilerLock(ctx, "worker-1")
+	require.NoError(t, err)
+	assert.True(t, rightRelease)
+	assert.False(t, mr.Exists(queue.ReconcilerLockKey))
+
+	reacquired, err := q.AcquireReconcilerLock(ctx, "worker-2", 30*time.Second)
+	require.NoError(t, err)
+	assert.True(t, reacquired)
+
+	// ForceEnqueue pushes onto queue even when {notif}:msg still holds stale metadata.
+	id := uuid.Must(uuid.NewV7())
+	meta := queue.Meta{ID: id, Channel: domain.ChannelEmail, Priority: domain.PriorityHigh, CorrelationID: "corr-force"}
+	mr.HSet(queue.MsgHashKey, id.String(), `{"id":"stale"}`)
+	require.NoError(t, q.ForceEnqueue(ctx, meta))
+
+	items, err := mr.List(queue.Key(domain.ChannelEmail, domain.PriorityHigh))
+	require.NoError(t, err)
+	assert.Equal(t, []string{id.String()}, items)
+	assert.Contains(t, mr.HGet(queue.MsgHashKey, id.String()), "corr-force")
+
+	// Schedule with empty workerID schedules directly into {notif}:delayed without inflight cleanup errors.
+	schedID := uuid.Must(uuid.NewV7())
+	require.NoError(t, q.Schedule(ctx, queue.Meta{ID: schedID, Channel: domain.ChannelPush, Priority: domain.PriorityNormal}, time.Now().Add(time.Second), ""))
+	members, err := mr.ZMembers(queue.DelayedZSetKey)
+	require.NoError(t, err)
+	assert.Contains(t, members, schedID.String())
+
+	// Inflight scanning + heartbeat existence + inflight key deletion for orphan recovery.
+	_, err = mr.Lpush(queue.InflightKey("worker-alive"), uuid.Must(uuid.NewV7()).String())
+	require.NoError(t, err)
+	_, err = mr.Lpush(queue.InflightKey("worker-dead"), uuid.Must(uuid.NewV7()).String())
+	require.NoError(t, err)
+	require.NoError(t, q.Heartbeat(ctx, "worker-alive", 15*time.Second))
+
+	workerIDs, err := q.ScanInflightWorkerIDs(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"worker-alive", "worker-dead"}, workerIDs)
+
+	hbs, err := q.HasHeartbeats(ctx, workerIDs)
+	require.NoError(t, err)
+	assert.True(t, hbs["worker-alive"])
+	assert.False(t, hbs["worker-dead"])
+
+	require.NoError(t, q.DeleteInflightKey(ctx, "worker-dead"))
+	assert.False(t, mr.Exists(queue.InflightKey("worker-dead")))
+	assert.True(t, mr.Exists(queue.InflightKey("worker-alive")))
+}

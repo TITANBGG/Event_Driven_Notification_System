@@ -14,7 +14,8 @@ const (
 	DelayedZSetKey      = HashTag + ":delayed"
 	DLQListKey          = HashTag + ":dlq"
 	QueuePrefix         = HashTag + ":q:"
-	InflightScanPattern = HashTag + ":inflight:*"
+	InflightPrefix      = HashTag + ":inflight:"
+	InflightScanPattern = InflightPrefix + "*"
 	HeartbeatPrefix     = HashTag + ":hb:"
 	ReconcilerLockKey   = HashTag + ":reconciler:lock"
 	EventsPubSubChannel = "notif:events"
@@ -30,7 +31,7 @@ func Key(ch domain.Channel, pr domain.Priority) string {
 
 // InflightKey returns the per-worker inflight list key.
 func InflightKey(workerID string) string {
-	return fmt.Sprintf("%s:inflight:%s", HashTag, workerID)
+	return InflightPrefix + workerID
 }
 
 // HeartbeatKey returns the per-worker liveness key with expiring TTL.
