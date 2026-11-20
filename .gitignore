@@ -1,0 +1,20 @@
+# WHAT: Git exclusion rules protecting secrets, private notes, build artifacts, and workspace scratch files.
+# WHY: Prevents leaking credentials (.env), submitting private Turkish study notes (.notes/),
+#      or polluting the clean assessment repository with warmup exercises and binaries.
+# EXPECTED OUTPUT EXAMPLE (`git status --short`):
+#   ?? CLAUDE.md
+#   ?? go.mod
+#   # (.env, .notes/, PROMPTS.md, go-warmup/ never appear as untracked/staged files)
+
+.env
+.env.*
+!.env.example
+.notes/
+coverage.*
+bin/
+PROMPTS.md
+go-warmup/
+*.exe
+.DS_Store
+Thumbs.db
+

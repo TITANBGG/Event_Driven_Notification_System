@@ -1,0 +1,24 @@
+# WHAT: Cross-editor formatting defaults ensuring consistent indentation and LF line endings.
+# WHY: Prevents Windows CRLF bytes (\r) from breaking Linux shell scripts (scripts/smoke.sh)
+#      and Makefiles inside containers or CI runners.
+# EXPECTED OUTPUT EXAMPLE:
+#   # Any newly saved *.sh or Makefile uses LF (\n), Go files use tabs, YAML uses 2 spaces.
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.go]
+indent_style = tab
+
+[Makefile]
+indent_style = tab
+
+[*.{yml,yaml,json,md,sql,sh}]
+indent_style = space
+indent_size = 2
+
