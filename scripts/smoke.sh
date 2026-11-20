@@ -136,24 +136,34 @@ run_req "POST /api/v1/notifications/${SCHED_ID}/cancel (cancel scheduled notific
   curl -X POST "${API_URL}/api/v1/notifications/${SCHED_ID}/cancel"
 
 echo "=== Template system (B-3): create template -> preview -> batch of 3 personalized SMS ==="
+# Non-ASCII bodies go through stdin: native Windows curl re-encodes argv with the ANSI code page,
+# which the API (correctly) rejects as invalid UTF-8.
 TMPL_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/templates" \
   -H "Content-Type: application/json" \
-  -d "{\"name\":\"otp-tr-${RUN_TAG}\",\"channel\":\"sms\",\"body\":\"Merhaba {{name}}, doğrulama kodunuz: {{code}}\",\"variables\":[\"name\",\"code\"]}")"
+  --data-binary @- <<JSON
+{"name":"otp-tr-${RUN_TAG}","channel":"sms","body":"Merhaba {{name}}, doğrulama kodunuz: {{code}}","variables":["name","code"]}
+JSON
+)"
 TMPL_ID="$(printf '%s' "${TMPL_JSON}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
 echo "Created template id=${TMPL_ID}"
 
 run_req "POST /api/v1/templates/${TMPL_ID}/preview" "200" \
   curl -X POST "${API_URL}/api/v1/templates/${TMPL_ID}/preview" \
   -H "Content-Type: application/json" \
-  -d '{"variables":{"name":"Ayşe","code":"4821","unusedVar":"extra"}}'
+  --data-binary @- <<'JSON'
+{"variables":{"name":"Ayşe","code":"4821","unusedVar":"extra"}}
+JSON
 
 TMPL_BATCH_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/notifications/batch" \
   -H "Content-Type: application/json" \
-  -d "{\"notifications\":[
-    {\"recipient\":\"+905551111111\",\"channel\":\"sms\",\"templateId\":\"${TMPL_ID}\",\"templateVariables\":{\"name\":\"Ayşe\",\"code\":\"4821\"}},
-    {\"recipient\":\"+905552222222\",\"channel\":\"sms\",\"templateId\":\"${TMPL_ID}\",\"templateVariables\":{\"name\":\"Mehmet\",\"code\":\"9035\"}},
-    {\"recipient\":\"+905553333333\",\"channel\":\"sms\",\"templateId\":\"${TMPL_ID}\",\"templateVariables\":{\"name\":\"Zeynep\",\"code\":7142}}
-  ]}")"
+  --data-binary @- <<JSON
+{"notifications":[
+  {"recipient":"+905551111111","channel":"sms","templateId":"${TMPL_ID}","templateVariables":{"name":"Ayşe","code":"4821"}},
+  {"recipient":"+905552222222","channel":"sms","templateId":"${TMPL_ID}","templateVariables":{"name":"Mehmet","code":"9035"}},
+  {"recipient":"+905553333333","channel":"sms","templateId":"${TMPL_ID}","templateVariables":{"name":"Zeynep","code":7142}}
+]}
+JSON
+)"
 TMPL_BATCH_ID="$(printf '%s' "${TMPL_BATCH_JSON}" | sed -n 's/.*"batchId":"\([^"]*\)".*/\1/p')"
 echo "Created template batchId=${TMPL_BATCH_ID}"
 
