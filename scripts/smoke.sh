@@ -32,11 +32,11 @@ run_req "GET /health/ready" "200" \
 run_req "GET /health (alias for /health/ready)" "200" \
   curl "${API_URL}/health"
 
-run_req "GET /metrics (Prometheus scrape headers + status check)" "200" \
-  curl -I "${API_URL}/metrics"
+run_req "GET /metrics (Prometheus scrape endpoint)" "200" \
+  curl "${API_URL}/metrics"
 
-run_req "GET /openapi.yaml (headers + status check)" "200" \
-  curl -I "${API_URL}/openapi.yaml"
+run_req "GET /openapi.yaml (OpenAPI specification)" "200" \
+  curl "${API_URL}/openapi.yaml"
 
 run_req "POST /api/v1/notifications (Turkish SMS, high priority)" "202" \
   curl -X POST "${API_URL}/api/v1/notifications" \
