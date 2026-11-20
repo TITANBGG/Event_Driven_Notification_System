@@ -162,17 +162,42 @@ type queueEnqueuer struct {
 }
 
 func (e queueEnqueuer) Enqueue(ctx context.Context, items []api.QueueItem) error {
-	metas := make([]queue.Meta, len(items))
-	for i, it := range items {
-		metas[i] = queue.Meta{
+	var (
+		immediate []queue.Meta
+		scheduled []queue.Meta
+		dueAts    []time.Time
+	)
+	for _, it := range items {
+		meta := queue.Meta{
 			ID:            it.ID,
 			Channel:       it.Channel,
 			Priority:      it.Priority,
 			CorrelationID: it.CorrelationID,
 			TraceParent:   it.TraceParent,
 		}
+		if it.ScheduledAt != nil {
+			scheduled = append(scheduled, meta)
+			dueAts = append(dueAts, it.ScheduledAt.UTC())
+		} else {
+			immediate = append(immediate, meta)
+		}
 	}
-	return e.q.Enqueue(ctx, metas...)
+	var errs []error
+	if len(immediate) > 0 {
+		if err := e.q.Enqueue(ctx, immediate...); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(scheduled) > 0 {
+		if err := e.q.ScheduleBatch(ctx, scheduled, dueAts); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (e queueEnqueuer) CancelDelayed(ctx context.Context, ids ...uuid.UUID) error {
+	return e.q.CancelDelayed(ctx, ids...)
 }
 
 type testInfra struct {
@@ -729,7 +754,7 @@ func TestCoreIntegration(t *testing.T) {
 	t.Run("h_reconciler_repairs_untracked_pending_and_simulated_redis_loss", func(t *testing.T) {
 		inf.resetState(t)
 
-		// 1. Insert a pending row directly into Postgres without Redis enqueue.
+		// 1. Insert a pending row and a due-soon scheduled row directly into Postgres without Redis enqueue/schedule.
 		directID := uuid.Must(uuid.NewV7())
 		_, err := inf.repo.InsertNotification(t.Context(), domain.Notification{
 			ID:          directID,
@@ -738,6 +763,20 @@ func TestCoreIntegration(t *testing.T) {
 			Status:      domain.StatusPending,
 			Recipient:   "+905556000001",
 			Content:     "Direct DB row without enqueue",
+			MaxAttempts: 5,
+		})
+		require.NoError(t, err)
+
+		schedLostID := uuid.Must(uuid.NewV7())
+		schedDueAt := time.Now().UTC().Add(350 * time.Millisecond)
+		_, err = inf.repo.InsertNotification(t.Context(), domain.Notification{
+			ID:          schedLostID,
+			Channel:     domain.ChannelSMS,
+			Priority:    domain.PriorityHigh,
+			Status:      domain.StatusScheduled,
+			ScheduledAt: &schedDueAt,
+			Recipient:   "+905556000002",
+			Content:     "Scheduled row lost from Redis",
 			MaxAttempts: 5,
 		})
 		require.NoError(t, err)
@@ -800,6 +839,12 @@ func TestCoreIntegration(t *testing.T) {
 			return c == http.StatusOK && detail.Status == "sent"
 		}, 10*time.Second, 30*time.Millisecond)
 
+		var schedDetail api.NotificationDetailResponse
+		require.Eventually(t, func() bool {
+			c, _ := doJSON(t, http.MethodGet, inf.apiSrv.URL+"/api/v1/notifications/"+schedLostID.String(), nil, nil, &schedDetail)
+			return c == http.StatusOK && schedDetail.Status == "sent"
+		}, 10*time.Second, 30*time.Millisecond)
+
 		var summary api.BatchDetailResponse
 		require.Eventually(t, func() bool {
 			c, _ := doJSON(t, http.MethodGet, inf.apiSrv.URL+"/api/v1/batches/"+batch.BatchID.String()+"?limit=1", nil, nil, &summary)
@@ -860,5 +905,64 @@ func TestCoreIntegration(t *testing.T) {
 			}
 		}
 		assert.Len(t, seen, 5)
+	})
+
+	t.Run("j_scheduled_due_in_2s_sent_after_due_and_cancelled_never_sent", func(t *testing.T) {
+		inf.resetState(t)
+		stopWorker := inf.startWorker(t, nil, 500, 10)
+		defer stopWorker()
+
+		dueAt := time.Now().UTC().Add(2 * time.Second).Truncate(time.Millisecond)
+		var scheduled, toCancel api.NotificationResponse
+		code1, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/notifications", nil, map[string]any{
+			"recipient":   "+905558000001",
+			"channel":     "sms",
+			"priority":    "high",
+			"content":     "Scheduled in 2s",
+			"scheduledAt": dueAt.Format(time.RFC3339Nano),
+		}, &scheduled)
+		require.Equal(t, http.StatusAccepted, code1)
+		assert.Equal(t, "scheduled", scheduled.Status)
+		require.NotNil(t, scheduled.ScheduledAt)
+
+		code2, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/notifications", nil, map[string]any{
+			"recipient":   "+905558000002",
+			"channel":     "sms",
+			"priority":    "high",
+			"content":     "Scheduled then cancelled",
+			"scheduledAt": dueAt.Format(time.RFC3339Nano),
+		}, &toCancel)
+		require.Equal(t, http.StatusAccepted, code2)
+		assert.Equal(t, "scheduled", toCancel.Status)
+
+		// Cancel the second scheduled notification before due time.
+		var cancelledResp api.NotificationResponse
+		cancelCode, _ := doJSON(t, http.MethodPost, inf.apiSrv.URL+"/api/v1/notifications/"+toCancel.ID.String()+"/cancel", nil, nil, &cancelledResp)
+		require.Equal(t, http.StatusOK, cancelCode)
+		assert.Equal(t, "cancelled", cancelledResp.Status)
+
+		// Verify 800ms after creation (well before the 2s due time) that neither notification has been sent.
+		time.Sleep(800 * time.Millisecond)
+		var earlyCheck api.NotificationDetailResponse
+		cEarly, _ := doJSON(t, http.MethodGet, inf.apiSrv.URL+"/api/v1/notifications/"+scheduled.ID.String(), nil, nil, &earlyCheck)
+		require.Equal(t, http.StatusOK, cEarly)
+		assert.Equal(t, "scheduled", earlyCheck.Status, "notification must remain scheduled before due time")
+		assert.Empty(t, inf.provider.callsForID(scheduled.ID.String()), "provider must not be called before due time")
+
+		// Wait until the first scheduled notification becomes sent after dueAt.
+		var finalDetail api.NotificationDetailResponse
+		require.Eventually(t, func() bool {
+			c, _ := doJSON(t, http.MethodGet, inf.apiSrv.URL+"/api/v1/notifications/"+scheduled.ID.String(), nil, nil, &finalDetail)
+			return c == http.StatusOK && finalDetail.Status == "sent"
+		}, 6*time.Second, 40*time.Millisecond)
+
+		calls := inf.provider.callsForID(scheduled.ID.String())
+		require.Len(t, calls, 1)
+		// Allow at most 100ms tolerance for sub-millisecond timer jitter, proving it was never sent early.
+		assert.False(t, calls[0].ReceivedAt.Before(dueAt.Add(-100*time.Millisecond)),
+			"provider call at %s occurred before dueAt %s", calls[0].ReceivedAt, dueAt)
+
+		// Confirm the cancelled scheduled notification was never sent to the provider.
+		assert.Empty(t, inf.provider.callsForID(toCancel.ID.String()), "cancelled scheduled notification must never reach provider")
 	})
 }

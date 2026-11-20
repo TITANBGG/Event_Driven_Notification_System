@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -17,24 +18,28 @@ type QueueInspector interface {
 }
 
 // QueueItem carries the minimal scheduling metadata pushed to Redis after Postgres commit.
+// When ScheduledAt is non-nil, the item is routed to {notif}:delayed instead of a ready list.
 type QueueItem struct {
 	ID            uuid.UUID
 	Channel       domain.Channel
 	Priority      domain.Priority
 	CorrelationID string
 	TraceParent   string
+	ScheduledAt   *time.Time
 }
 
-// Enqueuer abstracts asynchronous queue dispatch so the API package remains decoupled from Redis until Phase 4.
+// Enqueuer abstracts asynchronous queue dispatch and best-effort cancellation cleanup.
 type Enqueuer interface {
 	Enqueue(ctx context.Context, items []QueueItem) error
+	CancelDelayed(ctx context.Context, ids ...uuid.UUID) error
 }
 
 // MemoryEnqueuer is a thread-safe in-memory Enqueuer for unit tests and pre-Redis Phase 3 startup.
 type MemoryEnqueuer struct {
-	mu    sync.Mutex
-	items []QueueItem
-	err   error
+	mu           sync.Mutex
+	items        []QueueItem
+	cancelledIDs []uuid.UUID
+	err          error
 }
 
 // NewMemoryEnqueuer constructs an empty MemoryEnqueuer.
@@ -63,6 +68,34 @@ func (m *MemoryEnqueuer) Enqueue(ctx context.Context, items []QueueItem) error {
 	return nil
 }
 
+// CancelDelayed records best-effort delayed cancellation IDs in memory.
+func (m *MemoryEnqueuer) CancelDelayed(ctx context.Context, ids ...uuid.UUID) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.err != nil {
+		return m.err
+	}
+	m.cancelledIDs = append(m.cancelledIDs, ids...)
+	return nil
+}
+
+// CancelledIDs returns a snapshot copy of all IDs passed to CancelDelayed.
+func (m *MemoryEnqueuer) CancelledIDs() []uuid.UUID {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]uuid.UUID, len(m.cancelledIDs))
+	copy(out, m.cancelledIDs)
+	return out
+}
+
 // Items returns a snapshot copy of all enqueued items in submission order.
 func (m *MemoryEnqueuer) Items() []QueueItem {
 	m.mu.Lock()
@@ -79,6 +112,7 @@ func (m *MemoryEnqueuer) Reset() {
 	defer m.mu.Unlock()
 
 	m.items = nil
+	m.cancelledIDs = nil
 	m.err = nil
 }
 

@@ -47,7 +47,7 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 	}
 	opts := domain.ValidationOptions{
 		AllowEmptyContent:      in.TemplateID != nil,
-		CheckScheduledAt:       false,
+		CheckScheduledAt:       true,
 		ClockSkewTolerance:     h.cfg.ClockSkewTolerance,
 		ScheduleMaxAhead:       h.cfg.ScheduleMaxAhead,
 		ExtendedProviderFields: h.cfg.ProviderExtended,
@@ -80,17 +80,20 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 		storedIdemKey = &kCopy
 	}
 
+	status, scheduledAt := resolveScheduleState(norm.ScheduledAt, now)
+
 	candidate := domain.Notification{
 		ID:             notifID,
 		Channel:        domain.Channel(norm.Channel),
 		Priority:       domain.Priority(norm.Priority),
-		Status:         domain.StatusPending,
+		Status:         status,
 		Recipient:      norm.Recipient,
 		Subject:        norm.Subject,
 		Title:          norm.Title,
 		Content:        norm.Content,
 		IdempotencyKey: storedIdemKey,
 		MaxAttempts:    h.cfg.MaxAttempts,
+		ScheduledAt:    scheduledAt,
 		CorrelationID:  optionalNonEmpty(cid),
 	}
 
@@ -114,6 +117,7 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 		Channel:       created.Channel,
 		Priority:      created.Priority,
 		CorrelationID: cid,
+		ScheduledAt:   created.ScheduledAt,
 	}}); enqErr != nil {
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to enqueue notification; reconciler will recover",
 			slog.String("notification_id", created.ID.String()),
@@ -226,7 +230,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		addPhase3UnsupportedErrors(prefix, in, ve)
 		opts := domain.ValidationOptions{
 			AllowEmptyContent:      in.TemplateID != nil,
-			CheckScheduledAt:       false,
+			CheckScheduledAt:       true,
 			ClockSkewTolerance:     h.cfg.ClockSkewTolerance,
 			ScheduleMaxAhead:       h.cfg.ScheduleMaxAhead,
 			ExtendedProviderFields: h.cfg.ProviderExtended,
@@ -272,18 +276,20 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, h.logger, fmt.Errorf("generating notification id: %w", idErr))
 			return
 		}
+		status, scheduledAt := resolveScheduleState(norm.ScheduledAt, now)
 		notifications[i] = domain.Notification{
 			ID:             notifID,
 			BatchID:        &batchID,
 			Channel:        domain.Channel(norm.Channel),
 			Priority:       domain.Priority(norm.Priority),
-			Status:         domain.StatusPending,
+			Status:         status,
 			Recipient:      norm.Recipient,
 			Subject:        norm.Subject,
 			Title:          norm.Title,
 			Content:        norm.Content,
 			IdempotencyKey: norm.IdempotencyKey,
 			MaxAttempts:    h.cfg.MaxAttempts,
+			ScheduledAt:    scheduledAt,
 			CorrelationID:  optionalNonEmpty(cid),
 		}
 		if norm.IdempotencyKey != nil {
@@ -339,6 +345,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			Channel:       n.Channel,
 			Priority:      n.Priority,
 			CorrelationID: cid,
+			ScheduledAt:   n.ScheduledAt,
 		}
 	}
 	if enqErr := h.enqueuer.Enqueue(r.Context(), queueItems); enqErr != nil {
@@ -660,6 +667,15 @@ func (h *handler) handleCancelNotification(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
+	// Best-effort ZREM + HDEL frees Redis memory for cancelled scheduled/retrying items;
+	// PostgreSQL status='cancelled' is authoritative so worker Claim skips the row even if Redis fails.
+	if cancelErr := h.enqueuer.CancelDelayed(r.Context(), updated.ID); cancelErr != nil {
+		observability.LoggerFrom(r.Context(), h.logger).Warn("failed best-effort delayed cleanup on cancel",
+			slog.String("notification_id", updated.ID.String()),
+			slog.String("error", cancelErr.Error()),
+		)
+	}
+
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
 }
 
@@ -725,10 +741,21 @@ func parseIdempotencyHeader(r *http.Request) (string, bool) {
 	return trimmed, true
 }
 
-func addPhase3UnsupportedErrors(prefix string, in domain.CreateNotificationInput, ve *domain.ValidationError) {
-	if in.ScheduledAt != nil {
-		ve.Add(prefix+"scheduledAt", "not_supported_yet", "scheduledAt is not supported until Phase 8")
+// immediateScheduleThreshold treats scheduledAt values within now + 1s as immediate pending dispatches.
+const immediateScheduleThreshold = time.Second
+
+func resolveScheduleState(scheduledAt *time.Time, now time.Time) (domain.Status, *time.Time) {
+	if scheduledAt == nil {
+		return domain.StatusPending, nil
 	}
+	target := scheduledAt.UTC()
+	if !target.After(now.UTC().Add(immediateScheduleThreshold)) {
+		return domain.StatusPending, nil
+	}
+	return domain.StatusScheduled, &target
+}
+
+func addPhase3UnsupportedErrors(prefix string, in domain.CreateNotificationInput, ve *domain.ValidationError) {
 	if in.TemplateID != nil {
 		ve.Add(prefix+"templateId", "not_supported_yet", "templateId is not supported until Phase 9")
 	} else if len(in.TemplateVars) > 0 {

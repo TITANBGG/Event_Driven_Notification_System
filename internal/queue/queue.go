@@ -286,6 +286,88 @@ func (q *Queue) Schedule(ctx context.Context, meta Meta, dueAt time.Time, worker
 	return nil
 }
 
+// ScheduleBatch upserts tracking metadata and places one or more scheduled notification IDs into
+// {notif}:delayed at their target due times in a single pipelined round trip.
+func (q *Queue) ScheduleBatch(ctx context.Context, metas []Meta, dueAts []time.Time) error {
+	if len(metas) == 0 {
+		return nil
+	}
+	if len(metas) != len(dueAts) {
+		return fmt.Errorf("schedule batch length mismatch: %d metas vs %d due times", len(metas), len(dueAts))
+	}
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+
+	payloads := make([][]byte, len(metas))
+	dueMillis := make([]string, len(metas))
+	for i := range metas {
+		if !metas[i].Channel.Valid() {
+			return fmt.Errorf("schedule invalid channel %q for %s", metas[i].Channel, metas[i].ID)
+		}
+		if !metas[i].Priority.Valid() {
+			metas[i].Priority = domain.PriorityNormal
+		}
+		raw, err := json.Marshal(metas[i])
+		if err != nil {
+			return fmt.Errorf("marshaling schedule meta for %s: %w", metas[i].ID, err)
+		}
+		payloads[i] = raw
+		dueMillis[i] = strconv.FormatInt(dueAts[i].UTC().UnixMilli(), 10)
+	}
+
+	keys := []string{MsgHashKey, DelayedZSetKey}
+	runPipe := func() ([]*redis.Cmd, error) {
+		pipe := q.rdb.Pipeline()
+		cmds := make([]*redis.Cmd, len(metas))
+		for i, meta := range metas {
+			cmds[i] = scheduleScript.EvalSha(ctx, pipe, keys, meta.ID.String(), string(payloads[i]), dueMillis[i])
+		}
+		_, err := pipe.Exec(ctx)
+		return cmds, err
+	}
+
+	cmds, err := runPipe()
+	if err != nil && isNoScriptError(err, cmds) {
+		if loadErr := scheduleScript.Load(ctx, q.rdb).Err(); loadErr != nil {
+			return fmt.Errorf("loading schedule script: %w", loadErr)
+		}
+		_, err = runPipe()
+	}
+	if err != nil {
+		return fmt.Errorf("executing schedule pipeline: %w", err)
+	}
+	return nil
+}
+
+// CancelDelayed best-effort removes cancelled notification IDs from {notif}:delayed and deletes
+// their tracking metadata from {notif}:msg to reclaim Redis memory immediately.
+// PostgreSQL status='cancelled' remains the authoritative guard (Claim skips cancelled rows).
+func (q *Queue) CancelDelayed(ctx context.Context, ids ...uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if q.rdb == nil {
+		return errors.New("redis client is nil")
+	}
+
+	members := make([]any, len(ids))
+	fields := make([]string, len(ids))
+	for i, id := range ids {
+		s := id.String()
+		members[i] = s
+		fields[i] = s
+	}
+
+	pipe := q.rdb.Pipeline()
+	pipe.ZRem(ctx, DelayedZSetKey, members...)
+	pipe.HDel(ctx, MsgHashKey, fields...)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("cleaning cancelled delayed entries: %w", err)
+	}
+	return nil
+}
+
 // DeadLetter acknowledges the item and appends its ID to the bounded {notif}:dlq list.
 // When workerID is empty (e.g., reconciler expiry), only tracking cleanup and DLQ insertion run.
 func (q *Queue) DeadLetter(ctx context.Context, workerID string, id uuid.UUID) error {

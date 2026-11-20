@@ -298,6 +298,73 @@ func TestWorkerHappyPathAndCancelledBeforeClaimAndPermanentFailure(t *testing.T)
 		require.NoError(t, err)
 		assert.Equal(t, []string{id.String()}, dlq)
 	})
+
+	t.Run("scheduled notification claim guard refuses early claim and delivers when due", func(t *testing.T) {
+		t.Parallel()
+		mr := miniredis.RunT(t)
+		rdb := queue.NewClient(mr.Addr(), 4)
+		defer func() { _ = rdb.Close() }()
+		q := queue.New(rdb)
+
+		store := newMemWorkerStore()
+		cfg := testWorkerConfig()
+		cfg.ClockSkewTolerance = 50 * time.Millisecond
+
+		// 1. Not-yet-due scheduled row (scheduledAt = now + 10m > now + skew): even if prematurely enqueued, Claim refuses it and worker ACKs without calling provider.
+		notDueID := uuid.Must(uuid.NewV7())
+		futureDue := time.Now().UTC().Add(10 * time.Minute)
+		store.put(domain.Notification{
+			ID: notDueID, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh,
+			Status: domain.StatusScheduled, ScheduledAt: &futureDue, Recipient: "+905551234567", Content: "not due yet", MaxAttempts: 5,
+		})
+
+		// 2. Cancelled scheduled row in delayed ZSET: CancelDelayed cleans Redis; even if promoted, Claim skips it and provider is never called.
+		cancelledSchedID := uuid.Must(uuid.NewV7())
+		dueNow := time.Now().UTC().Add(-10 * time.Millisecond)
+		store.put(domain.Notification{
+			ID: cancelledSchedID, Channel: domain.ChannelSMS, Priority: domain.PriorityNormal,
+			Status: domain.StatusCancelled, ScheduledAt: &dueNow, Recipient: "+905551234568", Content: "cancelled before due", MaxAttempts: 5,
+		})
+
+		// 3. Due scheduled row in delayed ZSET: delayed mover promotes it -> Claim transitions scheduled -> processing -> provider called -> sent.
+		dueSchedID := uuid.Must(uuid.NewV7())
+		dueSoon := time.Now().UTC().Add(80 * time.Millisecond)
+		store.put(domain.Notification{
+			ID: dueSchedID, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh,
+			Status: domain.StatusScheduled, ScheduledAt: &dueSoon, Recipient: "+905551234569", Content: "deliver on time", MaxAttempts: 5,
+		})
+
+		var deliveredIDs []uuid.UUID
+		var mu sync.Mutex
+		status202 := 202
+		msgID := "prov-sched-1"
+		sender := &fakeSender{fn: func(_ context.Context, n domain.Notification) (provider.Result, error) {
+			mu.Lock()
+			deliveredIDs = append(deliveredIDs, n.ID)
+			mu.Unlock()
+			return provider.Result{Outcome: provider.OutcomeSent, HTTPStatus: &status202, ProviderMessageID: &msgID}, nil
+		}}
+
+		w, err := worker.New(worker.Deps{Config: cfg, Logger: observability.NewLogger("error", &bytes.Buffer{}), Store: store, Queue: q, RateLimiter: noopLimiter{}, Sender: sender})
+		require.NoError(t, err)
+
+		require.NoError(t, q.Enqueue(t.Context(), queue.Meta{ID: notDueID, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh}))
+		require.NoError(t, q.ScheduleBatch(t.Context(), []queue.Meta{
+			{ID: cancelledSchedID, Channel: domain.ChannelSMS, Priority: domain.PriorityNormal},
+			{ID: dueSchedID, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh},
+		}, []time.Time{dueNow, dueSoon}))
+		require.NoError(t, q.CancelDelayed(t.Context(), cancelledSchedID))
+
+		runWorkerUntil(t, w, func() bool {
+			return store.get(dueSchedID).Status == domain.StatusSent
+		})
+
+		assert.Equal(t, domain.StatusScheduled, store.get(notDueID).Status, "not-yet-due row must remain scheduled in DB")
+		assert.Equal(t, domain.StatusCancelled, store.get(cancelledSchedID).Status, "cancelled row must remain cancelled")
+		mu.Lock()
+		assert.Equal(t, []uuid.UUID{dueSchedID}, deliveredIDs, "only the due non-cancelled scheduled row may reach the provider")
+		mu.Unlock()
+	})
 }
 
 func TestWorkerLeaseLostPanicRecoveryAndShutdownRequeue(t *testing.T) {

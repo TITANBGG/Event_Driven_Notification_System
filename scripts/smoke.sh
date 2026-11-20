@@ -114,6 +114,21 @@ run_req "GET /api/v1/batches/${E2E_BATCH_ID} (all 10 sent)" "200" \
 run_req "POST /api/v1/batches/${E2E_BATCH_ID}/cancel (after completion: cancelled=0, notCancellable=10)" "200" \
   curl -X POST "${API_URL}/api/v1/batches/${E2E_BATCH_ID}/cancel"
 
+echo "=== Scheduled notification (B-2): schedule 30s ahead -> verify status=scheduled -> cancel before due ==="
+SCHED_AT="$(date -u -d '+30 seconds' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -v+30S '+%Y-%m-%dT%H:%M:%SZ')"
+SCHED_JSON="$(curl -fsS -X POST "${API_URL}/api/v1/notifications" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: smoke-sched-30s-${RUN_TAG}" \
+  -d "{\"recipient\":\"+905551234599\",\"channel\":\"sms\",\"priority\":\"high\",\"content\":\"Scheduled 30s ahead\",\"scheduledAt\":\"${SCHED_AT}\"}")"
+SCHED_ID="$(printf '%s' "${SCHED_JSON}" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
+echo "Scheduled 30s notification id=${SCHED_ID} scheduledAt=${SCHED_AT}"
+
+run_req "GET /api/v1/notifications?status=scheduled&limit=5" "200" \
+  curl "${API_URL}/api/v1/notifications?status=scheduled&limit=5"
+
+run_req "POST /api/v1/notifications/${SCHED_ID}/cancel (cancel scheduled notification before due)" "200" \
+  curl -X POST "${API_URL}/api/v1/notifications/${SCHED_ID}/cancel"
+
 run_req "GET /api/v1/metrics (real-time JSON observability snapshot)" "200" \
   curl "${API_URL}/api/v1/metrics"
 

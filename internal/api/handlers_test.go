@@ -141,9 +141,9 @@ func TestCreateNotificationPhase3FeatureGatesAndUnknownFields(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, recUnknown.Code)
 	assert.Contains(t, recUnknown.Body.String(), "malformed_json")
 
-	// scheduledAt and templateId are rejected with 422 not_supported_yet in Phase 3.
+	// templateId and templateVariables are rejected with 422 not_supported_yet until Phase 9.
 	recGate := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
-		`{"recipient":"+905551234567","channel":"sms","scheduledAt":"2026-11-22T10:00:00Z","templateId":"01936f7e-0000-7000-8000-000000000001"}`,
+		`{"recipient":"+905551234567","channel":"sms","templateId":"01936f7e-0000-7000-8000-000000000001"}`,
 		nil,
 	)
 	require.Equal(t, http.StatusUnprocessableEntity, recGate.Code)
@@ -153,8 +153,103 @@ func TestCreateNotificationPhase3FeatureGatesAndUnknownFields(t *testing.T) {
 	for _, d := range errResp.Error.Details {
 		codes[d.Field] = d.Code
 	}
-	assert.Equal(t, "not_supported_yet", codes["scheduledAt"])
 	assert.Equal(t, "not_supported_yet", codes["templateId"])
+}
+
+func TestScheduledNotificationsValidationImmediateThresholdAndCancel(t *testing.T) {
+	t.Parallel()
+
+	// Fixed test clock in newTestRouter: 2026-11-21T10:00:00Z, ClockSkewTolerance=2s, ScheduleMaxAhead=720h (30d).
+	h, store, enq := newTestRouter(t)
+
+	// 1. Past beyond clock skew (-3s) -> 422 scheduled_in_past.
+	recPast := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"past","scheduledAt":"2026-11-21T09:59:57Z"}`,
+		nil,
+	)
+	require.Equal(t, http.StatusUnprocessableEntity, recPast.Code)
+	assert.Contains(t, recPast.Body.String(), "scheduled_in_past")
+
+	// 2. Beyond 30 days (720h + 1m) -> 422 scheduled_too_far.
+	recTooFar := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"far","scheduledAt":"2026-12-21T10:01:00Z"}`,
+		nil,
+	)
+	require.Equal(t, http.StatusUnprocessableEntity, recTooFar.Code)
+	assert.Contains(t, recTooFar.Body.String(), "scheduled_too_far")
+
+	// 3. Within clock skew (-1s) or <= now + 1s (+1s) -> treated as immediate (status="pending", scheduledAt=null, Enqueue immediate).
+	for _, ts := range []string{"2026-11-21T09:59:59Z", "2026-11-21T10:00:01Z"} {
+		recImm := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+			fmt.Sprintf(`{"recipient":"+905551234567","channel":"sms","content":"immediate","scheduledAt":%q}`, ts),
+			nil,
+		)
+		require.Equal(t, http.StatusAccepted, recImm.Code)
+		var resp api.NotificationResponse
+		require.NoError(t, json.Unmarshal(recImm.Body.Bytes(), &resp))
+		assert.Equal(t, "pending", resp.Status)
+		assert.Nil(t, resp.ScheduledAt)
+	}
+	require.Len(t, enq.Items(), 2)
+	assert.Nil(t, enq.Items()[0].ScheduledAt)
+	assert.Nil(t, enq.Items()[1].ScheduledAt)
+
+	// 4. Future scheduledAt with non-UTC offset (+03:00 -> 2026-11-21T10:00:30Z) -> status="scheduled", stored in UTC, routed with ScheduledAt.
+	recSched := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"future 30s","scheduledAt":"2026-11-21T13:00:30+03:00"}`,
+		map[string]string{"Idempotency-Key": "sched-tz-1"},
+	)
+	require.Equal(t, http.StatusAccepted, recSched.Code)
+	var schedResp api.NotificationResponse
+	require.NoError(t, json.Unmarshal(recSched.Body.Bytes(), &schedResp))
+	assert.Equal(t, "scheduled", schedResp.Status)
+	require.NotNil(t, schedResp.ScheduledAt)
+	assert.Equal(t, time.Date(2026, 11, 21, 10, 0, 30, 0, time.UTC), *schedResp.ScheduledAt)
+
+	// Idempotent replay with equivalent UTC timestamp ("2026-11-21T10:00:30Z") matches canonical hash.
+	recReplay := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"future 30s","scheduledAt":"2026-11-21T10:00:30Z"}`,
+		map[string]string{"Idempotency-Key": "sched-tz-1"},
+	)
+	require.Equal(t, http.StatusAccepted, recReplay.Code)
+	assert.Equal(t, "true", recReplay.Header().Get("Idempotent-Replayed"))
+
+	items := enq.Items()
+	require.Len(t, items, 3)
+	require.NotNil(t, items[2].ScheduledAt)
+	assert.Equal(t, time.Date(2026, 11, 21, 10, 0, 30, 0, time.UTC), *items[2].ScheduledAt)
+
+	// 5. Batch create with mixed immediate and scheduled items.
+	recBatch := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications/batch",
+		`{"notifications":[
+			{"recipient":"+905551234501","channel":"sms","content":"imm","scheduledAt":"2026-11-21T10:00:00.500Z"},
+			{"recipient":"+905551234502","channel":"sms","content":"sched","scheduledAt":"2026-11-21T10:05:00Z"}
+		]}`,
+		nil,
+	)
+	require.Equal(t, http.StatusAccepted, recBatch.Code)
+
+	// 6. List filter status=scheduled returns the 2 scheduled notifications.
+	recList := doJSONRequest(t, h, http.MethodGet, "/api/v1/notifications?status=scheduled", "", nil)
+	require.Equal(t, http.StatusOK, recList.Code)
+	var listResp api.NotificationListResponse
+	require.NoError(t, json.Unmarshal(recList.Body.Bytes(), &listResp))
+	require.Len(t, listResp.Data, 2)
+	for _, n := range listResp.Data {
+		assert.Equal(t, "scheduled", n.Status)
+		assert.NotNil(t, n.ScheduledAt)
+	}
+
+	// 7. Cancel scheduled notification transitions scheduled -> cancelled and invokes best-effort CancelDelayed.
+	recCancel := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications/"+schedResp.ID.String()+"/cancel", "", nil)
+	require.Equal(t, http.StatusOK, recCancel.Code)
+	var cancelResp api.NotificationResponse
+	require.NoError(t, json.Unmarshal(recCancel.Body.Bytes(), &cancelResp))
+	assert.Equal(t, "cancelled", cancelResp.Status)
+	assert.Contains(t, enq.CancelledIDs(), schedResp.ID)
+	dbRow, err := store.GetNotification(t.Context(), schedResp.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.StatusCancelled, dbRow.Status)
 }
 
 func TestCreateNotificationDBFirstOnEnqueueFailure(t *testing.T) {

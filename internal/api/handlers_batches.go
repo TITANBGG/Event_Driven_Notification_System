@@ -2,9 +2,11 @@ package api
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 
 	"github.com/TITANBGG/notification-system/internal/domain"
+	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/repository"
 )
 
@@ -90,6 +92,16 @@ func (h *handler) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, r, h.logger, err)
 		return
+	}
+
+	if len(cancelledIDs) > 0 {
+		if cancelErr := h.enqueuer.CancelDelayed(r.Context(), cancelledIDs...); cancelErr != nil {
+			observability.LoggerFrom(r.Context(), h.logger).Warn("failed best-effort delayed cleanup on batch cancel",
+				slog.String("batch_id", id.String()),
+				slog.Int("count", len(cancelledIDs)),
+				slog.String("error", cancelErr.Error()),
+			)
+		}
 	}
 
 	cancelled := len(cancelledIDs)

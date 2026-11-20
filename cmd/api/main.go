@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/TITANBGG/notification-system/internal/api"
@@ -29,17 +30,42 @@ type redisEnqueuer struct {
 }
 
 func (e redisEnqueuer) Enqueue(ctx context.Context, items []api.QueueItem) error {
-	metas := make([]queue.Meta, len(items))
-	for i, item := range items {
-		metas[i] = queue.Meta{
+	var (
+		immediate []queue.Meta
+		scheduled []queue.Meta
+		dueAts    []time.Time
+	)
+	for _, item := range items {
+		meta := queue.Meta{
 			ID:            item.ID,
 			Channel:       item.Channel,
 			Priority:      item.Priority,
 			CorrelationID: item.CorrelationID,
 			TraceParent:   item.TraceParent,
 		}
+		if item.ScheduledAt != nil {
+			scheduled = append(scheduled, meta)
+			dueAts = append(dueAts, item.ScheduledAt.UTC())
+		} else {
+			immediate = append(immediate, meta)
+		}
 	}
-	return e.q.Enqueue(ctx, metas...)
+	var errs []error
+	if len(immediate) > 0 {
+		if err := e.q.Enqueue(ctx, immediate...); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(scheduled) > 0 {
+		if err := e.q.ScheduleBatch(ctx, scheduled, dueAts); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (e redisEnqueuer) CancelDelayed(ctx context.Context, ids ...uuid.UUID) error {
+	return e.q.CancelDelayed(ctx, ids...)
 }
 
 func main() {

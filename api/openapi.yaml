@@ -102,6 +102,14 @@ paths:
                   channel: push
                   title: "Package Delivered"
                   content: "Your delivery has arrived."
+              scheduledSms:
+                summary: Scheduled SMS notification (future delivery)
+                value:
+                  recipient: "+905551234567"
+                  channel: sms
+                  content: "Scheduled campaign reminder"
+                  priority: high
+                  scheduledAt: "2026-11-21T15:30:00+03:00"
       responses:
         "202":
           description: Notification accepted for asynchronous delivery (or replayed via Idempotency-Key)
@@ -681,7 +689,7 @@ components:
         scheduledAt:
           type: string
           format: date-time
-          description: Reserved for Phase 8 scheduled delivery
+          description: Optional RFC3339 delivery timestamp (`> now - 2s`, `<= now + 720h`; values `<= now + 1s` dispatch immediately as `pending`, otherwise stored in UTC with status `scheduled`)
         idempotencyKey:
           type: string
           minLength: 1
