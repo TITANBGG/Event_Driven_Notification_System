@@ -1210,6 +1210,7 @@ make drills             # live failure drills against the running stack (~5 min,
 make invariants         # check system invariants on the settled stack (no stuck rows, no cancelled or double sends, Redis matches PostgreSQL);
                         # covers the full history, so pass --since=<RFC3339> to ignore duplicates from an earlier crash drill
 make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, queue depths, DB pool, Redis memory
+make races              # concurrent cancel, batch cancel, idempotency and manual retry storms (~2 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
 make fuzz               # Go native fuzzing of SMS segmenting, validation, cursor decoding and templates (FUZZTIME=5m each)
 ```
@@ -1320,6 +1321,20 @@ The scaled run found two real defects. The worker pool was fixed at 35 connectio
 | Invariants | all passed: 0 stuck, 0 duplicates, Redis and PostgreSQL consistent |
 
 Each worker's 10-connection pool was fully used during the burst, and 16% of connection acquires had to wait (`db_pool_empty_acquire_total`). That cost about 2% of throughput (93.3/s against 95.2/s in steady load). Goroutines and file descriptors returned to their baseline afterwards, so nothing leaked.
+
+### Race conditions under real concurrency
+
+`scripts/races.sh` (`make races`) fires many simultaneous requests at one resource from a single `curl --parallel` process (200 connections at once) and checks each outcome against the API responses, PostgreSQL and the provider's per-`Idempotency-Key` counts. Measured on 2026-11-21:
+
+| Scenario | What runs at the same time | Result |
+|---|---|---|
+| Cancel vs worker | 1,000 cancels while the same 1,000 SMS are being delivered (300ms provider latency) | 689 cancels won: all ended `cancelled` with 0 provider calls. 311 lost to the worker (`409`): all ended `sent`, each delivered exactly once |
+| Batch cancel storm | 20 cancels of the same 1,000-item batch | The 20 responses together report 768 cancelled = 768 `cancelled` rows in PostgreSQL (one atomic `UPDATE`, no double counting); 0 cancelled rows reached the provider |
+| Idempotency, same body | 200 `POST`s with one `Idempotency-Key` | 1 created, 199 replayed (`Idempotent-Replayed: true`), one ID returned to all, 1 row |
+| Idempotency, different bodies | 200 `POST`s, one key, 200 different bodies | One `202`, 199 × `409 idempotency_conflict`, 1 row |
+| Manual retry storm | 50 retries for each of 20 failed notifications | Exactly one `200` per notification, the rest `409`; each sent exactly once afterwards and removed from the DLQ list |
+
+The first version of the script spawned one `curl` per request with `xargs`. On Windows that spread 1,000 "concurrent" cancels over ~30 seconds, so the batch finished before any cancel arrived and the scenario passed without ever racing. The script now fails a scenario in which no cancel both won and lost.
 
 ### CI/CD (GitHub Actions, `B-6`)
 
