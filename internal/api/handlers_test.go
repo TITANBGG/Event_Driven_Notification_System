@@ -980,3 +980,35 @@ func TestWebSocketConnectSnapshotReceiveEventsAndValidation(t *testing.T) {
 	assert.Equal(t, created.ID, ev.NotificationID)
 	assert.Equal(t, domain.StatusCancelled, ev.Status)
 }
+
+// hangingEnqueuer simulates an unreachable Redis: every call blocks until the caller's context ends.
+type hangingEnqueuer struct{ *api.MemoryEnqueuer }
+
+func (hangingEnqueuer) Enqueue(ctx context.Context, _ []api.QueueItem) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// With Redis hanging, create must still answer 202 (the row is durable in PostgreSQL and the
+// reconciler re-enqueues it) and must not wait longer than the post-commit Redis budget.
+func TestCreateNotificationRedisHangIsBoundedAndStillAccepted(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.LoadFrom(func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	store := newFakeStore()
+	h := api.NewRouter(api.Deps{
+		Config:   cfg,
+		Logger:   observability.NewLogger("error", &bytes.Buffer{}),
+		Store:    store,
+		Enqueuer: hangingEnqueuer{api.NewMemoryEnqueuer()},
+	})
+
+	start := time.Now()
+	rec := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications",
+		`{"recipient":"+905551234567","channel":"sms","content":"redis is down"}`, nil)
+	elapsed := time.Since(start)
+
+	assert.Equal(t, http.StatusAccepted, rec.Code)
+	assert.Equal(t, 1, store.NotificationCount())
+	assert.Less(t, elapsed, 3*time.Second, "all post-commit Redis work shares one ~2s budget")
+}

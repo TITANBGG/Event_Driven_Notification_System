@@ -96,7 +96,9 @@ func (h *handler) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(cancelledIDs) > 0 {
-		if cancelErr := h.enqueuer.CancelDelayed(r.Context(), cancelledIDs...); cancelErr != nil {
+		cleanupCtx, cancelCleanup := redisFollowUpCtx(r.Context())
+		defer cancelCleanup()
+		if cancelErr := h.enqueuer.CancelDelayed(cleanupCtx, cancelledIDs...); cancelErr != nil {
 			observability.LoggerFrom(r.Context(), h.logger).Warn("failed best-effort delayed cleanup on batch cancel",
 				slog.String("batch_id", id.String()),
 				slog.Int("count", len(cancelledIDs)),
@@ -120,7 +122,7 @@ func (h *handler) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if len(events) > 0 && h.publisher != nil {
-				if pubErr := h.publisher.Publish(r.Context(), events...); pubErr != nil {
+				if pubErr := h.publisher.Publish(cleanupCtx, events...); pubErr != nil {
 					observability.LoggerFrom(r.Context(), h.logger).Warn("failed publishing batch cancel events",
 						slog.String("batch_id", id.String()),
 						slog.String("error", pubErr.Error()),

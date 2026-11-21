@@ -125,10 +125,13 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 	}
 
 	h.metrics.IncNotificationCreated(created.Channel.String(), created.Priority.String())
-	h.publishStatusEvents(r.Context(), cid, *created)
+	// One shared budget for all post-commit Redis work of this request (see redisFollowUpTimeout).
+	followCtx, cancelFollow := redisFollowUpCtx(r.Context())
+	defer cancelFollow()
+	h.publishStatusEvents(followCtx, cid, *created)
 
 	// Commit to PostgreSQL completed before pushing queue hint to Redis so reconciler repairs enqueue failures.
-	if enqErr := h.enqueueWithSpan(r.Context(), []QueueItem{{
+	if enqErr := h.enqueueWithSpan(followCtx, []QueueItem{{
 		ID:            created.ID,
 		Channel:       created.Channel,
 		Priority:      created.Priority,
@@ -378,7 +381,10 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	for _, n := range notifications {
 		h.metrics.IncNotificationCreated(n.Channel.String(), n.Priority.String())
 	}
-	h.publishStatusEvents(r.Context(), cid, notifications...)
+	// One shared budget for all post-commit Redis work of this request (see redisFollowUpTimeout).
+	followCtx, cancelFollow := redisFollowUpCtx(r.Context())
+	defer cancelFollow()
+	h.publishStatusEvents(followCtx, cid, notifications...)
 
 	queueItems := make([]QueueItem, len(notifications))
 	for i, n := range notifications {
@@ -391,7 +397,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			ScheduledAt:   n.ScheduledAt,
 		}
 	}
-	if enqErr := h.enqueueWithSpan(r.Context(), queueItems); enqErr != nil {
+	if enqErr := h.enqueueWithSpan(followCtx, queueItems); enqErr != nil {
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to enqueue batch items; reconciler will recover",
 			slog.String("batch_id", batchID.String()),
 			slog.Int("count", len(queueItems)),
@@ -712,14 +718,16 @@ func (h *handler) handleCancelNotification(w http.ResponseWriter, r *http.Reques
 
 	// Best-effort ZREM + HDEL frees Redis memory for cancelled scheduled/retrying items;
 	// PostgreSQL status='cancelled' is authoritative so worker Claim skips the row even if Redis fails.
-	if cancelErr := h.enqueuer.CancelDelayed(r.Context(), updated.ID); cancelErr != nil {
+	cleanupCtx, cancelCleanup := redisFollowUpCtx(r.Context())
+	defer cancelCleanup()
+	if cancelErr := h.enqueuer.CancelDelayed(cleanupCtx, updated.ID); cancelErr != nil {
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed best-effort delayed cleanup on cancel",
 			slog.String("notification_id", updated.ID.String()),
 			slog.String("error", cancelErr.Error()),
 		)
 	}
 	h.metrics.IncNotificationProcessed(updated.Channel.String(), domain.StatusCancelled.String())
-	h.publishStatusEvents(r.Context(), observability.CorrelationID(r.Context()), *updated)
+	h.publishStatusEvents(cleanupCtx, observability.CorrelationID(r.Context()), *updated)
 
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
 }
@@ -763,7 +771,10 @@ func (h *handler) handleRetryNotification(w http.ResponseWriter, r *http.Request
 	if tp == "" && updated.TraceParent != nil {
 		tp = *updated.TraceParent
 	}
-	if enqErr := h.enqueueWithSpan(r.Context(), []QueueItem{{
+	// One shared budget for all post-commit Redis work of this request (see redisFollowUpTimeout).
+	followCtx, cancelFollow := redisFollowUpCtx(r.Context())
+	defer cancelFollow()
+	if enqErr := h.enqueueWithSpan(followCtx, []QueueItem{{
 		ID:            updated.ID,
 		Channel:       updated.Channel,
 		Priority:      updated.Priority,
@@ -777,13 +788,13 @@ func (h *handler) handleRetryNotification(w http.ResponseWriter, r *http.Request
 	}
 	// The row left the DLQ in PostgreSQL; drop the ID from the informational Redis DLQ list too so
 	// dlq_depth reflects currently failed notifications. Best effort: PostgreSQL stays authoritative.
-	if dlqErr := h.enqueuer.ReleaseFromDLQ(r.Context(), updated.ID); dlqErr != nil {
+	if dlqErr := h.enqueuer.ReleaseFromDLQ(followCtx, updated.ID); dlqErr != nil {
 		observability.LoggerFrom(r.Context(), h.logger).Warn("failed to remove manually retried notification from DLQ list",
 			slog.String("notification_id", updated.ID.String()),
 			slog.String("error", dlqErr.Error()),
 		)
 	}
-	h.publishStatusEvents(r.Context(), cid, *updated)
+	h.publishStatusEvents(followCtx, cid, *updated)
 
 	writeJSON(w, h.logger, http.StatusOK, toNotificationResponse(*updated))
 }
@@ -979,7 +990,19 @@ func newUUIDv7() (uuid.UUID, error) {
 	return id, nil
 }
 
+// redisFollowUpTimeout bounds the best-effort Redis writes made after a PostgreSQL commit (enqueue,
+// realtime publish, delayed/DLQ cleanup). The row is already durable and the reconciler repairs any
+// missing Redis state, so during a Redis outage the API answers in ~2s instead of waiting out the
+// client's dial/read timeouts and retries (measured at ~11s by scripts/drills.sh drill 1).
+const redisFollowUpTimeout = 2 * time.Second
+
+func redisFollowUpCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, redisFollowUpTimeout)
+}
+
 func (h *handler) enqueueWithSpan(ctx context.Context, items []QueueItem) error {
+	ctx, cancel := redisFollowUpCtx(ctx)
+	defer cancel()
 	enqCtx, span := observability.Tracer("notification-api").Start(ctx, "queue.enqueue")
 	span.SetAttributes(attribute.Int("notification.count", len(items)))
 	if len(items) == 1 {
@@ -1007,7 +1030,9 @@ func (h *handler) publishStatusEvents(ctx context.Context, correlationID string,
 	for i, n := range items {
 		events[i] = realtime.NewEvent(n, now, correlationID)
 	}
-	if err := h.publisher.Publish(ctx, events...); err != nil {
+	pubCtx, cancel := redisFollowUpCtx(ctx)
+	defer cancel()
+	if err := h.publisher.Publish(pubCtx, events...); err != nil {
 		observability.LoggerFrom(ctx, h.logger).Warn("failed publishing realtime status events",
 			slog.Int("count", len(events)),
 			slog.String("error", err.Error()),
