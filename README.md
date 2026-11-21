@@ -46,6 +46,8 @@ Both commands were verified from a fresh clone with no `.env`: Docker Compose v5
 ./scripts/smoke.sh
 ```
 
+To run the whole test suite with only Docker, see [section 10](#10-testing): `./scripts/verify.sh`.
+
 | What | URL |
 |---|---|
 | REST API | http://localhost:8080 (`/api/v1/...`, `/health`, `/metrics`, `/openapi.yaml`) |
@@ -1199,10 +1201,28 @@ Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so 
 
 ## 10. Testing
 
+**Fastest way to check everything, with only Docker installed** (no Go, `make` or GCC on the host):
+
+```bash
+./scripts/verify.sh              # lint, unit, integration, then the live stack: up, smoke test, invariants
+./scripts/verify.sh --no-stack   # only the Go checks
+./scripts/test-docker.sh         # unit + integration tests only (also: unit | integration | lint)
+```
+
+Both run the Go tools inside the pinned `golang:1.27.4` image, with module and build caches in named Docker volumes, so only the first run downloads anything. Integration tests start their PostgreSQL and Redis containers through the host's Docker socket. `verify.sh` runs every step even after a failure and ends with a PASS/FAIL table and per-step log files. On Windows, run these from Git Bash or WSL. From PowerShell without bash, the unit tests are one command:
+
+```powershell
+docker run --rm -v "${PWD}:/src" -w /src golang:1.27.4 go test -race ./...
+```
+
+With Go 1.27 and `make` installed:
+
 ```bash
 make test               # unit tests with -race (no Docker; miniredis + in-memory fakes)
 make test-integration   # adds the Testcontainers suite (PostgreSQL 16 + Redis 7), -race
 make test-all           # both
+make test-docker        # the same with only Docker (scripts/test-docker.sh)
+make verify             # one-command check: lint, unit, integration, stack up, smoke, invariants (scripts/verify.sh)
 make cover              # unit coverage -> coverage.html + per-package table
 make cover-all          # unit + integration coverage per internal package
 make lint               # gofmt, go vet, golangci-lint
@@ -1226,7 +1246,7 @@ make fuzz               # Go native fuzzing of 7 parsers of untrusted input, inc
 
 Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leaves a goroutine behind fails. For stress runs (`make stress`), `docker compose -f docker-compose.yml -f docker-compose.stress.yml up -d --wait` caps the API and workers at 0.5 CPU / 256 MB and Redis at 64 MB with `noeviction`, so resource exhaustion surfaces as errors instead of silent key eviction.
 
-`make` and `-race` need Linux, macOS, WSL or CI. On native Windows without GCC, run `go test ./...` and `go test -tags=integration ./internal/integration/...`.
+`make` and `-race` need Linux, macOS, WSL or CI. On native Windows without GCC, use `./scripts/test-docker.sh`, or run `go test ./...` and `go test -tags=integration ./internal/integration/...` without `-race`.
 
 ### Integration scenarios (`internal/integration`, one Testcontainers PostgreSQL + Redis per run)
 

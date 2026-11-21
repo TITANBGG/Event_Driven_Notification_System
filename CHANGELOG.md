@@ -23,6 +23,10 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ### Tests
 
+- `scripts/verify.sh` (`make verify`): one command, only Docker needed: lint, unit, integration, Compose
+  stack up, smoke test and invariants, with a PASS/FAIL table (3m50s on a warm machine).
+- `scripts/test-docker.sh` (`make test-docker`): the Go test suite and linters in the pinned `golang`
+  image, for machines without Go, `make` or GCC.
 - Scenario scripts: channel isolation, priority starvation, provider timeout, rolling restarts, a
   constrained-resource run that fills Redis, and a 60-minute endurance soak (`make isolation priority provider-timeout rolling-test stress soak`).
 - Race scenarios: scheduled send vs cancel, template delete vs batch.
