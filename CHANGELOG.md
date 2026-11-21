@@ -12,6 +12,8 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 - Live EXT-1 run against webhook.site: one SMS, one email and one push notification were delivered on
   the first attempt with the exact `{"to","channel","content"}` body and `Idempotency-Key`,
   `X-Correlation-ID` and `traceparent` headers (README section 11).
+- Real screenshots of the Jaeger trace UI (replacing a rendered drawing), Swagger UI, the `/demo` page
+  and a Prometheus graph of the per-channel send rate under load (README sections 7, 8 and 10).
 
 ## [1.0.0] - 2026-11-21
 

@@ -1056,6 +1056,14 @@ info:
 GET /demo -> 200 text/html; charset=utf-8
 ```
 
+Swagger UI at http://localhost:8081 renders the same spec, and **Try it out** calls the API on port 8080 (CORS allows that origin):
+
+![Swagger UI listing the System and Notifications endpoints of the 1.0.0 spec](docs/images/swagger.png)
+
+The `/demo` page creates a batch and follows it over the WebSocket. Here 40 SMS went from `pending` through `processing` to `sent`, and the log shows the events as they arrived:
+
+![Demo page after a 40-item SMS batch: every row sent, WebSocket event log below the table](docs/images/demo.png)
+
 ---
 
 ## 8. Observability
@@ -1120,7 +1128,7 @@ OpenTelemetry spans cover the API request, every SQL query (`otelpgx`), the Redi
 
 ![Trace waterfall of one notification: API insert and enqueue, worker claim, provider call, retry](docs/images/trace.png)
 
-*The waterfall above was rendered from a real Jaeger trace (80 spans across `notification-api`, `notification-worker` and `notification-mockprovider`) for a notification whose first attempt failed and was retried.*
+*Jaeger UI screenshot of one notification (37 spans across `notification-api`, `notification-worker` and `notification-mockprovider`). The mock provider was set to fail half of the requests: the first attempt got a `500` (red markers), the worker recorded it and called `schedule.retry`, and the second attempt about 0.9s later ended in `MarkSent`.*
 
 ### Health checks
 
@@ -1269,6 +1277,10 @@ Flags: `-n` total, `-batch` items per request (`<= 1000`), `-concurrency` parall
 Hardware: Intel Core i7-11800H (8C/16T), 32 GB RAM, Windows 11 + Docker Desktop 29.9.3 (Linux VM: 16 vCPU, 15.5 GB); API, 2 workers, PostgreSQL, Redis and the mock provider all on the same machine.
 
 The effective rate is ~5% below the configured 100/s because a denied worker sleeps for the GCRA `RetryAfter` and then needs another Redis round trip before it can send, so slots are occasionally missed; the requirement (never more than 100/s per channel) is the hard bound and is asserted separately by integration test `g`.
+
+Prometheus during a 24,000-notification run (`sum by (channel) (rate(notifications_processed_total{status="sent"}[15s]))`): all three channels hold a flat line at about 95/s and never cross 100/s.
+
+![Prometheus graph: sms, email and push send rates plateau at about 95 per second under the 100 per second limit](docs/images/prometheus-rate-limit.png)
 
 ### CI/CD (GitHub Actions, `B-6`)
 
