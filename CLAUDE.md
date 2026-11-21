@@ -70,7 +70,7 @@ External provider = `webhook.site` (configurable via `PROVIDER_URL`; `cmd/mockpr
 - **D-3:** Docker Compose one-command setup: **BOTH** `docker-compose up` and `docker compose up` must work with zero manual steps (no `.env` required, no pre-built images, migrations run automatically).
 - **D-4:** Swagger/OpenAPI specification (`api/openapi.yaml` + Swagger UI).
 - **D-5:** Versioned database migrations (`migrations/*.up.sql` / `.down.sql`).
-- **D-6:** Test suite runnable with a single command (`make test-all` in WSL/Linux/CI; native Windows without GCC/make can run `go test ./...`).
+- **D-6:** Test suite runnable with a single command (`make test-all` in WSL/Linux/CI; with only Docker: `./scripts/test-docker.sh`, or `./scripts/verify.sh` for lint + tests + live stack smoke + invariants; native Windows without GCC/make can also run `go test ./...`).
 
 ### Timeline & Non-Functional Targets
 

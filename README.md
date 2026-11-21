@@ -1068,7 +1068,7 @@ Output:
 openapi: 3.0.3
 info:
   title: Event-Driven Notification System API
-  version: 1.0.0
+  version: 1.1.0
 GET /demo -> 200 text/html; charset=utf-8
 ```
 
