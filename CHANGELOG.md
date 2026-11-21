@@ -13,6 +13,9 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
   at least 3 characters are now always hidden (found by fuzzing).
 - A very large `Retry-After` header overflowed to a negative delay, so the hint was ignored; it is now
   clamped and capped at `RETRY_AFTER_MAX` (found by fuzzing).
+- Workers could not dequeue while Redis was at `maxmemory` (`noeviction`): `LMOVE` is a `denyoom`
+  command, so a full Redis with nothing in flight could never drain again. `dequeue.lua` now uses
+  `RPOP` + `LPUSH` (found by the 64 MB stress test; integration scenario `s`).
 - A non-upgrade `GET /api/v1/ws` returned a plain-text `426`; it now returns `426 upgrade_required`
   with the standard error envelope (found by fuzzing).
 

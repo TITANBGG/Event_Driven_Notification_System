@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -359,5 +362,62 @@ func runExtendedScenarios(t *testing.T, inf *testInfra) {
 		assert.InDelta(t, 500, lat.ProviderP50MS, 0.01)
 		assert.InDelta(t, 860, lat.ProviderP95MS, 0.01)
 		assert.InDelta(t, 892, lat.ProviderP99MS, 0.01)
+	})
+
+	t.Run("s_dequeue_and_ack_drain_while_redis_is_out_of_memory", func(t *testing.T) {
+		inf.resetState(t)
+		ctx := t.Context()
+		ids := []uuid.UUID{uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7())}
+		for _, id := range ids {
+			require.NoError(t, inf.q.Enqueue(ctx, queue.Meta{ID: id, Channel: domain.ChannelSMS, Priority: domain.PriorityNormal}))
+		}
+
+		// Fill Redis up to a small maxmemory with noeviction, the stress profile's policy.
+		info, err := inf.rdb.Info(ctx, "memory").Result()
+		require.NoError(t, err)
+		var usedMemory int64
+		for _, line := range strings.Split(info, "\r\n") {
+			if v, ok := strings.CutPrefix(line, "used_memory:"); ok {
+				usedMemory, err = strconv.ParseInt(v, 10, 64)
+				require.NoError(t, err)
+			}
+		}
+		require.Positive(t, usedMemory, "used_memory from INFO")
+		t.Cleanup(func() {
+			_ = inf.rdb.ConfigSet(context.Background(), "maxmemory", "0").Err()
+			_ = inf.rdb.FlushDB(context.Background()).Err()
+		})
+		require.NoError(t, inf.rdb.ConfigSet(ctx, "maxmemory-policy", "noeviction").Err())
+		require.NoError(t, inf.rdb.ConfigSet(ctx, "maxmemory", strconv.FormatInt(usedMemory+512*1024, 10)).Err())
+		filler := strings.Repeat("x", 4096)
+		var oomErr error
+		for i := 0; i < 10000 && oomErr == nil; i++ {
+			oomErr = inf.rdb.Set(ctx, fmt.Sprintf("filler:%d", i), filler, 0).Err()
+		}
+		require.ErrorContains(t, oomErr, "OOM", "Redis must refuse writes before the drain is tested")
+		// A few tiny keys still fit after a 4 KB value is refused; fill those too, so used > maxmemory.
+		oomErr = nil
+		for i := 0; i < 10000 && oomErr == nil; i++ {
+			oomErr = inf.rdb.Set(ctx, fmt.Sprintf("tiny:%d", i), "1", 0).Err()
+		}
+		require.ErrorContains(t, oomErr, "OOM", "even a tiny write is refused")
+		// The former LMOVE-based script is refused in exactly this state: the condition is real.
+		lmove := redis.NewScript(`return redis.call("LMOVE", KEYS[1], KEYS[2], "RIGHT", "LEFT")`)
+		require.ErrorContains(t, lmove.Run(ctx, inf.rdb, []string{queue.Key(domain.ChannelSMS, domain.PriorityNormal), "probe"}).Err(), "OOM")
+
+		// Dequeue and Ack still work, in FIFO order, so a full Redis can always drain.
+		for _, want := range ids {
+			meta, ok, err := inf.q.Dequeue(ctx, domain.ChannelSMS, "oom-worker")
+			require.NoError(t, err)
+			require.True(t, ok)
+			assert.Equal(t, want, meta.ID)
+			require.NoError(t, inf.q.Ack(ctx, "oom-worker", meta.ID))
+		}
+		_, ok, err := inf.q.Dequeue(ctx, domain.ChannelSMS, "oom-worker")
+		require.NoError(t, err)
+		assert.False(t, ok)
+		inflight, err := inf.rdb.LLen(ctx, queue.InflightKey("oom-worker")).Result()
+		require.NoError(t, err)
+		assert.Zero(t, inflight)
 	})
 }

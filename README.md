@@ -67,7 +67,7 @@ flowchart LR
     Browser["Browser /demo"] <-->|"WebSocket /api/v1/ws"| API
     API -->|"1. commit (source of truth)"| PG[("PostgreSQL 16")]
     API -->|"2. enqueue (hint)"| R[("Redis 7")]
-    R -->|"LMOVE into inflight list"| W["worker-1 / worker-2"]
+    R -->|"atomic move into inflight list"| W["worker-1 / worker-2"]
     W -->|"GCRA token per channel"| R
     W -->|"claim + fenced updates"| PG
     W -->|"POST {to, channel, content}<br/>Idempotency-Key, X-Correlation-ID, traceparent"| P["Provider<br/>(mockprovider or webhook.site)"]
@@ -103,7 +103,7 @@ sequenceDiagram
     A->>DB: BEGIN; INSERT idempotency_keys + notifications (status=pending); COMMIT
     A->>R: enqueue.lua (HSET {notif}:msg, LPUSH {notif}:q:sms:high)
     A-->>C: 202 Accepted {id, status: pending}
-    W->>R: dequeue.lua (LMOVE queue -> {notif}:inflight:worker-1)
+    W->>R: dequeue.lua (RPOP queue + LPUSH {notif}:inflight:worker-1)
     W->>R: GCRA rate limiter (wait for a token on {notif}:rl:sms)
     W->>DB: Claim: UPDATE ... SET status=processing, attempts=attempts+1 WHERE status IN (...)
     W->>P: POST {to, channel, content} + Idempotency-Key: <id>
@@ -169,7 +169,7 @@ All keys share the hash tag `{notif}`, so every multi-key Lua script touches a s
 
 | Key | Type | Purpose |
 |---|---|---|
-| `{notif}:q:{channel}:{priority}` | LIST | Ready queue of notification IDs (`LPUSH` in, `LMOVE` out = FIFO) |
+| `{notif}:q:{channel}:{priority}` | LIST | Ready queue of notification IDs (`LPUSH` in, `RPOP` out = FIFO) |
 | `{notif}:msg` | HASH | `id -> {channel, priority, correlationId, traceparent}`. An ID present here is "tracked". |
 | `{notif}:inflight:{workerId}` | LIST | IDs a worker has dequeued and not yet acknowledged |
 | `{notif}:hb:{workerId}` | STRING | Worker heartbeat, TTL 15s, refreshed every 5s |
@@ -179,9 +179,9 @@ All keys share the hash tag `{notif}`, so every multi-key Lua script touches a s
 | `{notif}:rl:{channel}` | GCRA | Distributed rate limiter state (`go-redis/redis_rate`) |
 | `notif:events` | PUB/SUB | Status events fanned out to every API replica's WebSocket hub |
 
-### Reliable queue: `LMOVE` + inflight list + heartbeat
+### Reliable queue: atomic move to an inflight list + heartbeat
 
-`dequeue.lua` moves an ID atomically from the ready queue into the worker's own inflight list. If the worker dies, the ID is not lost: it stays in `{notif}:inflight:{workerId}`. Once the worker's heartbeat key expires, reconciler step (d) moves the orphaned list back to the ready queues.
+`dequeue.lua` moves an ID atomically from the ready queue into the worker's own inflight list (`RPOP` + `LPUSH` in one script, which is `LMOVE RIGHT LEFT`; see "Redis full" in the failure matrix for why it is split). If the worker dies, the ID is not lost: it stays in `{notif}:inflight:{workerId}`. Once the worker's heartbeat key expires, reconciler step (d) moves the orphaned list back to the ready queues.
 
 A second safety net covers a live worker. If a PostgreSQL transition succeeds but the follow-up Redis write (`ack`, `schedule` or `deadletter`) fails, the ID is stuck in that worker's inflight list. The worker's inflight sweeper requeues any ID it has not been actively handling for two consecutive sweeps.
 
@@ -279,6 +279,7 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Ea
 |---|---|---|
 | **Redis down during `POST /notifications`** | Row commits to PostgreSQL as `pending`; Redis enqueue logs `warn`; API still returns `202 Accepted` (durable). `/health/ready` returns `503`. | Reconciler step `(a)` enqueues untracked stale `pending` rows once Redis recovers. |
 | **Redis down for workers** | Dequeue backs off with context-aware timer; GCRA rate limiter **fails closed** (no sends) to protect the `100/s` provider SLA. | Workers resume automatically as soon as Redis responds. |
+| **Redis full (`maxmemory`, `noeviction`)** | API enqueue fails with `OOM`, the API still answers `202` (the row is committed). Dequeue and ack keep working: `dequeue.lua` starts with `RPOP`, which is not `denyoom`, and Redis lets a script that has already written finish. | Queues drain and free memory; reconciler `(a)` re-enqueues the rows whose enqueue failed. With `LMOVE` (a `denyoom` command) as the first write, a full Redis with nothing in flight could never drain again. |
 | **Redis loses last ~1s (`AOF everysec`)** | Some IDs vanish from ready lists or `{notif}:delayed` ZSET. | Reconciler steps `(a)` (stale `pending`) and `(b)` (untracked `retrying`/`scheduled` due within 5m) restore them from PostgreSQL. |
 | **PostgreSQL down** | API create returns `503 service_unavailable`; `/health/ready` returns `503`; worker `Claim` errors schedule the item `now+1s` out of inflight. | Resumes automatically when PostgreSQL recovers. |
 | **PostgreSQL refuses connections right after the provider accepted a send** | `InsertAttempt` and `MarkSent` are retried for up to 5s with backoff, so a short outage or a full connection pool does not leave the row in `processing`. | If the database is still unavailable after 5s, the row stays `processing`; reconciler step `(c)` resets it after `VISIBILITY_TIMEOUT` and it is sent again (at-least-once, same `Idempotency-Key`). |
@@ -1248,8 +1249,9 @@ Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leave
 | `p_idempotency_20_concurrent_posts_same_key_create_exactly_one_row` | 20 simultaneous POSTs with one key: all `202`, one id, exactly one non-replayed response, one DB row |
 | `q_manual_retry_failed_to_sent` | `failed` (DLQ) -> `POST /retry` resets attempts -> `sent`; retrying a `sent` row -> `409` |
 | `r_metrics_windows_and_percentiles_from_known_rows` | Rows with known `sent_at` / `failed_at` offsets and durations: exact 1m/5m/15m counts per channel and p50/p95/p99 (e.g. p95 = 8,600 ms from 1..9 s); non-counted and older attempts excluded |
+| `s_dequeue_and_ack_drain_while_redis_is_out_of_memory` | Redis filled past a small `maxmemory` with `noeviction` (even a 1-byte `SET` and the former `LMOVE` script are refused): `Dequeue` and `Ack` still drain all 3 queued IDs in FIFO order |
 
-The full suite (18 scenarios) runs in ~30s locally and in the CI `integration` job.
+The full suite (19 scenarios) runs in ~30s locally and in the CI `integration` job.
 
 ### Fuzzing
 
@@ -1600,7 +1602,7 @@ Every item from the assignment, where it is implemented, and how it is tested. "
 | **D-3** | One-command zero-config Docker Compose (`docker compose up` & `docker-compose up`) | `docker-compose.yml`, `Dockerfile`, `.env.example` | Live Docker Compose build + `scripts/smoke.sh` | **DONE** |
 | **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
 | **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
-| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (18 scenarios), `make cover`, 10k load test | **DONE** |
+| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (19 scenarios), `make cover`, 10k load test | **DONE** |
 | **Context: burst traffic** | Flash sales / breaking news: absorb bursts without dropping or overrunning the provider | `POST /batch` (1000 items, one `CopyFrom`), Redis queues as buffer, per-channel GCRA limiter | Load test: 10,000 notifications accepted in 287ms (34,787/s), drained at ~95/s/channel with 0 failures; integration `c`, `g` | **DONE** |
 | **Context: intelligent retry** | Retry only what can succeed, back off, protect a failing provider | `internal/provider/client.go` (classification), `internal/worker/retry.go` (full jitter + `Retry-After`), `internal/worker/breaker.go` | `internal/worker/retry_test.go`, `internal/provider/client_test.go`, integration `e`, `n`, `q` | **DONE** |
 | **Context: visibility for internal teams** | Metrics, logs and traces for operators | Prometheus `/metrics` (API + workers), `slog` JSON with `correlation_id`/`trace_id`, OpenTelemetry → Jaeger | `internal/observability/*_test.go`, integration `m`, PromQL queries in section 8 run against Prometheus | **DONE** |

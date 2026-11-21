@@ -316,9 +316,9 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 
 | Key / Channel | Type | Purpose & Lifecycle |
 |---|---|---|
-| `{notif}:q:{channel}:{priority}` | `LIST` | Queue of notification IDs (`LPUSH` in, `LMOVE RIGHT→LEFT` out = FIFO) |
+| `{notif}:q:{channel}:{priority}` | `LIST` | Queue of notification IDs (`LPUSH` in, `RPOP`+`LPUSH` to inflight out = FIFO) |
 | `{notif}:msg` | `HASH` | `id -> meta JSON` (`{"id","channel","priority","correlationId","traceparent"}`); presence = **"tracked"** |
-| `{notif}:inflight:{workerId}` | `LIST` | IDs a specific worker dequeued via `LMOVE` and has not yet acked |
+| `{notif}:inflight:{workerId}` | `LIST` | IDs a specific worker dequeued (atomically, inside `dequeue.lua`) and has not yet acked |
 | `{notif}:hb:{workerId}` | `STRING` | Worker liveness heartbeat, `PX = HEARTBEAT_TTL` (`15s`), refreshed every `5s` |
 | `{notif}:delayed` | `ZSET` | Member = **notification ID ONLY**, score = due time in Unix ms (retries + scheduled sends) |
 | `{notif}:dlq` | `LIST` | IDs of failed notifications (`LTRIM 0 99999` caps at `100k`; PostgreSQL keeps full truth) |
@@ -330,7 +330,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 
 1. `enqueue.lua(id, meta, queueKey)`: if `HEXISTS msg id` → return `0`; else `HSET msg id meta` + `LPUSH queueKey id` → return `1`.
 2. `schedule.lua(id, meta, dueMs, [inflightKey])`: `HSET msg id meta`; `ZADD delayed dueMs id`; if `inflightKey` provided: `LREM inflightKey 1 id`.
-3. `dequeue.lua(inflightKey, key1, key2, key3)`: for each key in the given order: `id = LMOVE key inflightKey RIGHT LEFT`; if `id` → return `{id, HGET msg id}`. Return `nil` if all empty. *(Non-blocking; caller waits with idle backoff `50ms → 1s` using `select` on `ctx.Done()` and a timer — never `time.Sleep`.)*
+3. `dequeue.lua(inflightKey, key1, key2, key3)`: for each key in the given order: `id = RPOP key`; if `id` → `LPUSH inflightKey id` and return `{id, HGET msg id}` (= `LMOVE RIGHT LEFT`, split so the script's first write is not `denyoom`: under `maxmemory` + `noeviction` Redis refuses a script whose first write is `denyoom` but lets a script that already wrote finish, so workers keep draining a full Redis; decided 2026-11-21 after the 64 MB stress test). Return `nil` if all empty. *(Non-blocking; caller waits with idle backoff `50ms → 1s` using `select` on `ctx.Done()` and a timer — never `time.Sleep`.)*
 4. `ack.lua(inflightKey, id)`: `LREM inflightKey 1 id`; `HDEL msg id`.
 5. `deadletter.lua(inflightKey, id)`: `LREM inflightKey 1 id`; `HDEL msg id`; `LPUSH dlq id`; `LTRIM dlq 0 99999`.
 6. `requeue.lua(inflightKey)`: move every ID in `inflightKey` back to its `{notif}:q:{channel}:{priority}` (parsed from `{notif}:msg` meta) — used on graceful shutdown and for orphaned workers.
@@ -351,7 +351,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 
 ### Worker Loop (per channel, `WORKER_CONCURRENCY_PER_CHANNEL` goroutines per replica)
 
-1. `item := queue.Dequeue(ctx, channel, workerID)` (`LMOVE` into worker's inflight list). If none → idle backoff (`select` on `ctx.Done()` / timer) → `continue`.
+1. `item := queue.Dequeue(ctx, channel, workerID)` (`RPOP`+`LPUSH` into worker's inflight list). If none → idle backoff (`select` on `ctx.Done()` / timer) → `continue`.
 2. `n, ok := repo.Claim(ctx, id)` (atomically increments `attempts`).
    - If `!ok` (cancelled / already terminal / not due yet) → `queue.Ack` → `continue`.
    - On DB error → `queue.Schedule(id, now+1s, inflight)` (moves the item out of the inflight list and retries it via the delayed mover) → `continue`.
@@ -416,7 +416,7 @@ Guarded by distributed lock `{notif}:reconciler:lock` (`SET NX PX 30000`). Each 
 
 ### Inflight Sweeper (Every Worker Replica, Every `RECONCILE_INTERVAL`)
 
-Covers the gap the reconciler cannot see: a DB transition succeeded but the follow-up Redis write (`Schedule` / `Ack` / `DeadLetter`) failed, or a panic was recovered mid-item. The ID is then **tracked** in `{notif}:msg` (so `(a)`/`(b)` skip it) and parked in a **live** worker's inflight list (so `(d)` skips it). Each worker keeps an in-memory set of IDs it is actively handling; IDs in its own inflight list that are not active in **two consecutive sweeps** (covers the `LMOVE` → mark-active window) are moved back with `requeue_ids.lua`. The normal path then converges: `Claim` succeeds, or `Claim` refuses → `Ack` untracks the ID → the reconciler repairs it from PostgreSQL.
+Covers the gap the reconciler cannot see: a DB transition succeeded but the follow-up Redis write (`Schedule` / `Ack` / `DeadLetter`) failed, or a panic was recovered mid-item. The ID is then **tracked** in `{notif}:msg` (so `(a)`/`(b)` skip it) and parked in a **live** worker's inflight list (so `(d)` skips it). Each worker keeps an in-memory set of IDs it is actively handling; IDs in its own inflight list that are not active in **two consecutive sweeps** (covers the dequeue → mark-active window) are moved back with `requeue_ids.lua`. The normal path then converges: `Claim` succeeds, or `Claim` refuses → `Ack` untracks the ID → the reconciler repairs it from PostgreSQL.
 - `(e)` Delete expired `idempotency_keys` in batches of `10000`.
 - **Startup Config Guard:** `VISIBILITY_TIMEOUT >= 2*PROVIDER_TIMEOUT + 15s` — startup **fails** if violated (prevents reclaiming rows from slow-but-alive workers).
 
@@ -430,6 +430,7 @@ On `SIGINT` / `SIGTERM`: stop dequeuing immediately → allow in-flight provider
 |---|---|---|
 | Redis down during create | Row committed as `pending`, enqueue fails → still returns `202` (durable), logs `warn` | Reconciler `(a)` when Redis recovers; `/health/ready` returns `503` |
 | Redis down for workers | Dequeue errors → idle backoff; limiter unavailable → **FAIL CLOSED** (no sends) to honor `100/s` cap | Resumes automatically on Redis recovery |
+| Redis full (`maxmemory`, `noeviction`) | API enqueue fails with `OOM` → still `202` (row committed); dequeue and ack keep working (memory-neutral / freeing) | Queues drain and free memory; reconciler `(a)` re-enqueues the untracked rows |
 | Redis loses last ~1s (`AOF everysec`) | Some IDs missing from queues / `delayed` ZSET | Reconciler `(a)` and `(b)` |
 | PostgreSQL down | API create → `503`; worker `Claim` errors → `requeue` + backoff | Automatic on DB recovery |
 | PostgreSQL refuses connections after the provider accepted a send | `InsertAttempt`/`MarkSent` retried for up to `5s` | If still failing: row stays `processing`, `(c)` resets it after `VISIBILITY_TIMEOUT` and it is re-sent (at-least-once duplicate) |
