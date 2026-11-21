@@ -45,6 +45,12 @@ code bugs are pinned by regression tests, the line-ending one by the clean-room 
 - A Windows clone with `core.autocrlf=true` checked out every file with CRLF and failed `make lint`;
   `.gitattributes` now forces LF for all text files (found by the clean-room clone).
 
+### Changed
+
+- `GET /api/v1/metrics`: `successRate` and `failureRate` are `null` for a window in which a channel
+  had no sent or failed notification (they were `0`, which reads as 0% success), and the windows come
+  in chronological order `1m`, `5m`, `15m` with channels in queue order (OpenAPI updated).
+
 ### Added
 
 - `make verify` (`scripts/verify.sh`): one command, only Docker needed: lint, unit, integration,

@@ -959,30 +959,14 @@ Output:
     "inflight": 0
   },
   "windows": {
-    "15m": {
-      "email": {
-        "sent": 2,
-        "failed": 0,
-        "retrying": 0,
-        "successRate": 1,
-        "failureRate": 0
-      },
-      "push": {
-        "sent": 2,
-        "failed": 0,
-        "retrying": 0,
-        "successRate": 1,
-        "failureRate": 0
-      },
-      "sms": {
-        "sent": 5,
-        "failed": 0,
-        "retrying": 0,
-        "successRate": 1,
-        "failureRate": 0
-      }
-    },
     "1m": {
+      "sms": {
+        "sent": 5,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
       "email": {
         "sent": 2,
         "failed": 0,
@@ -992,13 +976,6 @@ Output:
       },
       "push": {
         "sent": 2,
-        "failed": 0,
-        "retrying": 0,
-        "successRate": 1,
-        "failureRate": 0
-      },
-      "sms": {
-        "sent": 5,
         "failed": 0,
         "retrying": 0,
         "successRate": 1,
@@ -1006,6 +983,13 @@ Output:
       }
     },
     "5m": {
+      "sms": {
+        "sent": 5,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
       "email": {
         "sent": 2,
         "failed": 0,
@@ -1019,9 +1003,25 @@ Output:
         "retrying": 0,
         "successRate": 1,
         "failureRate": 0
-      },
+      }
+    },
+    "15m": {
       "sms": {
         "sent": 5,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "email": {
+        "sent": 2,
+        "failed": 0,
+        "retrying": 0,
+        "successRate": 1,
+        "failureRate": 0
+      },
+      "push": {
+        "sent": 2,
         "failed": 0,
         "retrying": 0,
         "successRate": 1,
@@ -1050,6 +1050,8 @@ notifications_created_total{channel="sms",priority="normal"} 4
 http_requests_total{code="202",method="POST",route="/api/v1/notifications"} 6
 http_requests_total{code="202",method="POST",route="/api/v1/notifications/batch"} 2
 ```
+
+`successRate` and `failureRate` are `sent / (sent + failed)` and `failed / (sent + failed)`. They are `null` for a window in which a channel had neither, so an idle channel does not read as 0% success.
 
 ### OpenAPI spec and demo page (`GET /openapi.yaml`, `GET /demo`) — `D-4, B-4`
 

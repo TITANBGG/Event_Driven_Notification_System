@@ -1010,9 +1010,36 @@ components:
         successRate:
           type: number
           format: double
+          nullable: true
+          description: sent / (sent + failed); null when the window has neither, so no traffic does not read as 0% success.
         failureRate:
           type: number
           format: double
+          nullable: true
+          description: failed / (sent + failed); null when the window has neither.
+
+    WindowChannels:
+      type: object
+      required: [sms, email, push]
+      properties:
+        sms:
+          $ref: "#/components/schemas/WindowChannelMetrics"
+        email:
+          $ref: "#/components/schemas/WindowChannelMetrics"
+        push:
+          $ref: "#/components/schemas/WindowChannelMetrics"
+
+    MetricsWindows:
+      type: object
+      description: Trailing windows ending at generatedAt, always all three, in this order.
+      required: ["1m", "5m", "15m"]
+      properties:
+        1m:
+          $ref: "#/components/schemas/WindowChannels"
+        5m:
+          $ref: "#/components/schemas/WindowChannels"
+        15m:
+          $ref: "#/components/schemas/WindowChannels"
 
     LatencyPercentiles:
       type: object
@@ -1047,11 +1074,7 @@ components:
         queues:
           $ref: "#/components/schemas/QueuesSnapshot"
         windows:
-          type: object
-          additionalProperties:
-            type: object
-            additionalProperties:
-              $ref: "#/components/schemas/WindowChannelMetrics"
+          $ref: "#/components/schemas/MetricsWindows"
         latencyMs:
           $ref: "#/components/schemas/LatencyMetrics"
 

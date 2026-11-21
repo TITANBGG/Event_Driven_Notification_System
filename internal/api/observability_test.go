@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -167,11 +168,26 @@ func TestMetricsSnapshotJSONShapeAndTwoSecondCache(t *testing.T) {
 	assert.Equal(t, now, snap.GeneratedAt)
 	assert.Equal(t, int64(1), snap.Queues.SMS.High)
 	assert.Equal(t, int64(1), snap.Queues.Push.Normal)
-	assert.Equal(t, int64(1), snap.Windows["1m"]["sms"].Sent)
-	assert.Equal(t, int64(1), snap.Windows["1m"]["sms"].Failed)
-	assert.Equal(t, 0.5, snap.Windows["1m"]["sms"].SuccessRate)
-	assert.Equal(t, 0.5, snap.Windows["1m"]["sms"].FailureRate)
-	assert.Equal(t, int64(1), snap.Windows["1m"]["email"].Retrying)
+	sms1m := snap.Windows.OneMinute.SMS
+	assert.Equal(t, int64(1), sms1m.Sent)
+	assert.Equal(t, int64(1), sms1m.Failed)
+	require.NotNil(t, sms1m.SuccessRate)
+	require.NotNil(t, sms1m.FailureRate)
+	assert.Equal(t, 0.5, *sms1m.SuccessRate)
+	assert.Equal(t, 0.5, *sms1m.FailureRate)
+	assert.Equal(t, int64(1), snap.Windows.OneMinute.Email.Retrying)
+	// Nothing sent or failed: the rates are unknown (null), not 0% success.
+	assert.Nil(t, snap.Windows.OneMinute.Email.SuccessRate, "retrying only: no outcome to rate")
+	assert.Nil(t, snap.Windows.OneMinute.Push.SuccessRate)
+	assert.Nil(t, snap.Windows.OneMinute.Push.FailureRate)
+	body := rec1.Body.String()
+	assert.Contains(t, body, `"successRate":null`)
+	// Windows in chronological order and channels in queue order, not alphabetical map order.
+	assert.Less(t, strings.Index(body, `"1m":`), strings.Index(body, `"5m":`))
+	assert.Less(t, strings.Index(body, `"5m":`), strings.Index(body, `"15m":`))
+	win := body[strings.Index(body, `"windows":`):]
+	assert.Less(t, strings.Index(win, `"sms":`), strings.Index(win, `"email":`))
+	assert.Less(t, strings.Index(win, `"email":`), strings.Index(win, `"push":`))
 	assert.InDelta(t, 400.0, snap.LatencyMS.EndToEnd.P50, 0.1)
 	assert.InDelta(t, 95.0, snap.LatencyMS.ProviderCall.P50, 0.1)
 

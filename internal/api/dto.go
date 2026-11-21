@@ -81,12 +81,29 @@ type QueuesSnapshotResponse struct {
 }
 
 // WindowChannelStatsResponse holds outcome counts and rates for a channel in a trailing time window.
+// The rates are null when the window has no sent or failed notification: 0 would read as "every
+// delivery failed" on a dashboard, while the truth is "nothing to measure".
 type WindowChannelStatsResponse struct {
-	Sent        int64   `json:"sent"`
-	Failed      int64   `json:"failed"`
-	Retrying    int64   `json:"retrying"`
-	SuccessRate float64 `json:"successRate"`
-	FailureRate float64 `json:"failureRate"`
+	Sent        int64    `json:"sent"`
+	Failed      int64    `json:"failed"`
+	Retrying    int64    `json:"retrying"`
+	SuccessRate *float64 `json:"successRate"`
+	FailureRate *float64 `json:"failureRate"`
+}
+
+// WindowChannelsResponse holds one window's stats per channel, in the same order as the queues.
+type WindowChannelsResponse struct {
+	SMS   WindowChannelStatsResponse `json:"sms"`
+	Email WindowChannelStatsResponse `json:"email"`
+	Push  WindowChannelStatsResponse `json:"push"`
+}
+
+// WindowsResponse holds the trailing windows in chronological order (a map would serialize as
+// 15m, 1m, 5m).
+type WindowsResponse struct {
+	OneMinute      WindowChannelsResponse `json:"1m"`
+	FiveMinutes    WindowChannelsResponse `json:"5m"`
+	FifteenMinutes WindowChannelsResponse `json:"15m"`
 }
 
 // PercentilesResponse holds p50/p95/p99 latency percentiles in milliseconds.
@@ -104,10 +121,10 @@ type LatencyMetricsResponse struct {
 
 // MetricsSnapshotResponse is the JSON body returned by GET /api/v1/metrics.
 type MetricsSnapshotResponse struct {
-	GeneratedAt time.Time                                        `json:"generatedAt"`
-	Queues      QueuesSnapshotResponse                           `json:"queues"`
-	Windows     map[string]map[string]WindowChannelStatsResponse `json:"windows"`
-	LatencyMS   LatencyMetricsResponse                           `json:"latencyMs"`
+	GeneratedAt time.Time              `json:"generatedAt"`
+	Queues      QueuesSnapshotResponse `json:"queues"`
+	Windows     WindowsResponse        `json:"windows"`
+	LatencyMS   LatencyMetricsResponse `json:"latencyMs"`
 }
 
 // NotificationResponse is the public HTTP representation of a notification.

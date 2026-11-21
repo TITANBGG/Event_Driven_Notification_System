@@ -45,33 +45,17 @@ func (h *handler) handleMetricsSnapshot(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	channels := []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}
-	windows := make(map[string]map[string]WindowChannelStatsResponse, 3)
-	for _, win := range []string{"1m", "5m", "15m"} {
-		perChannel := make(map[string]WindowChannelStatsResponse, 3)
-		for _, ch := range channels {
-			perChannel[ch.String()] = WindowChannelStatsResponse{}
-		}
-		windows[win] = perChannel
-	}
+	var windows WindowsResponse
 	for _, row := range windowRows {
-		perChannel, ok := windows[row.Window]
-		if !ok {
-			perChannel = make(map[string]WindowChannelStatsResponse, 3)
-			windows[row.Window] = perChannel
+		stats := windows.slot(row.Window, row.Channel)
+		if stats == nil {
+			continue // a window or channel this API version does not report
 		}
-		var successRate, failureRate float64
-		total := row.SentCount + row.FailedCount
-		if total > 0 {
-			successRate = roundMetricRatio(float64(row.SentCount) / float64(total))
-			failureRate = roundMetricRatio(float64(row.FailedCount) / float64(total))
-		}
-		perChannel[row.Channel.String()] = WindowChannelStatsResponse{
-			Sent:        row.SentCount,
-			Failed:      row.FailedCount,
-			Retrying:    row.RetryingCount,
-			SuccessRate: successRate,
-			FailureRate: failureRate,
+		*stats = WindowChannelStatsResponse{Sent: row.SentCount, Failed: row.FailedCount, Retrying: row.RetryingCount}
+		if total := row.SentCount + row.FailedCount; total > 0 {
+			success := roundMetricRatio(float64(row.SentCount) / float64(total))
+			failure := roundMetricRatio(float64(row.FailedCount) / float64(total))
+			stats.SuccessRate, stats.FailureRate = &success, &failure
 		}
 	}
 
@@ -106,6 +90,31 @@ func (h *handler) handleMetricsSnapshot(w http.ResponseWriter, r *http.Request) 
 	h.metricsMu.Unlock()
 
 	writeJSON(w, h.logger, http.StatusOK, snapshot)
+}
+
+// slot returns the stats cell for a window and channel, or nil for one the response does not have.
+func (w *WindowsResponse) slot(window string, ch domain.Channel) *WindowChannelStatsResponse {
+	var perChannel *WindowChannelsResponse
+	switch window {
+	case "1m":
+		perChannel = &w.OneMinute
+	case "5m":
+		perChannel = &w.FiveMinutes
+	case "15m":
+		perChannel = &w.FifteenMinutes
+	default:
+		return nil
+	}
+	switch ch {
+	case domain.ChannelSMS:
+		return &perChannel.SMS
+	case domain.ChannelEmail:
+		return &perChannel.Email
+	case domain.ChannelPush:
+		return &perChannel.Push
+	default:
+		return nil
+	}
 }
 
 func mapChannelQueueDepths(depths queue.MetricsDepths, ch domain.Channel) ChannelQueueDepthsResponse {

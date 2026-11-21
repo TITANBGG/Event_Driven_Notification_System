@@ -501,7 +501,7 @@ Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_c
     "inflight": 40
   },
   "windows": {
-    "1m": {"sms": {"sent": 5800, "failed": 12, "retrying": 40, "successRate": 0.998, "failureRate": 0.002}},
+    "1m": {"sms": {"sent": 5800, "failed": 12, "retrying": 40, "successRate": 0.998, "failureRate": 0.002}},  // rates are null when a channel had no sent or failed notification in the window
     "5m": {},
     "15m": {}
   },
