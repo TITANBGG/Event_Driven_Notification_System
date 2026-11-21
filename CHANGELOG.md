@@ -7,6 +7,12 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+### Documentation
+
+- Live EXT-1 run against webhook.site: one SMS, one email and one push notification were delivered on
+  the first attempt with the exact `{"to","channel","content"}` body and `Idempotency-Key`,
+  `X-Correlation-ID` and `traceparent` headers (README section 11).
+
 ## [1.0.0] - 2026-11-21
 
 First complete release of the Event-Driven Notification System for the Insider One Software Engineer

@@ -1326,6 +1326,16 @@ To send to the real external provider used in the assignment, `webhook.site`:
    ```
 4. Create a notification (section 7). The request appears on webhook.site with the JSON body and the `Idempotency-Key`, `X-Correlation-ID` and `traceparent` headers.
 
+**Verified on 2026-11-21.** With the response configured as in step 2, the workers were pointed at a webhook.site URL and one notification per channel was created (fake recipients). All three reached `sent` on the first attempt with `providerMessageId: "webhook-site-1"` taken from the `202` body. webhook.site recorded exactly three `POST` requests with these bodies:
+
+```json
+{"to":"+905551234567","channel":"sms","content":"EXT-1 proof: your order has shipped"}
+{"to":"test@example.com","channel":"email","content":"EXT-1 proof: your order has shipped"}
+{"to":"fake-device-token-ext1-proof","channel":"push","content":"EXT-1 proof: your order has shipped"}
+```
+
+Each request carried `Content-Type: application/json`, `Idempotency-Key: <notification id>`, the client's `X-Correlation-ID` and a W3C `traceparent`. The optional `subject` and `title` were not sent because `PROVIDER_EXTENDED_FIELDS` defaults to `false`, which keeps the body exactly as in the assignment.
+
 webhook.site's free tier limits the number of requests, so use the mock provider for load tests. webhook.site does not deduplicate on `Idempotency-Key`, so a provider timeout followed by a retry can produce two requests there (see section 4).
 
 ---
@@ -1367,7 +1377,7 @@ Every item from the assignment, where it is implemented, and how it is tested. "
 | **FR-4.1** | Real-time metrics (`/metrics` Prometheus custom registry + `/api/v1/metrics` 2s cached JSON) | `internal/observability/metrics.go`, `internal/api/handlers_metrics.go`, `internal/api/middleware/metrics.go` | `internal/observability/metrics_test.go`, `internal/api/observability_test.go` | **DONE** |
 | **FR-4.2** | Structured JSON logging (`log/slog`) with `correlation_id` propagation & PII masking | `internal/observability/logger.go`, `internal/api/middleware/correlation.go`, `internal/api/middleware/logger.go` | `internal/observability/logger_test.go`, `internal/api/middleware/middleware_test.go`, `internal/worker/observability_hooks_test.go` | **DONE** |
 | **FR-4.3** | Health check endpoints (`/health/live`, `/health/ready`, `/health` with 1s DB/Redis timeout & `503`) | `internal/api/handlers_system.go`, `cmd/worker/main.go`, `cmd/healthcheck/main.go` | `internal/api/observability_test.go`, `cmd/healthcheck/main_test.go`, `scripts/smoke.sh` | **DONE** |
-| **EXT-1** | External provider HTTP contract (`POST {to,channel,content}` -> `202 {messageId,status,timestamp}`) | `internal/provider/client.go`, `cmd/mockprovider/main.go` | `internal/provider/client_test.go`, `cmd/mockprovider/main_test.go`, `TestCoreIntegration/a_single_notification_end_to_end` | **DONE** |
+| **EXT-1** | External provider HTTP contract (`POST {to,channel,content}` -> `202 {messageId,status,timestamp}`) | `internal/provider/client.go`, `cmd/mockprovider/main.go` | `internal/provider/client_test.go`, `cmd/mockprovider/main_test.go`, `TestCoreIntegration/a_single_notification_end_to_end`; live webhook.site run (section 11) | **DONE** |
 | **B-1** | Failure handling (per-channel `gobreaker/v2`, DLQ, 5-step Reconciler, Inflight Sweeper, manual `/retry`) | `internal/worker/breaker.go`, `internal/worker/reconciler.go`, `internal/worker/worker.go` | `internal/worker/breaker_test.go`, `internal/worker/reconciler_test.go`, `internal/worker/stranded_repair_test.go`, `TestCoreIntegration/h_reconciler_repairs_untracked_pending_and_simulated_redis_loss`, `n_circuit_breaker_opens_on_503_outage_without_burning_attempts_then_recovers`, `o_worker_crash_mid_batch_recovered_by_reconciler_with_bounded_duplicates`, `q_manual_retry_failed_to_sent` | **DONE** |
 | **B-2** | Scheduled notifications (`scheduledAt` RFC3339 -> UTC, shared `{notif}:delayed` ZSET + `Claim` clock-skew guard, cancel-before-due) | `internal/api/handlers_notifications.go`, `internal/domain/validation.go`, `internal/queue/queue.go`, `internal/worker/reconciler.go` | `internal/api/handlers_test.go`, `internal/worker/worker_test.go`, `TestCoreIntegration/j_scheduled_due_in_2s_sent_after_due_and_cancelled_never_sent` | **DONE** |
 | **B-3** | Message templates with safe `{{variable}}` substitution, preview endpoint, soft-delete, and render-at-create | `internal/template/template.go`, `internal/api/handlers_templates.go`, `migrations/000002_templates.up.sql` | `internal/template/template_test.go`, `internal/api/handlers_test.go`, `TestCoreIntegration/k_template_create_preview_and_batch_personalized_sms_delivery` | **DONE** |
