@@ -1223,6 +1223,38 @@ Both run the Go tools inside the pinned `golang:1.27.4` image, with module and b
 docker run --rm -v "${PWD}:/src" -w /src golang:1.27.4 go test -race ./...
 ```
 
+### Test program summary
+
+After v1.0.0 the system went through a test program aimed at breaking it, run against the live Compose stack. Every scenario also has to prove that its triggering condition actually happened. A cancel race in which no cancel won, or a shutdown with nothing in flight, counts as a failure, not a pass. The subsections below have the details.
+
+| Area | What was done | Outcome |
+|---|---|---|
+| Unit, integration, fuzz | 134 test functions, 20 Testcontainers scenarios, 7 fuzz targets (~70M executions) | all pass; fuzzing found 3 bugs (below) |
+| Throughput and rate limit | 100k flash sale; 250k into a 64 MB Redis; 60-minute soak at ~250/s | busiest 1 s window ≤ 98 per channel in every run |
+| Concurrency | 6 race scenarios (cancel vs send, batch cancel, idempotency, manual retry, scheduled cancel, template delete) | 0 cancelled sends, 0 double creates |
+| Failures | Worker/Redis/PostgreSQL kills, slow and failing provider, timeouts beyond `PROVIDER_TIMEOUT`, rolling restarts, graceful shutdown | 0 lost; duplicates only from `SIGKILL` mid-send (at-least-once, documented) |
+| Isolation and priority | 30k SMS backlog vs email/push; 2x-capacity high traffic vs low | email/push p95 1.3 s; low kept 9–10% |
+| Scale and endurance | 2M-row database; 60-minute soak with outages and 50 WebSocket readers | list queries 3.5–12 ms; flat goroutines, FDs and heap |
+
+Bugs this found, all fixed (1–11 pinned by regression tests, 12 by the clean-room clone check):
+
+| # | Bug | Found by | Fix |
+|---|---|---|---|
+| 1 | A fixed DB pool of 35 per worker exhausted PostgreSQL at 3 replicas | scaling test | `DB_MAX_CONNS`, smaller default (`bb60d93`) |
+| 2 | Rate limit overrun to 107/s per channel when a DB stall bunched sends | 6-replica stress | rate-limit token taken after `Claim` (`bb60d93`) |
+| 3 | A DB blip right after the provider accepted a send led to a re-send | failure drill | post-send writes retried for 5 s (`bb60d93`) |
+| 4 | A 1,000-item batch made one 28,013-span trace (~145 MB) and filled Docker's memory | chaos test | batch items linked, not nested; Jaeger capped (`2582308`) |
+| 5 | WebSocket hub dropped fast readers during batch bursts | WebSocket flood | per-client queues, progress-based drops (`52c1451`) |
+| 6 | `/api/v1/metrics` took 1.7 s at 2M rows | data growth | one scan per source (`c250ce3`) |
+| 7 | Log masking showed some phone numbers and tokens in full | fuzzing | at least 3 characters always hidden (`fcc91f4`) |
+| 8 | A huge `Retry-After` overflowed to a negative delay | fuzzing | clamped (`fcc91f4`) |
+| 9 | Non-upgrade `GET /api/v1/ws` answered plain-text `426` | fuzzing | standard error envelope (`fcc91f4`) |
+| 10 | Workers could not dequeue while Redis was full | 64 MB Redis stress | `RPOP`+`LPUSH` instead of `LMOVE` (`e83c07e`) |
+| 11 | Expired idempotency key cleanup scanned the whole table (378 ms at 2.25M keys) | `EXPLAIN` at 2M rows | primary-key probes, 29 ms (`f985544`) |
+| 12 | A Windows clone (`autocrlf=true`) failed `make lint` on every Go file | clean-room clone | `.gitattributes` forces LF |
+
+The test tools had bugs of their own. Several early scenarios passed without testing anything, and the invariants checker ran for 20 minutes at 500k keys. Each was fixed and is described in its subsection.
+
 With Go 1.27 and `make` installed:
 
 ```bash

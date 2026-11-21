@@ -1,0 +1,3 @@
+# README section 7: "dGhlIHNhbXBsZSBub25jZQ==" is base64("the sample nonce"), the example
+# Sec-WebSocket-Key from RFC 6455 section 1.3, used in a curl handshake example. Not a secret.
+b2782d2b5c361445d15e45dbe4e5868739829b80:README.md:generic-api-key:874

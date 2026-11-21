@@ -7,43 +7,75 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-21
+
+A test program aimed at breaking the system: fuzzing, race storms, chaos, constrained resources,
+2 million rows, a 60-minute soak and a clean-room clone. It found 12 bugs, all fixed below; the 11
+code bugs are pinned by regression tests, the line-ending one by the clean-room check. README section 10 opens with a summary table.
+
 ### Fixed
 
+- Rate limit: with the token taken before `Claim`, a DB pool stall bunched sends to 107/s per channel.
+  The token is now taken right before the provider call, and the claim is handed back without burning
+  an attempt if the wait would outlive the lease.
+- A short DB blip right after the provider accepted a send left the row `processing`, and the
+  reconciler re-sent it. `InsertAttempt` and `MarkSent` now retry for up to 5 s; a lost lease is never retried.
+- A fixed pool of 35 connections per worker exhausted PostgreSQL at 3 replicas. Pool size is now
+  `DB_MAX_CONNS` (auto: API 20, worker 10).
+- One 1,000-item batch produced a 28,013-span trace (~145 MB in Jaeger) and long runs filled Docker's
+  memory. Batch items now start their own trace linked to the request span; Jaeger is capped
+  (`MEMORY_MAX_TRACES=20000`, `mem_limit: 1536m`).
+- The WebSocket hub dropped fast readers during batch bursts (fixed 64-slot buffers). Each client now
+  has a queue that grows on demand and is dropped only when it stops making progress; events are
+  encoded once.
+- Workers could not dequeue while Redis was at `maxmemory` (`noeviction`): `LMOVE` is a `denyoom`
+  command, so a full Redis with nothing in flight could never drain again. `dequeue.lua` now uses
+  `RPOP` + `LPUSH` (integration scenario `s`).
+- The reconciler's expired idempotency key cleanup scanned the whole key table on every batch
+  (378 ms at 2.25M keys, growing with the table); it now probes the primary key (29 ms at any size;
+  integration scenario `t`).
+- `/api/v1/metrics` took 1.7 s at 2M rows; window counts and percentiles now use one scan per source
+  (integration scenario `r`).
 - Log masking revealed 10-character phone numbers in full and 8 of 9 characters of short push tokens;
   at least 3 characters are now always hidden (found by fuzzing).
 - A very large `Retry-After` header overflowed to a negative delay, so the hint was ignored; it is now
   clamped and capped at `RETRY_AFTER_MAX` (found by fuzzing).
-- Workers could not dequeue while Redis was at `maxmemory` (`noeviction`): `LMOVE` is a `denyoom`
-  command, so a full Redis with nothing in flight could never drain again. `dequeue.lua` now uses
-  `RPOP` + `LPUSH` (found by the 64 MB stress test; integration scenario `s`).
-- The reconciler's expired idempotency key cleanup scanned the whole key table on every batch
-  (378 ms at 2.25M keys, growing with the table); it now probes the primary key (29 ms at any size).
 - A non-upgrade `GET /api/v1/ws` returned a plain-text `426`; it now returns `426 upgrade_required`
   with the standard error envelope (found by fuzzing).
+- A Windows clone with `core.autocrlf=true` checked out every file with CRLF and failed `make lint`;
+  `.gitattributes` now forces LF for all text files (found by the clean-room clone).
+
+### Added
+
+- `make verify` (`scripts/verify.sh`): one command, only Docker needed: lint, unit, integration,
+  Compose stack up, smoke test and invariants, with a PASS/FAIL table.
+- `make test-docker` (`scripts/test-docker.sh`): the Go tests and linters in the pinned `golang`
+  image, for machines without Go, `make` or GCC.
+- `DB_MAX_CONNS` setting and `db_pool_*` Prometheus metrics.
+- Mock provider `POST /config` to change its fault profile at runtime without losing `/stats`.
 
 ### Tests
 
-- Soak test (`make soak`): 60 minutes at ~250/s with 50 WebSocket readers and a 30 s provider outage
-  every 10 minutes; flat goroutines, FDs and heap, 898,120/898,120 sent, no accumulation across outages.
-  `wsflood -hold` keeps WebSocket readers open for a soak.
-- `scripts/verify.sh` (`make verify`): one command, only Docker needed: lint, unit, integration, Compose
-  stack up, smoke test and invariants, with a PASS/FAIL table (3m50s on a warm machine).
-- `scripts/test-docker.sh` (`make test-docker`): the Go test suite and linters in the pinned `golang`
-  image, for machines without Go, `make` or GCC.
-- Scenario scripts: channel isolation, priority starvation, provider timeout, rolling restarts, a
-  constrained-resource run that fills Redis, and a 60-minute endurance soak (`make isolation priority provider-timeout rolling-test stress soak`).
-- Race scenarios: scheduled send vs cancel, template delete vs batch.
-- `invariants.sh` streams provider `/stats` directly to a temp file (`--max-time 60`) and parses it
-  in linear time (fixing a 15s shell-variable buffering timeout at ~900k keys / ~40 MB, and taking ~33s instead of 20+ minutes at 500k keys).
-- Fuzz targets for PII masking, `Retry-After` parsing and the HTTP API (7 targets, ~70M executions).
+- `goleak` goroutine-leak check in every test package; 7 fuzz targets (~70M executions).
+- Integration scenarios `r`, `s`, `t` (20 in total).
+- Live scenario scripts, each failing when its triggering condition did not happen:
+  - `races.sh`: 6 concurrent races.
+  - `chaos.sh`: kills, Redis loss and a PostgreSQL stop under sustained load.
+  - `shutdown.sh`: graceful stops and `--rolling` restarts.
+  - `isolation.sh` and `priority.sh`.
+  - `provider-timeout.sh`.
+  - `stress.sh`: 64 MB Redis.
+  - `soak.sh`: 60 minutes with provider outages and 50 WebSocket readers.
+  - `ws-boundaries.sh`.
+- `invariants.sh` (PostgreSQL-backed, linear-time provider stats parsing) and `ratecheck.sh` (busiest
+  sliding 1 s window per channel).
 
 ### Documentation
 
-- Live EXT-1 run against webhook.site: one SMS, one email and one push notification were delivered on
-  the first attempt with the exact `{"to","channel","content"}` body and `Idempotency-Key`,
-  `X-Correlation-ID` and `traceparent` headers (README section 11).
-- Real screenshots of the Jaeger trace UI (replacing a rendered drawing), Swagger UI, the `/demo` page
-  and a Prometheus graph of the per-channel send rate under load (README sections 7, 8 and 10).
+- README section 10: test program summary, and results for every scenario above.
+- Quick start says the default provider is the bundled mock and how to switch to webhook.site.
+- Live EXT-1 run against webhook.site for all three channels (README section 11).
+- Real screenshots of Jaeger, Swagger UI, the `/demo` page and Prometheus.
 
 ## [1.0.0] - 2026-11-21
 

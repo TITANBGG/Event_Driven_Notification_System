@@ -1,4 +1,8 @@
-*.mod text eol=lf
-*.sum text eol=lf
-*.sh text eol=lf
+# Check out every text file with LF, whatever the client's core.autocrlf: gofmt, golangci-lint and the
+# shell scripts require LF, and a Windows clone with autocrlf=true otherwise fails `make lint` on every
+# Go file (found by the clean-room check, 2026-11-21).
+* text=auto eol=lf
 
+*.png binary
+*.jpg binary
+*.ico binary
