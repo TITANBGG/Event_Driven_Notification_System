@@ -289,6 +289,19 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Ea
 | **Client retries `POST` after network drop** | `idempotency_keys` lookup matches key + SHA-256 request hash. | Returns original `202` resource with `Idempotent-Replayed: true` header. |
 | **Cancel vs. Worker race** | Both execute atomic conditional SQL `UPDATE ... WHERE id=$1 AND status IN (...)`. | Whichever transaction commits first wins; loser sees `0` rows (`409 Conflict` for API cancel, or `claimed=false -> Ack` for worker). |
 
+
+### Verified failure drills
+
+`scripts/drills.sh` (`make drills`) runs these against the live Compose stack: it breaks one dependency, checks the documented behavior, restores the stack and prints PASS/FAIL with measured times. Results from 2026-11-21, on the hardware listed in section 10:
+
+| Drill | What it does | Result |
+|---|---|---|
+| 1. Redis down during create | `docker compose stop redis`, then `POST` a notification | `202` in ~3s (all post-commit Redis work shares one 2s budget), `/health/ready` = `503`; sent 36s after Redis restarted (reconciler step a: `PENDING_STALE_AFTER` 30s + cycle) |
+| 2. PostgreSQL down | `docker compose stop postgres`, then `POST` | `503 service_unavailable`, `/health/ready` = `503`; after restart a new notification was sent within 1s |
+| 3. Worker SIGKILL mid-batch | 300 SMS with 200ms provider latency, `docker compose kill worker-1` after 1s | 300/300 sent 64s after the kill (orphaned inflight list requeued after the heartbeat expired, abandoned `processing` rows reclaimed after `VISIBILITY_TIMEOUT`); 4 duplicate provider calls, i.e. sends in flight at the moment of the kill, all with the same `Idempotency-Key` |
+| 4. Provider outage | Mock provider returns 500 for everything, 40 SMS | Breaker open (`circuit_breaker_state=2`) 6s into the outage, 0 notifications failed; 40/40 sent 25s after the provider recovered |
+| 5. Redis data loss | `FLUSHALL` while a 500-SMS batch is being delivered (138 already sent) | 500/500 sent 34s later, rebuilt from PostgreSQL by the reconciler; 0 duplicates |
+
 ---
 
 ## 6. Alternatives and scaling to 100M/day
@@ -1181,6 +1194,7 @@ make cover              # unit coverage -> coverage.html + per-package table
 make cover-all          # unit + integration coverage per internal package
 make lint               # gofmt, go vet, golangci-lint
 make load               # 2,000-notification load test against the running stack
+make drills             # live failure drills against the running stack (~5 min, section 5)
 ```
 
 `make` and `-race` need Linux, macOS, WSL or CI. On native Windows without GCC, run `go test ./...` and `go test -tags=integration ./internal/integration/...`.

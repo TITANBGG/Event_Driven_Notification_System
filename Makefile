@@ -4,7 +4,7 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
-.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke load run-api run-worker
+.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker
 
 up:
 	$(COMPOSE) up --build -d
@@ -62,6 +62,10 @@ sqlc:
 
 smoke:
 	./scripts/smoke.sh
+
+# Live failure drills (Redis/PostgreSQL down, worker SIGKILL, provider outage, Redis FLUSHALL).
+drills:
+	./scripts/drills.sh
 
 load:
 	go run ./cmd/loadgen -n 2000
