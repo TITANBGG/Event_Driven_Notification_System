@@ -1251,8 +1251,9 @@ Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leave
 | `q_manual_retry_failed_to_sent` | `failed` (DLQ) -> `POST /retry` resets attempts -> `sent`; retrying a `sent` row -> `409` |
 | `r_metrics_windows_and_percentiles_from_known_rows` | Rows with known `sent_at` / `failed_at` offsets and durations: exact 1m/5m/15m counts per channel and p50/p95/p99 (e.g. p95 = 8,600 ms from 1..9 s); non-counted and older attempts excluded |
 | `s_dequeue_and_ack_drain_while_redis_is_out_of_memory` | Redis filled past a small `maxmemory` with `noeviction` (even a 1-byte `SET` and the former `LMOVE` script are refused): `Dequeue` and `Ack` still drain all 3 queued IDs in FIFO order |
+| `t_expired_idempotency_keys_deleted_in_bounded_batches_live_keys_kept` | 25 expired + 5 live keys, batch limit 10: deletes 10, 10, 5, 0; the 5 live keys stay |
 
-The full suite (19 scenarios) runs in ~30s locally and in the CI `integration` job.
+The full suite (20 scenarios) runs in ~30s locally and in the CI `integration` job.
 
 ### Fuzzing
 
@@ -1488,6 +1489,18 @@ A separate database was seeded with 2,000,000 notifications (1,000 batches of 1,
 
 Every list query used its composite index, and 30 repeated calls showed no slowdown when PostgreSQL switches prepared statements to a generic plan. The metrics snapshot was the outlier: its window counts ran 27 correlated subqueries and its latency query 6 separate percentile scans, each over the last 15 minutes. With the 2s cache, every API replica would spend most of a CPU core on it. The rewrite reads each outcome once (the 1m and 5m windows are `FILTER`s of the 15m scan) and computes p50/p95/p99 with one `percentile_cont(ARRAY[...])` per source. Run side by side in one transaction on the same data, the old and new queries returned identical results, and the time dropped from 0.8–1.6 s to 127–144 ms (window counts) and from 1.5–1.7 s to 0.53–0.59 s (percentiles). The rest is sorting ~280k rows; at higher volume these numbers should come from Prometheus histograms instead (section 12). Integration scenario `r` pins both queries to hand-computed answers.
 
+**Reconciler scans on the same 2M rows.** To give each scan real work, the growth database got 2,000 stale `pending`, 2,000 abandoned `processing` and 2,000 due `retrying` rows, plus 2.25M idempotency keys (50,000 expired). Each query was run as a prepared statement with `EXPLAIN ANALYZE`, once with a custom plan and once with a forced generic plan:
+
+| Reconciler query (page of 1,000) | Plan | Time |
+|---|---|---|
+| (a) `FindStalePending` | index scan on the partial `idx_notifications_reconciler` | 3.3–6.6 ms |
+| (b) `FindDelayedDueSoon` | same partial index | 2.0–5.2 ms |
+| (c) `FindAbandonedProcessing` | same partial index | 1.2 ms |
+| (e) `DeleteExpiredIdempotencyKeys` (10,000) | **was:** hash semi join over a sequential scan of the whole key table | **378 ms** at 2.25M keys, growing with the table |
+| | **now:** `key = ANY(ARRAY(subquery))`, primary-key probes | **29–37 ms**, independent of table size |
+
+The partial index holds only non-terminal rows, so the scans cost the same whatever the size of the `sent` history. The key cleanup did not. With `IN (SELECT ... LIMIT)` the planner hash-joined the 10,000 expired keys against every key in the table. With a 24-hour TTL and an `Idempotency-Key` on most requests, the table holds a day of traffic (tens of millions of rows at the stated volume), and the reconciler would have scanned all of it every 15 seconds. Integration scenario `t` covers the rewritten query (bounded batches, live keys kept).
+
 ### CI/CD (GitHub Actions, `B-6`)
 
 `.github/workflows/ci.yml` runs on every branch push and pull request (`permissions: contents: read`, superseded runs on the same ref are cancelled):
@@ -1617,7 +1630,7 @@ Every item from the assignment, where it is implemented, and how it is tested. "
 | **D-3** | One-command zero-config Docker Compose (`docker compose up` & `docker-compose up`) | `docker-compose.yml`, `Dockerfile`, `.env.example` | Live Docker Compose build + `scripts/smoke.sh` | **DONE** |
 | **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
 | **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
-| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (19 scenarios), `make cover`, 10k load test | **DONE** |
+| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (20 scenarios), `make cover`, 10k load test | **DONE** |
 | **Context: burst traffic** | Flash sales / breaking news: absorb bursts without dropping or overrunning the provider | `POST /batch` (1000 items, one `CopyFrom`), Redis queues as buffer, per-channel GCRA limiter | Load test: 10,000 notifications accepted in 287ms (34,787/s), drained at ~95/s/channel with 0 failures; integration `c`, `g` | **DONE** |
 | **Context: intelligent retry** | Retry only what can succeed, back off, protect a failing provider | `internal/provider/client.go` (classification), `internal/worker/retry.go` (full jitter + `Retry-After`), `internal/worker/breaker.go` | `internal/worker/retry_test.go`, `internal/provider/client_test.go`, integration `e`, `n`, `q` | **DONE** |
 | **Context: visibility for internal teams** | Metrics, logs and traces for operators | Prometheus `/metrics` (API + workers), `slog` JSON with `correlation_id`/`trace_id`, OpenTelemetry → Jaeger | `internal/observability/*_test.go`, integration `m`, PromQL queries in section 8 run against Prometheus | **DONE** |

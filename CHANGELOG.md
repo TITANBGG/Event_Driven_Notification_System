@@ -16,6 +16,8 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 - Workers could not dequeue while Redis was at `maxmemory` (`noeviction`): `LMOVE` is a `denyoom`
   command, so a full Redis with nothing in flight could never drain again. `dequeue.lua` now uses
   `RPOP` + `LPUSH` (found by the 64 MB stress test; integration scenario `s`).
+- The reconciler's expired idempotency key cleanup scanned the whole key table on every batch
+  (378 ms at 2.25M keys, growing with the table); it now probes the primary key (29 ms at any size).
 - A non-upgrade `GET /api/v1/ws` returned a plain-text `426`; it now returns `426 upgrade_required`
   with the standard error envelope (found by fuzzing).
 

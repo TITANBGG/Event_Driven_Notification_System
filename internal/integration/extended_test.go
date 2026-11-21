@@ -420,4 +420,29 @@ func runExtendedScenarios(t *testing.T, inf *testInfra) {
 		require.NoError(t, err)
 		assert.Zero(t, inflight)
 	})
+
+	t.Run("t_expired_idempotency_keys_deleted_in_bounded_batches_live_keys_kept", func(t *testing.T) {
+		inf.resetState(t)
+		ctx := t.Context()
+		_, err := inf.pool.Exec(ctx, `
+			INSERT INTO idempotency_keys (key, request_hash, resource_type, resource_id, response_status, created_at, expires_at)
+			SELECT 'k-' || g, 'h', 'notification', gen_random_uuid(), 202, now() - interval '2 days',
+			       CASE WHEN g <= 25 THEN now() - interval '1 minute' ELSE now() + interval '1 hour' END
+			FROM generate_series(1, 30) g`)
+		require.NoError(t, err)
+
+		var got []int64
+		for range 4 {
+			n, err := inf.repo.DeleteExpiredIdempotencyKeys(ctx, 10)
+			require.NoError(t, err)
+			got = append(got, n)
+		}
+		assert.Equal(t, []int64{10, 10, 5, 0}, got, "at most the batch limit per call, until none is expired")
+
+		var live, expired int
+		require.NoError(t, inf.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE expires_at > now()),
+			count(*) FILTER (WHERE expires_at <= now()) FROM idempotency_keys`).Scan(&live, &expired))
+		assert.Equal(t, 5, live, "keys that have not expired are never deleted")
+		assert.Zero(t, expired)
+	})
 }
