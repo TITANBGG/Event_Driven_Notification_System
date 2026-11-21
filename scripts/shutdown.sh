@@ -7,14 +7,28 @@
 #   - no 'abandoned' attempt and no duplicate delivery (invariants without --allow-duplicates)
 #   - every batch the API accepted (202) is complete (all-or-nothing) despite the API restart
 #
-#   ./scripts/shutdown.sh
+#   ./scripts/shutdown.sh             the four stops above (~4 min)
+#   ./scripts/shutdown.sh --rolling   rolling restarts: worker-1 and worker-2 alternately get
+#                                     `compose restart` every 5s for 2 minutes under the same load; every
+#                                     restart must drain, and the run must end with 0 abandoned attempts,
+#                                     0 duplicates and no "lease lost" log line (~5 min)
 # shellcheck disable=SC2317 # functions run indirectly through `at` and the EXIT trap
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
 MOCK_URL="${MOCK_URL:-http://localhost:8090}"
 read -r -a COMPOSE <<<"${COMPOSE:-docker compose}"
+MODE="stops"
+for arg in "$@"; do
+  case "$arg" in
+    --rolling) MODE="rolling" ;;
+    *) echo "usage: $0 [--rolling]" >&2; exit 2 ;;
+  esac
+done
+ROLLING_SECONDS=120
+ROLLING_EVERY=5
 LOAD_SECONDS=100
+if [[ "$MODE" == rolling ]]; then LOAD_SECONDS=$((ROLLING_SECONDS + 10)); fi
 BATCH_SIZE=1000
 BATCH_EVERY=2
 STOP_LIMIT_S=16
@@ -102,6 +116,35 @@ graceful_stop() {
   if ((bad)); then record "$name" FAIL "$detail"; else record "$name" PASS "$detail"; fi
 }
 
+# rolling_restarts: restart worker-1 and worker-2 alternately, one every ROLLING_EVERY seconds after the
+# previous restart finished, so at least one worker is always up and every restart drains live sends.
+rolling_restarts() {
+  local end=$((T0 + 5 + ROLLING_SECONDS)) i=0 svc since t0 t1 clean drained timeout_hit restarts=0 undrained=0 unclean=0
+  while (($(date +%s) < end)); do
+    svc="worker-$((i % 2 + 1))"
+    since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    t0=$(date +%s%3N)
+    "${COMPOSE[@]}" restart -t 30 "$svc" >/dev/null 2>&1
+    t1=$(date +%s%3N)
+    clean="$("${COMPOSE[@]}" logs --no-log-prefix --since "$since" "$svc" 2>/dev/null | grep -c 'worker stopped cleanly' || true)"
+    timeout_hit="$("${COMPOSE[@]}" logs --no-log-prefix --since "$since" "$svc" 2>/dev/null | grep -c 'shutdown timeout elapsed' || true)"
+    drained="$("${COMPOSE[@]}" logs --no-log-prefix --since "$since" "$svc" 2>/dev/null |
+      awk '/worker shutdown signal received/ {on = 1; next} on && /notification sent/ {c++} /worker stopped cleanly/ {on = 0} END {print c + 0}')"
+    log "restart ${i}: ${svc} in $((t1 - t0))ms, drained_sends=${drained} clean_stop_log=${clean} timeout_hit=${timeout_hit}"
+    restarts=$((restarts + 1))
+    if [[ "$drained" == 0 ]]; then undrained=$((undrained + 1)); fi
+    if [[ "$clean" -lt 1 || "$timeout_hit" != 0 ]]; then unclean=$((unclean + 1)); fi
+    i=$((i + 1))
+    sleep "$ROLLING_EVERY"
+  done
+  # A restart that found nothing in flight proves nothing; with 1,000 items every 2s it should not happen.
+  if ((restarts >= 10 && undrained == 0 && unclean == 0)); then
+    record "rolling restarts" PASS "${restarts} restarts, each drained live sends and logged a clean stop"
+  else
+    record "rolling restarts" FAIL "${restarts} restarts (need >= 10), ${undrained} without drained sends, ${unclean} unclean"
+  fi
+}
+
 at() {
   local t="$1"
   shift
@@ -123,14 +166,18 @@ T0=$(date +%s)
 load_loop &
 LOAD_PID=$!
 
-at 10 graceful_stop worker-1
-at 25 "${COMPOSE[@]}" start worker-1
-at 35 graceful_stop worker-2
-at 50 "${COMPOSE[@]}" start worker-2
-at 60 graceful_stop worker-1 worker-2
-at 72 "${COMPOSE[@]}" start worker-1 worker-2
-at 80 graceful_stop api
-at 88 "${COMPOSE[@]}" up -d --wait api
+if [[ "$MODE" == rolling ]]; then
+  at 5 rolling_restarts
+else
+  at 10 graceful_stop worker-1
+  at 25 "${COMPOSE[@]}" start worker-1
+  at 35 graceful_stop worker-2
+  at 50 "${COMPOSE[@]}" start worker-2
+  at 60 graceful_stop worker-1 worker-2
+  at 72 "${COMPOSE[@]}" start worker-1 worker-2
+  at 80 graceful_stop api
+  at 88 "${COMPOSE[@]}" up -d --wait api
+fi
 
 wait "$LOAD_PID" || true
 LOAD_PID=""
@@ -167,13 +214,21 @@ else
   record "nothing left for the reconciler" FAIL "sent=${sent} failed=${failed} open=${open} abandoned=${abandoned}"
 fi
 
+# Fencing would make a stale write harmless, but a graceful restart must not need it at all.
+lease_lost="$("${COMPOSE[@]}" logs --no-log-prefix --since "$SINCE" worker-1 worker-2 2>/dev/null | grep -c 'worker lease lost' || true)"
+if [[ "$lease_lost" == 0 ]]; then
+  record "no lease lost" PASS "0 'worker lease lost' log lines since ${SINCE}"
+else
+  record "no lease lost" FAIL "${lease_lost} 'worker lease lost' log lines since ${SINCE}"
+fi
+
 echo
 inv_status=0
 "$DIR/invariants.sh" --since="$SINCE" || inv_status=1
 if ((inv_status)); then record "invariants (no duplicates allowed)" FAIL "see report above"; else record "invariants (no duplicates allowed)" PASS "0 duplicates, Redis and PostgreSQL consistent"; fi
 
 echo
-echo "=== graceful shutdown summary ==="
+echo "=== graceful shutdown summary (${MODE}) ==="
 for r in "${RESULTS[@]}"; do
   IFS='|' read -r check status detail <<<"$r"
   printf '%-34s %-5s %s\n' "$check" "$status" "$detail"

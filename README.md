@@ -1212,7 +1212,11 @@ make invariants         # check system invariants on the settled stack (no stuck
 make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, queue depths, DB pool, Redis memory
 make ws-test            # 39 API boundary cases + WebSocket capacity, fast/slow consumers and batch watchers (~5 min)
 make shutdown-test      # SIGTERM workers and API under load: drain, no abandoned attempts, no duplicates (~4 min)
+make rolling-test       # restart worker-1/worker-2 alternately every ~8s for 2 min under load: 0 abandoned, 0 duplicates, 0 lease lost (~6 min)
 make chaos              # sustained load + worker kills, Redis restart/FLUSHALL, PostgreSQL stop, slow/failing provider (~15 min)
+make isolation          # 30,000 SMS backlog vs ~50/s email and push: email/push p95 < 2s, per-channel rate limit (~7 min)
+make priority           # 1,000 low under 3 min of 2x-capacity high: low >= 8% per 10s slice, high overtakes older low (~9 min)
+make provider-timeout   # provider slower than PROVIDER_TIMEOUT: breaker opens, deferrals not counted, all sent; permanent 4xx: 1 attempt, DLQ (~4 min)
 make races              # concurrent cancel, batch cancel, idempotency, manual retry, scheduled-cancel and template-delete races (~4 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
 make fuzz               # Go native fuzzing of 7 parsers of untrusted input, incl. PII masking, Retry-After and the HTTP API (FUZZTIME=5m each)
@@ -1395,6 +1399,8 @@ Two earlier runs of the same test found infrastructure problems rather than deli
 | API | stopped in 0.9s; the 3 batch requests that hit the stopped API got connection errors and created **no rows at all** (all-or-nothing), so the client can retry them with the same `Idempotency-Key` |
 | Overall | 47,000 accepted, 47,000 sent, **0 `abandoned` attempts, 0 duplicates**, invariants passed without `--allow-duplicates` |
 
+**Rolling restarts** (`./scripts/shutdown.sh --rolling`, `make rolling-test`): under the same load, worker-1 and worker-2 were restarted alternately with `compose restart`, one every ~8s (5s pause + ~1.7s restart) for 2 minutes, so one worker was always down or starting. All 15 restarts drained 75 in-flight sends and logged a clean stop; 65,000 accepted, 65,000 sent, **0 `abandoned` attempts, 0 duplicates, 0 "lease lost" log lines** (no fenced write was ever needed), invariants passed without `--allow-duplicates`.
+
 The script fails a stop during which no send completed, because such a stop says nothing about draining. Its first version built request bodies in a bash loop that was too slow to keep the workers busy, and its first stop passed with an idle worker.
 
 ### WebSocket flood and boundary values
@@ -1408,6 +1414,48 @@ The script fails a stop during which no send completed, because such a stop says
 | Batch watchers | 20 clients on `batchId`: 20/20 snapshots, 1,000/1,000 live events each |
 
 The fast/slow scenario first failed: 324 of the 400 readers were dropped. Each client had a fixed 64-slot channel, and the Hub dropped any client whose channel was full at the moment an event arrived. But creating a 1,000-item batch publishes 1,000 `pending` events at once, so a reader that kept up was indistinguishable from one that had stopped. Raising the buffer to 1,024 only moved the threshold: four batches in a row still dropped 37 of 100 readers. The Hub now keeps a per-client queue that grows on demand and drops a client only when more than 1,024 frames are waiting **and** it has delivered none for 5 seconds, or when more than 8,192 are waiting. Each event is JSON-encoded once and the same bytes go to every client (before, every client re-encoded every event). A client that has stopped reading entirely cannot receive a close frame through its full TCP window, so it is cut by the 5-second write timeout and sees `1006`; `1008` is sent when the frame can still be delivered.
+
+### Channel isolation and priority under saturation
+
+Two scripts saturate one dimension and check that the others are unaffected. Measured on 2026-11-21, 2 workers:
+
+**`scripts/isolation.sh` (`make isolation`).** 30,000 SMS are submitted at once (5 minutes of work at 100/s). While they drain, email and push each get a 100-item batch every 2 seconds (~50/s) for 2 minutes. The smallest SMS backlog seen during that time was 18,113.
+
+| Channel | Sent | End-to-end p50 / p95 / p99 | Busiest 1s window |
+|---|---|---|---|
+| email | 6,000 / 6,000 | 696 / 1,293 / 1,919 ms | 97 |
+| push | 6,000 / 6,000 | 682 / 1,263 / 1,795 ms | 97 |
+| sms | 30,000 / 30,000 (drained in 5m15s) | backlog-bound | 97 |
+
+Email and push were delivered as if SMS were idle: each channel has its own consumers and its own GCRA key. The ~0.7s median is the limiter spacing a 100-item batch that arrives in one go at 10ms intervals, not waiting behind SMS.
+
+**`scripts/priority.sh` (`make priority`).** 1,000 `low` SMS are queued first, then `high` SMS arrive at ~200/s for 3 minutes. That is twice what the channel may send, so the high queue never emptied (smallest sample: 815).
+
+| Check | Result |
+|---|---|
+| Low share in each 10s slice while both were queued | 9–10% in all 10 slices (6:3:1 schedule; the empty `normal` slots fall through to high) |
+| First 1,000 high, created after all 1,000 low | p50 4.5s, all sent 14s after the low batch arrived; the low batch finished after 103s (p50 49s) |
+| Everything | 37,000 / 37,000 sent, busiest 1s window 97, invariants passed |
+
+The first version of this script compared the p50 of all high against all low and failed (high 110s, low 49s). That comparison measured the overload, not the priority: high arrived at twice its capacity, so its own FIFO backlog kept growing. The script now compares high and low notifications by arrival order.
+
+### Provider slower than its timeout, and permanent errors
+
+`scripts/provider-timeout.sh` (`make provider-timeout`) has two parts. Measured on 2026-11-21:
+
+- **Slow provider.** The mock answers after 12s, which is beyond `PROVIDER_TIMEOUT` = 10s, for 90 seconds while 300 SMS are sent.
+- **Permanent errors.** The mock answers every request with a permanent `4xx` while 20 SMS are sent.
+
+| Check | Result |
+|---|---|
+| Timeouts | 77 provider timeouts, all recorded as `transient` |
+| Breaker | `circuit_breaker_state{channel="sms"}` reached 2 (open) and was back at 0 after recovery |
+| Deferrals while open | 1,191 `circuit_open` rows, **0 counted as attempts**; every notification's `attempts` equals its counted rows; highest `attempts` was 3 of 5 |
+| Outcome | 300 / 300 sent, 0 failed, about 1 minute after the provider recovered |
+| Permanent `4xx` | 20 / 20 `failed` with exactly 1 attempt each, no retry and no deferral (a `4xx` counts as a breaker success); all 20 in the DLQ list |
+| Invariants | passed, 0 recorded double sends |
+
+Without the breaker, 5 attempts (10s timeout each plus 2–16s backoff) take about 80s, less than the 90s outage, so most of the batch would likely have been dead-lettered. The mock counts a request when it arrives and abandons it when the client disconnects, so the timed-out calls were never accepted by the provider. Against a real provider, a timeout can hide an accepted send, which is why the same `Idempotency-Key` goes on every attempt.
 
 ### Data growth: 2 million notifications
 

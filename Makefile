@@ -4,7 +4,7 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
-.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot ratecheck races chaos shutdown-test ws-test fuzz
+.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot ratecheck races chaos shutdown-test rolling-test isolation priority provider-timeout ws-test fuzz
 
 up:
 	$(COMPOSE) up --build -d
@@ -81,6 +81,18 @@ chaos:
 
 shutdown-test:
 	./scripts/shutdown.sh
+
+rolling-test:
+	./scripts/shutdown.sh --rolling
+
+isolation:
+	./scripts/isolation.sh
+
+priority:
+	./scripts/priority.sh
+
+provider-timeout:
+	./scripts/provider-timeout.sh
 
 ws-test:
 	./scripts/ws-boundaries.sh
