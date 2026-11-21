@@ -1218,12 +1218,13 @@ make chaos              # sustained load + worker kills, Redis restart/FLUSHALL,
 make isolation          # 30,000 SMS backlog vs ~50/s email and push: email/push p95 < 2s, per-channel rate limit (~7 min)
 make priority           # 1,000 low under 3 min of 2x-capacity high: low >= 8% per 10s slice, high overtakes older low (~9 min)
 make provider-timeout   # provider slower than PROVIDER_TIMEOUT: breaker opens, deferrals not counted, all sent; permanent 4xx: 1 attempt, DLQ (~4 min)
+make stress             # stress profile only: 50k then 200k into a 64 MB Redis; OOM on enqueue, nothing lost, no container killed (~20 min)
 make races              # concurrent cancel, batch cancel, idempotency, manual retry, scheduled-cancel and template-delete races (~4 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
 make fuzz               # Go native fuzzing of 7 parsers of untrusted input, incl. PII masking, Retry-After and the HTTP API (FUZZTIME=5m each)
 ```
 
-Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leaves a goroutine behind fails. For stress runs, `docker compose -f docker-compose.yml -f docker-compose.stress.yml up -d --wait` caps the API and workers at 0.5 CPU / 256 MB and Redis at 64 MB with `noeviction`, so resource exhaustion surfaces as errors instead of silent key eviction.
+Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leaves a goroutine behind fails. For stress runs (`make stress`), `docker compose -f docker-compose.yml -f docker-compose.stress.yml up -d --wait` caps the API and workers at 0.5 CPU / 256 MB and Redis at 64 MB with `noeviction`, so resource exhaustion surfaces as errors instead of silent key eviction.
 
 `make` and `-race` need Linux, macOS, WSL or CI. On native Windows without GCC, run `go test ./...` and `go test -tags=integration ./internal/integration/...`.
 
@@ -1458,6 +1459,20 @@ The first version of this script compared the p50 of all high against all low an
 | Invariants | passed, 0 recorded double sends |
 
 Without the breaker, 5 attempts (10s timeout each plus 2–16s backoff) take about 80s, less than the 90s outage, so most of the batch would likely have been dead-lettered. The mock counts a request when it arrives and abandons it when the client disconnects, so the timed-out calls were never accepted by the provider. Against a real provider, a timeout can hide an accepted send, which is why the same `Idempotency-Key` goes on every attempt.
+
+### Constrained resources: Redis full
+
+`scripts/stress.sh` (`make stress`) runs against the stress profile (`docker-compose.stress.yml`). There, the API and each worker get 0.5 CPU / 256 MB, PostgreSQL 1 CPU / 512 MB, and Redis is capped at 64 MB with `noeviction`. Redis is only a hint of work to do, so a full Redis must slow the system down without losing anything. Measured on 2026-11-21, 2 workers:
+
+| Phase | Load | Result |
+|---|---|---|
+| A | 50 × 1,000 mixed batches, 4 in parallel | all `202`, request p50 387 ms / p99 1.1 s; drained in 174 s |
+| B | 200 × 1,000, 4 in parallel: more queue metadata than 64 MB holds (~400 B per tracked ID) | all `202`, p50 303 ms / p99 580 ms; Redis hit 64 MB with 165,580 tracked IDs; 31 batches got `OOM` on enqueue and stayed `pending` in PostgreSQL; reconciler step (a) re-enqueued ~30,000 rows as the queues drained; drained in 702 s (285/s) |
+| Overall | 250,000 | 250,000 sent; no container OOM-killed or restarted; busiest 1 s window 98 per channel; invariants passed |
+
+The first run found a real bug. While Redis was full, workers could not dequeue: 1,668 `OOM` warnings in 2 minutes. `dequeue.lua` started with `LMOVE`, and Redis refuses a script whose first write is a `denyoom` command. The run recovered only because acks of in-flight sends freed memory. A full Redis with nothing in flight, for example a backlog parked in the delayed set during a provider outage, would never have drained again. `dequeue.lua` now does `RPOP` + `LPUSH` (see the failure matrix), integration scenario `s` pins it against a real full Redis, and the rerun above logged 0 dequeue failures.
+
+The same run exposed a slow test tool. `invariants.sh` parsed the mock's 24 MB single-line `/stats` with an awk loop that copied the rest of the line after every match, which is quadratic. With 500,000 keys it ran for over 20 minutes; it now uses `grep -o` and finishes in 33 s.
 
 ### Data growth: 2 million notifications
 

@@ -21,6 +21,10 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ### Tests
 
+- Scenario scripts: channel isolation, priority starvation, provider timeout, rolling restarts and a
+  constrained-resource run that fills Redis (`make isolation priority provider-timeout rolling-test stress`).
+- Race scenarios: scheduled send vs cancel, template delete vs batch.
+- `invariants.sh` parses the provider stats in linear time (33 s instead of 20+ minutes at 500k keys).
 - Fuzz targets for PII masking, `Retry-After` parsing and the HTTP API (7 targets, ~70M executions).
 
 ### Documentation

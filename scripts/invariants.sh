@@ -130,21 +130,10 @@ else
   record "3. Sent metadata complete" "FAIL" "${incomplete_sent}/${sent_total} sent rows missing provider_message_id or sent_at"
 fi
 
-# Parse MockProvider /stats byKey entries: "<uuid> <count>" per line.
-printf '%s' "$STATS_JSON" | awk '
-  {
-    line = $0
-    while (match(line, /"[0-9a-fA-F-]+":[0-9]+/)) {
-      pair = substr(line, RSTART, RLENGTH)
-      gsub(/"/, "", pair)
-      split(pair, kv, ":")
-      if (kv[2] + 0 > 0) {
-        print kv[1] " " kv[2]
-      }
-      line = substr(line, RSTART + RLENGTH)
-    }
-  }
-' > "${TMP_DIR}/mock_by_key.txt"
+# Parse MockProvider /stats byKey entries: "<uuid> <count>" per line. grep -o is linear; the former awk
+# loop re-copied the rest of the single-line JSON after every match, which took 20+ minutes at 500k keys.
+printf '%s' "$STATS_JSON" | { grep -oE '"[0-9a-fA-F-]{36}":[0-9]+' || true; } \
+  | tr -d '"' | awk -F: '$2 + 0 > 0 { print $1 " " $2 }' > "${TMP_DIR}/mock_by_key.txt"
 
 mock_window="$(wc -l < "${TMP_DIR}/mock_by_key.txt" | tr -d ' ')"
 
