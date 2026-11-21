@@ -20,7 +20,12 @@ func TestLimiterGCRA100PerSecondOverSimulated1Second(t *testing.T) {
 
 	mr := miniredis.RunT(t)
 	rdb := queue.NewClient(mr.Addr(), 4)
-	defer func() { _ = rdb.Close() }()
+	defer func() {
+		_ = rdb.Close()
+		// go-redis v9 ConnPool.tryDial sleeps 1s before checking p.closed(); wait past one sleep
+		// cycle so goleak verifies the background dialer exits cleanly after Close().
+		time.Sleep(1100 * time.Millisecond)
+	}()
 
 	base := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
 	lim := ratelimit.New(rdb, 100, 1)
@@ -46,7 +51,12 @@ func TestLimiterWaitRespectsContextAndFailsClosedOnRedisError(t *testing.T) {
 
 	mr := miniredis.RunT(t)
 	rdb := queue.NewClient(mr.Addr(), 4)
-	defer func() { _ = rdb.Close() }()
+	defer func() {
+		_ = rdb.Close()
+		// go-redis v9 ConnPool.tryDial sleeps 1s before checking p.closed(); wait past one sleep
+		// cycle so goleak verifies the background dialer exits cleanly after Close().
+		time.Sleep(1100 * time.Millisecond)
+	}()
 
 	var hookCalls atomic.Int32
 	lim := ratelimit.New(rdb, 10, 1, ratelimit.WithOnRateLimited(func(_ domain.Channel, _ time.Duration) {

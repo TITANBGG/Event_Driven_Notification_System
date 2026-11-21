@@ -94,3 +94,29 @@ func TestAPIVsWorkerMetricsSeparation(t *testing.T) {
 	assert.Contains(t, workerBody, "circuit_breaker_state")
 	assert.NotContains(t, workerBody, "queue_depth")
 }
+
+func TestMetricsDBPoolStats(t *testing.T) {
+	t.Parallel()
+
+	m := observability.NewAPIMetrics()
+	m.RegisterDBPoolStats(func() observability.DBPoolSnapshot {
+		return observability.DBPoolSnapshot{
+			AcquiredConns:     4,
+			IdleConns:         6,
+			TotalConns:        10,
+			MaxConns:          20,
+			EmptyAcquireCount: 3,
+		}
+	})
+
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/metrics", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "db_pool_acquired_conns 4")
+	assert.Contains(t, body, "db_pool_idle_conns 6")
+	assert.Contains(t, body, "db_pool_total_conns 10")
+	assert.Contains(t, body, "db_pool_max_conns 20")
+	assert.Contains(t, body, "db_pool_empty_acquire_total 3")
+}

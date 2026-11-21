@@ -102,6 +102,16 @@ func run() error {
 	store := repository.New(pool)
 	q := queue.New(rdb)
 	metrics := observability.NewWorkerMetrics()
+	metrics.RegisterDBPoolStats(func() observability.DBPoolSnapshot {
+		st := pool.Stat()
+		return observability.DBPoolSnapshot{
+			AcquiredConns:     st.AcquiredConns(),
+			IdleConns:         st.IdleConns(),
+			TotalConns:        st.TotalConns(),
+			MaxConns:          st.MaxConns(),
+			EmptyAcquireCount: st.EmptyAcquireCount(),
+		}
+	})
 	limiter := ratelimit.New(
 		rdb,
 		cfg.RateLimitPerSec,

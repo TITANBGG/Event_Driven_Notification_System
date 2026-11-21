@@ -1,0 +1,4 @@
+*.mod text eol=lf
+*.sum text eol=lf
+*.sh text eol=lf
+

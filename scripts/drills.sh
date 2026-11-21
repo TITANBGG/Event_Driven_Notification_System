@@ -163,8 +163,10 @@ drill_3_worker_sigkill() {
   else
     record "$name" FAIL "batch not terminal after 240s: sent=$(count_status "$batch" sent)"
   fi
-  "${COMPOSE[@]}" up -d --wait worker-1 >/dev/null 2>&1
-  mock_env
+  # `start`, not `up`: worker-1 depends on the mock provider, and `up` would recreate it with the
+  # default settings, wiping the in-memory /stats the invariants cross-check needs. The main loop
+  # restores the mock provider only after that check.
+  "${COMPOSE[@]}" start worker-1 >/dev/null 2>&1
 }
 
 drill_4_provider_outage() {
@@ -215,6 +217,7 @@ fi
 selected=("$@")
 if ((${#selected[@]} == 0)); then selected=(1 2 3 4 5); fi
 for d in "${selected[@]}"; do
+  drill_start="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   case "$d" in
     1) drill_1_redis_down_during_create ;;
     2) drill_2_postgres_down ;;
@@ -223,6 +226,16 @@ for d in "${selected[@]}"; do
     5) drill_5_redis_flushall ;;
     *) echo "unknown drill $d" >&2; exit 2 ;;
   esac
+  # Check invariants before restore_stack: recreating the mock provider would reset its /stats.
+  # Drills 3 and 5 interrupt in-flight sends, so at-least-once duplicates are expected there.
+  inv_args=("--since=${drill_start}")
+  if [[ "$d" == "3" || "$d" == "5" ]]; then inv_args+=(--allow-duplicates); fi
+  if inv_out="$(COMPOSE="${COMPOSE[*]}" "$(dirname "$0")/invariants.sh" "${inv_args[@]}" 2>&1)"; then
+    record "${d} invariants" PASS "$(printf '%s\n' "$inv_out" | grep -E '^6\. ' | sed 's/^6\. Duplicate deliveries *PASS *//')"
+  else
+    printf '%s\n' "$inv_out"
+    record "${d} invariants" FAIL "post-drill invariants failed (report printed above)"
+  fi
   restore_stack
 done
 

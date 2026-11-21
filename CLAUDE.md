@@ -176,7 +176,7 @@ scripts/            # smoke.sh (curl examples for every endpoint)
 - Logging: `log/slog` (stdlib JSON handler)
 - Tracing: `go.opentelemetry.io/otel` (`+ otlptracehttp exporter, otelhttp`), `github.com/exaring/otelpgx`
 - WebSockets: `github.com/coder/websocket`
-- Testing: `github.com/testcontainers/testcontainers-go` (`+ postgres and redis modules`), `github.com/alicebob/miniredis/v2` (unit tests including Lua), `github.com/stretchr/testify` (`assert`/`require` only)
+- Testing: `github.com/testcontainers/testcontainers-go` (`+ postgres and redis modules`), `github.com/alicebob/miniredis/v2` (unit tests including Lua), `github.com/stretchr/testify` (`assert`/`require` only), `go.uber.org/goleak` (`TestMain` goroutine-leak check in every test package; approved 2026-11-21)
 - **Dependency Policy:** Prefer the Go standard library otherwise. Ask before adding any other external dependency.
 
 ---
@@ -479,6 +479,7 @@ Exposed on a **custom** `prometheus.Registry` (never global default) at `api :80
 - `worker_panics_total` (Counter)
 - `http_requests_total{route, method, code}` (Counter — `route` = chi route pattern, **never** raw URL path)
 - `http_request_duration_seconds{route, method}` (Histogram)
+- `db_pool_acquired_conns`, `db_pool_idle_conns`, `db_pool_total_conns`, `db_pool_max_conns` (Gauge) and `db_pool_empty_acquire_total` (Counter) — `pgxpool.Stat()` read at scrape time, api and worker
 - **Cardinality Rule:** **NEVER** label metrics by `notification_id`, `batch_id`, `recipient`, or `correlation_id`.
 
 ### Real-Time JSON Snapshot (`GET /api/v1/metrics`)

@@ -1,0 +1,38 @@
+# Resource-constrained and low-memory Redis override for stress and chaos testing.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.stress.yml up -d --wait
+#
+# Forces API and workers into tight CPU/RAM bounds (256MB / 0.5 CPU) and caps Redis at 64MB
+# with noeviction so OOM write failures surface under load without silent queue key eviction.
+
+services:
+  postgres:
+    mem_limit: 512m
+    cpus: "1.00"
+
+  redis:
+    mem_limit: 128m
+    cpus: "0.50"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - noeviction
+
+  api:
+    mem_limit: 256m
+    cpus: "0.50"
+
+  worker-1:
+    mem_limit: 256m
+    cpus: "0.50"
+
+  worker-2:
+    mem_limit: 256m
+    cpus: "0.50"
+

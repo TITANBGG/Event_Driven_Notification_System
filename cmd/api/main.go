@@ -157,6 +157,16 @@ func run() error {
 
 	store := api.NewRepositoryStore(repository.New(pool))
 	metrics := observability.NewAPIMetrics()
+	metrics.RegisterDBPoolStats(func() observability.DBPoolSnapshot {
+		st := pool.Stat()
+		return observability.DBPoolSnapshot{
+			AcquiredConns:     st.AcquiredConns(),
+			IdleConns:         st.IdleConns(),
+			TotalConns:        st.TotalConns(),
+			MaxConns:          st.MaxConns(),
+			EmptyAcquireCount: st.EmptyAcquireCount(),
+		}
+	})
 	hub := realtime.NewHub(realtime.HubConfig{
 		Redis:      rdb,
 		Logger:     logger,

@@ -292,13 +292,13 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Ea
 
 ### Verified failure drills
 
-`scripts/drills.sh` (`make drills`) runs these against the live Compose stack: it breaks one dependency, checks the documented behavior, restores the stack and prints PASS/FAIL with measured times. Results from 2026-11-21, on the hardware listed in section 10:
+`scripts/drills.sh` (`make drills`) runs these against the live Compose stack: it breaks one dependency, checks the documented behavior, runs `scripts/invariants.sh` on the result and prints PASS/FAIL with measured times. The invariants use `delivery_attempts` in PostgreSQL as the complete history (no `sent` attempt on a cancelled row, no notification sent twice) and cross-check the mock provider's per-`Idempotency-Key` counts to find provider calls the system never recorded, which is how a worker crash shows up as an at-least-once duplicate. Results from 2026-11-21, on the hardware listed in section 10:
 
 | Drill | What it does | Result |
 |---|---|---|
 | 1. Redis down during create | `docker compose stop redis`, then `POST` a notification | `202` in ~3s (all post-commit Redis work shares one 2s budget), `/health/ready` = `503`; sent 36s after Redis restarted (reconciler step a: `PENDING_STALE_AFTER` 30s + cycle) |
 | 2. PostgreSQL down | `docker compose stop postgres`, then `POST` | `503 service_unavailable`, `/health/ready` = `503`; after restart a new notification was sent within 1s |
-| 3. Worker SIGKILL mid-batch | 300 SMS with 200ms provider latency, `docker compose kill worker-1` after 1s | 300/300 sent 64s after the kill (orphaned inflight list requeued after the heartbeat expired, abandoned `processing` rows reclaimed after `VISIBILITY_TIMEOUT`); 4 duplicate provider calls, i.e. sends in flight at the moment of the kill, all with the same `Idempotency-Key` |
+| 3. Worker SIGKILL mid-batch | 300 SMS with 200ms provider latency, `docker compose kill worker-1` after 1s | 300/300 sent 64s after the kill (orphaned inflight list requeued after the heartbeat expired, abandoned `processing` rows reclaimed after `VISIBILITY_TIMEOUT`); 4 to 11 duplicate provider calls across runs, one per send in flight at the moment of the kill, all with the same `Idempotency-Key`; the invariants check counts the same number of provider calls the system never recorded and of `abandoned` attempts |
 | 4. Provider outage | Mock provider returns 500 for everything, 40 SMS | Breaker open (`circuit_breaker_state=2`) 6s into the outage, 0 notifications failed; 40/40 sent 25s after the provider recovered |
 | 5. Redis data loss | `FLUSHALL` while a 500-SMS batch is being delivered (138 already sent) | 500/500 sent 34s later, rebuilt from PostgreSQL by the reconciler; 0 duplicates |
 
@@ -1090,6 +1090,8 @@ The API exposes them on `:8080/metrics` and each worker on `:9091/metrics`. Each
 | `worker_panics_total` | counter | — | worker |
 | `http_requests_total` | counter | `route, method, code` (`route` is the chi pattern, never the raw path) | api |
 | `http_request_duration_seconds` | histogram | `route, method` | api |
+| `db_pool_acquired_conns`, `db_pool_idle_conns`, `db_pool_total_conns`, `db_pool_max_conns` | gauge | — | api, worker (read from `pgxpool.Stat()` at scrape time) |
+| `db_pool_empty_acquire_total` | counter | — | api, worker (acquires that had to wait for a free connection: the pool-saturation signal) |
 
 No metric is labeled with a notification ID, batch ID, recipient or correlation ID, which keeps the number of series bounded. Queue depths are sampled only by the API process, so two worker replicas do not report duplicate gauge series.
 
@@ -1203,7 +1205,13 @@ make cover-all          # unit + integration coverage per internal package
 make lint               # gofmt, go vet, golangci-lint
 make load               # 2,000-notification load test against the running stack
 make drills             # live failure drills against the running stack (~5 min, section 5)
+make invariants         # check system invariants on the settled stack (no stuck rows, no cancelled or double sends, Redis matches PostgreSQL);
+                        # covers the full history, so pass --since=<RFC3339> to ignore duplicates from an earlier crash drill
+make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, queue depths, DB pool, Redis memory
+make fuzz               # Go native fuzzing of SMS segmenting, validation, cursor decoding and templates (FUZZTIME=5m each)
 ```
+
+Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leaves a goroutine behind fails. For stress runs, `docker compose -f docker-compose.yml -f docker-compose.stress.yml up -d --wait` caps the API and workers at 0.5 CPU / 256 MB and Redis at 64 MB with `noeviction`, so resource exhaustion surfaces as errors instead of silent key eviction.
 
 `make` and `-race` need Linux, macOS, WSL or CI. On native Windows without GCC, run `go test ./...` and `go test -tags=integration ./internal/integration/...`.
 

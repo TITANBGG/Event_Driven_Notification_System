@@ -4,7 +4,7 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
-.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker
+.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot fuzz
 
 up:
 	$(COMPOSE) up --build -d
@@ -66,6 +66,20 @@ smoke:
 # Live failure drills (Redis/PostgreSQL down, worker SIGKILL, provider outage, Redis FLUSHALL).
 drills:
 	./scripts/drills.sh
+
+invariants:
+	./scripts/invariants.sh
+
+prom-snapshot:
+	./scripts/prom-snapshot.sh once
+
+# Run Go built-in fuzzing across SMS segmenter, validator, cursor decoder, and template engine.
+FUZZTIME ?= 5m
+fuzz:
+	go test -fuzz=FuzzSMSInfo -fuzztime=$(FUZZTIME) ./internal/domain
+	go test -fuzz=FuzzValidateNotification -fuzztime=$(FUZZTIME) ./internal/domain
+	go test -fuzz=FuzzDecodeCursor -fuzztime=$(FUZZTIME) ./internal/api
+	go test -fuzz=FuzzTemplateEngine -fuzztime=$(FUZZTIME) ./internal/template
 
 load:
 	go run ./cmd/loadgen -n 2000

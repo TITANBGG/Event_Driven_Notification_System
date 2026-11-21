@@ -203,6 +203,44 @@ func (m *Metrics) Registry() *prometheus.Registry {
 	return m.registry
 }
 
+// DBPoolSnapshot holds point-in-time database connection pool utilization and contention stats.
+type DBPoolSnapshot struct {
+	AcquiredConns     int32
+	IdleConns         int32
+	TotalConns        int32
+	MaxConns          int32
+	EmptyAcquireCount int64
+}
+
+// RegisterDBPoolStats registers on-demand PostgreSQL pool collectors backed by fn on the private registry.
+func (m *Metrics) RegisterDBPoolStats(fn func() DBPoolSnapshot) {
+	if m == nil || m.registry == nil || fn == nil {
+		return
+	}
+	m.registry.MustRegister(
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "db_pool_acquired_conns",
+			Help: "Number of currently acquired connections in the PostgreSQL pool.",
+		}, func() float64 { return float64(fn().AcquiredConns) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "db_pool_idle_conns",
+			Help: "Number of currently idle connections in the PostgreSQL pool.",
+		}, func() float64 { return float64(fn().IdleConns) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "db_pool_total_conns",
+			Help: "Total number of connections currently open in the PostgreSQL pool.",
+		}, func() float64 { return float64(fn().TotalConns) }),
+		prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "db_pool_max_conns",
+			Help: "Maximum number of connections allowed in the PostgreSQL pool.",
+		}, func() float64 { return float64(fn().MaxConns) }),
+		prometheus.NewCounterFunc(prometheus.CounterOpts{
+			Name: "db_pool_empty_acquire_total",
+			Help: "Cumulative number of pool acquires that had to wait because all connections were busy.",
+		}, func() float64 { return float64(fn().EmptyAcquireCount) }),
+	)
+}
+
 // Handler returns the Prometheus HTTP scrape handler backed by the private registry.
 func (m *Metrics) Handler() http.Handler {
 	if m == nil || m.registry == nil {
