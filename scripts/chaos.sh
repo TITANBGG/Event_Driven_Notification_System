@@ -37,7 +37,7 @@ psql_q() {
 }
 mock_config() { curl -s --max-time 10 -X POST "${MOCK_URL}/config" -H 'Content-Type: application/json' -d "$1" >/dev/null || true; }
 
-# shellcheck disable=SC2317 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup() {
   local rc=$?
   if [[ -n "${LOAD_PID:-}" ]]; then kill "$LOAD_PID" 2>/dev/null || true; fi

@@ -50,7 +50,7 @@ RECOVERY_SECONDS="${RECOVERY_SECONDS:-540}"
 WORK="$(mktemp -d)"
 SERVICES=(api worker-1 worker-2 redis postgres mockprovider jaeger prometheus)
 
-# shellcheck disable=SC2317 # invoked by EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by EXIT trap
 cleanup() {
   local rc=$?
   if [[ -n "${WATCH_PID:-}" ]]; then kill "$WATCH_PID" 2>/dev/null || true; fi

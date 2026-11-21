@@ -5,7 +5,7 @@
 #   ./scripts/test-docker.sh            unit + integration tests (default)
 #   ./scripts/test-docker.sh unit       unit tests with -race (no extra containers)
 #   ./scripts/test-docker.sh integration Testcontainers suite (starts PostgreSQL 16 + Redis 7 containers)
-#   ./scripts/test-docker.sh lint       gofmt, go vet (both build tags) and golangci-lint (CI's version)
+#   ./scripts/test-docker.sh lint       gofmt, go vet (both build tags), golangci-lint and shellcheck (CI's versions)
 #
 # Integration tests start sibling containers through the host's Docker socket, and reach them through
 # host.docker.internal (Docker Desktop provides it; on Linux --add-host maps it to the host gateway).
@@ -14,6 +14,7 @@ set -euo pipefail
 
 GO_IMAGE="golang:1.27.4"
 GOLANGCI_LINT_VERSION="v2.15.0" # keep in sync with .github/workflows/ci.yml
+SHELLCHECK_VERSION="v0.11.0"     # keep in sync with .github/workflows/ci.yml
 MODE="${1:-all}"
 
 cd "$(dirname "$0")/.."
@@ -51,6 +52,8 @@ lint() {
     golangci-lint version --short 2>/dev/null | grep -qx 'v\\?${GOLANGCI_LINT_VERSION#v}' ||
       go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}
     golangci-lint run ./... && golangci-lint run --build-tags=integration ./internal/integration/..."
+  echo "=== lint: shellcheck ${SHELLCHECK_VERSION} ==="
+  docker run --rm -v "${SRC}:/mnt" -w /mnt "koalaman/shellcheck:${SHELLCHECK_VERSION}" -x scripts/*.sh
 }
 
 case "$MODE" in

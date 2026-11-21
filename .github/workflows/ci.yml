@@ -24,10 +24,11 @@ env:
   SQLC_VERSION: 1.28.0
   MIGRATE_VERSION: v4.18.2
   REDOCLY_CLI_VERSION: 2.82.0
+  SHELLCHECK_VERSION: v0.11.0
 
 jobs:
   lint:
-    name: Lint (gofmt, go vet, golangci-lint)
+    name: Lint (gofmt, go vet, golangci-lint, shellcheck)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -52,6 +53,9 @@ jobs:
           # Build the linter with the job's Go 1.27.4 toolchain: a prebuilt binary compiled with an
           # older Go refuses to analyse a module that declares a newer `go` directive.
           install-mode: goinstall
+      # The scenario scripts are deliverables too (make races, chaos, soak, verify, ...).
+      - name: shellcheck scripts
+        run: docker run --rm -v "$PWD:/mnt" -w /mnt "koalaman/shellcheck:${SHELLCHECK_VERSION}" -x scripts/*.sh
 
   test:
     name: Unit tests (-race, coverage)

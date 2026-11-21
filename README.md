@@ -65,6 +65,8 @@ PROVIDER_URL="https://webhook.site/<uuid>" docker compose up -d worker-1 worker-
 
 Step-by-step setup and a verified run for all three channels are in [section 11](#11-mock-provider-vs-webhooksite).
 
+On Windows, if `http://localhost:8080` times out while `http://127.0.0.1:8080` answers, Docker Desktop's IPv6 (`[::1]`) port forwarding has gone stale. This is a Docker Desktop issue, not this project's; use `127.0.0.1` or restart Docker Desktop.
+
 PostgreSQL, Redis and the workers' `:9091` health/metrics port are reachable only inside the Compose network; they are not published on the host. Use `docker compose exec postgres psql -U notif notif` or `docker compose exec redis redis-cli` to inspect them.
 
 ---

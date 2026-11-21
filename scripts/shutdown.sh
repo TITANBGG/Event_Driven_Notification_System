@@ -12,7 +12,7 @@
 #                                     `compose restart` every 5s for 2 minutes under the same load; every
 #                                     restart must drain, and the run must end with 0 abandoned attempts,
 #                                     0 duplicates and no "lease lost" log line (~5 min)
-# shellcheck disable=SC2317 # functions run indirectly through `at` and the EXIT trap
+# shellcheck disable=SC2317,SC2329 # functions run indirectly through `at` and the EXIT trap
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
@@ -48,7 +48,7 @@ psql_q() { "${COMPOSE[@]}" exec -T postgres psql -U notif -d notif -qAt -F ' ' -
 redis_q() { "${COMPOSE[@]}" exec -T redis redis-cli --raw "$@" | tr -d '\r'; }
 mock_config() { curl -s --max-time 10 -X POST "${MOCK_URL}/config" -H 'Content-Type: application/json' -d "$1" >/dev/null || true; }
 
-# shellcheck disable=SC2317 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup() {
   if [[ -n "${LOAD_PID:-}" ]]; then kill "$LOAD_PID" 2>/dev/null || true; fi
   mock_config '{"latencyMs":0,"latencyJitterMs":0}'

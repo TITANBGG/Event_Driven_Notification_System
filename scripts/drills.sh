@@ -5,7 +5,7 @@
 #
 #   ./scripts/drills.sh            # all drills (about 6-8 minutes)
 #   ./scripts/drills.sh 3 5        # selected drills
-# shellcheck disable=SC2317 # predicate functions are invoked indirectly through wait_until
+# shellcheck disable=SC2317,SC2329 # predicate functions are invoked indirectly through wait_until
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"

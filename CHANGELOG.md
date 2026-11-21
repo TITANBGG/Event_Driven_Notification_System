@@ -73,6 +73,8 @@ code bugs are pinned by regression tests, the line-ending one by the clean-room 
   - `stress.sh`: 64 MB Redis.
   - `soak.sh`: 60 minutes with provider outages and 50 WebSocket readers.
   - `ws-boundaries.sh`.
+- CI lints every script with shellcheck v0.11.0 (also in `test-docker.sh lint`); v0.11's new `SC2329`
+  flagged functions called only through `trap`, `at` or `wait_until`, now annotated.
 - `invariants.sh` (PostgreSQL-backed, linear-time provider stats parsing) and `ratecheck.sh` (busiest
   sliding 1 s window per channel).
 

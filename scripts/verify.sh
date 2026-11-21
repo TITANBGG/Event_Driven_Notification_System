@@ -49,7 +49,7 @@ step() {
 
 stack_up() { "${COMPOSE_CMD[@]}" up -d --build --wait; }
 
-step "lint (gofmt, vet, golangci)" ./scripts/test-docker.sh lint
+step "lint (Go + shellcheck)" ./scripts/test-docker.sh lint
 step "unit tests (-race)" ./scripts/test-docker.sh unit
 step "integration tests" ./scripts/test-docker.sh integration
 if ((STACK)); then
