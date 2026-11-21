@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Event-Driven Notification System API
-  version: 1.1.0
+  version: 1.1.1
   description: |
     Multi-channel (SMS, email, push) notification API. Requests are validated and persisted in PostgreSQL
     (the source of truth), then queued in Redis for asynchronous delivery by stateless workers
@@ -19,11 +19,12 @@ info:
       deduplicate retries.
 
     **Error codes** (`error.code` in the common `ErrorResponse` envelope): `malformed_json`, `unsupported_media_type`,
-    `payload_too_large`, `validation_failed`, `batch_too_large`, `invalid_uuid`, `invalid_cursor`, `not_found`,
-    `idempotency_conflict`, `item_idempotency_key_exists`, `not_cancellable`, `not_retryable`, `template_name_exists`,
-    `missing_ws_filter`, `upgrade_required`, `too_many_ws_clients`, `method_not_allowed`, `request_timeout`, `service_unavailable`,
-    `internal_error`. Field-level problems are listed in `error.details[]` with dot/bracket paths such as
-    `notifications[3].recipient`.
+    `payload_too_large`, `validation_failed`, `batch_too_large`, `invalid_uuid`, `invalid_channel`, `invalid_cursor`,
+    `not_found`, `invalid_transition`, `idempotency_conflict`, `item_idempotency_key_exists`, `duplicate_idempotency_key`,
+    `template_not_found`, `missing_variable`, `not_cancellable`, `not_retryable`, `template_name_exists`,
+    `missing_ws_filter`, `upgrade_required`, `forbidden_origin`, `too_many_ws_clients`, `method_not_allowed`,
+    `request_timeout`, `service_unavailable`, `internal_error`. Field-level problems are listed in `error.details[]`
+    with dot/bracket paths such as `notifications[3].recipient`.
   license:
     name: MIT
     url: https://opensource.org/licenses/MIT
@@ -360,6 +361,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/notifications/{id}/cancel:
     post:
@@ -387,6 +390,8 @@ paths:
           $ref: "#/components/responses/NotCancellable"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/notifications/{id}/retry:
     post:
@@ -415,6 +420,8 @@ paths:
           $ref: "#/components/responses/NotRetryable"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/batches/{id}:
     get:
@@ -446,7 +453,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/BatchDetailResponse"
         "400":
-          $ref: "#/components/responses/InvalidUUID"
+          $ref: "#/components/responses/InvalidUUIDOrCursor"
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -480,6 +487,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "500":
           $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /api/v1/templates:
     post:
@@ -616,7 +625,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/TemplateResponse"
         "400":
-          $ref: "#/components/responses/InvalidUUID"
+          $ref: "#/components/responses/InvalidUUIDOrMalformedJSON"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
@@ -680,7 +689,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/TemplatePreviewResponse"
         "400":
-          $ref: "#/components/responses/MalformedJSON"
+          $ref: "#/components/responses/InvalidUUIDOrMalformedJSON"
         "404":
           $ref: "#/components/responses/NotFound"
         "415":
@@ -761,6 +770,8 @@ paths:
                   code: missing_ws_filter
                   message: at least one filter query parameter (notificationId, batchId, or channel) is required
                 correlationId: 01a1faec-fa8d-7807-bd64-5e7e9125458f
+        "403":
+          $ref: "#/components/responses/ForbiddenOrigin"
         "426":
           description: "Valid filter but not a WebSocket upgrade request (`Connection: Upgrade` and `Upgrade: websocket` are required)"
           headers:
@@ -777,6 +788,8 @@ paths:
                   code: upgrade_required
                   message: "this endpoint only accepts WebSocket upgrade requests (Connection: Upgrade, Upgrade: websocket)"
                 correlationId: 01a1faec-fa8d-7807-bd64-5e7e9125458f
+        "500":
+          $ref: "#/components/responses/InternalError"
         "503":
           description: Maximum concurrent WebSocket clients (`MAX_WS_CLIENTS`) exceeded
           content:
@@ -1333,7 +1346,7 @@ components:
     UpsertTemplateRequest:
       type: object
       additionalProperties: false
-      required: [name, channel, body, variables]
+      required: [name, channel, body]
       properties:
         name:
           type: string
@@ -1352,6 +1365,7 @@ components:
           minLength: 1
         variables:
           type: array
+          description: Declared placeholder variable names; optional when body/subject/title contain no {{variable}} placeholders.
           items:
             type: string
 
@@ -1534,6 +1548,55 @@ components:
               code: invalid_uuid
               message: parameter "id" must be a valid UUID
             correlationId: 01a1faec-0000-7000-8000-000000000011
+    InvalidUUIDOrCursor:
+      description: Invalid UUID path parameter or malformed pagination cursor
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            invalidUuid:
+              value:
+                error:
+                  code: invalid_uuid
+                  message: parameter "id" must be a valid UUID
+                correlationId: 01a1faec-0000-7000-8000-000000000011
+            invalidCursor:
+              value:
+                error:
+                  code: invalid_cursor
+                  message: cursor parameter is malformed
+                correlationId: 01a1faec-a0d0-7993-b4bd-4e236b3a2eed
+    InvalidUUIDOrMalformedJSON:
+      description: Invalid UUID path parameter or malformed JSON request body
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            invalidUuid:
+              value:
+                error:
+                  code: invalid_uuid
+                  message: parameter "id" must be a valid UUID
+                correlationId: 01a1faec-0000-7000-8000-000000000011
+            malformedJson:
+              value:
+                error:
+                  code: malformed_json
+                  message: 'malformed JSON request: json: unknown field "foo"'
+                correlationId: 01a1faec-0000-7000-8000-000000000010
+    ForbiddenOrigin:
+      description: Request Origin is not in the allowed WebSocket origins
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: forbidden_origin
+              message: request origin is not allowed for WebSocket connections
+            correlationId: 01a1faec-0000-7000-8000-000000000019
     BadCursor:
       description: Malformed pagination cursor
       content:

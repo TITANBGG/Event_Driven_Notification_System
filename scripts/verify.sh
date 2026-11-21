@@ -26,6 +26,14 @@ else COMPOSE_CMD=(docker-compose); fi
 LOG_DIR="$(mktemp -d)"
 RESULTS=()
 FAILED=0
+# Keep per-step logs only when something fails; remove the temp dir on a clean pass.
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+cleanup() {
+  if ((FAILED == 0)); then
+    rm -rf "$LOG_DIR"
+  fi
+}
+trap cleanup EXIT
 
 # step <name> <command...>: runs the command with its output in a log file, records PASS/FAIL and time.
 step() {
@@ -59,7 +67,11 @@ if ((STACK)); then
 fi
 
 echo
-echo "=== verify summary (logs: ${LOG_DIR}) ==="
+if ((FAILED)); then
+  echo "=== verify summary (logs kept: ${LOG_DIR}) ==="
+else
+  echo "=== verify summary ==="
+fi
 for r in "${RESULTS[@]}"; do
   IFS='|' read -r name status took <<<"$r"
   printf '%-30s %-5s %s\n' "$name" "$status" "$took"

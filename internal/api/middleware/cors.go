@@ -40,7 +40,7 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 				w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
 				w.Header().Set("Access-Control-Expose-Headers", "Idempotent-Replayed, X-Correlation-ID")
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, X-Correlation-ID, Authorization")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key, X-Correlation-ID, traceparent, tracestate, Authorization")
 				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 

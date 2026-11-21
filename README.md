@@ -1068,13 +1068,13 @@ Output:
 openapi: 3.0.3
 info:
   title: Event-Driven Notification System API
-  version: 1.1.0
+  version: 1.1.1
 GET /demo -> 200 text/html; charset=utf-8
 ```
 
 Swagger UI at http://localhost:8081 renders the same spec, and **Try it out** calls the API on port 8080 (CORS allows that origin):
 
-![Swagger UI listing the System and Notifications endpoints of the 1.0.0 spec](docs/images/swagger.png)
+![Swagger UI listing the System and Notifications endpoints](docs/images/swagger.png)
 
 The `/demo` page creates a batch and follows it over the WebSocket. Here 40 SMS went from `pending` through `processing` to `sent`, and the log shows the events as they arrived:
 
@@ -1233,7 +1233,7 @@ After v1.0.0 the system went through a test program aimed at breaking it, run ag
 
 | Area | What was done | Outcome |
 |---|---|---|
-| Unit, integration, fuzz | 134 test functions, 20 Testcontainers scenarios, 7 fuzz targets (~70M executions) | all pass; fuzzing found 3 bugs (below) |
+| Unit, integration, fuzz | 137 test functions, 20 Testcontainers scenarios, 7 fuzz targets (~70M executions) | all pass; fuzzing found 3 bugs (below) |
 | Throughput and rate limit | 100k flash sale; 250k into a 64 MB Redis; 60-minute soak at ~250/s | busiest 1 s window ≤ 98 per channel in every run |
 | Concurrency | 6 race scenarios (cancel vs send, batch cancel, idempotency, manual retry, scheduled cancel, template delete) | 0 cancelled sends, 0 double creates |
 | Failures | Worker/Redis/PostgreSQL kills, slow and failing provider, timeouts beyond `PROVIDER_TIMEOUT`, rolling restarts, graceful shutdown | 0 lost; duplicates only from `SIGKILL` mid-send (at-least-once, documented) |
@@ -1619,13 +1619,13 @@ How to read the resource table:
 | `openapi-lint` | `@redocly/cli` (pinned) lints `api/openapi.yaml` using `redocly.yaml` |
 | `docker` | Builds the image with `docker/build-push-action` (no push, GHA layer cache) and validates `docker compose config` without any `.env` |
 
-`.github/workflows/release.yml` is the CD part: pushing a tag such as `v1.0.0` builds `linux/amd64` + `linux/arm64` images and pushes them to `ghcr.io/titanbgg/notification-system` (`{{version}}`, `{{major}}.{{minor}}`, `sha-<short>` tags) using `GITHUB_TOKEN`, with `packages: write` granted only to that job. A second job then creates the GitHub Release, using the matching [`CHANGELOG.md`](CHANGELOG.md) section as the release notes (`scripts/release-notes.sh`). A tag without a changelog section fails that job. That job is the only one granted `contents: write`.
+`.github/workflows/release.yml` is the CD part: pushing a tag such as `v1.1.0` builds `linux/amd64` + `linux/arm64` images and pushes them to `ghcr.io/titanbgg/notification-system` (`{{version}}`, `{{major}}.{{minor}}`, `sha-<short>` tags) using `GITHUB_TOKEN`, with `packages: write` granted only to that job. A second job then creates the GitHub Release, using the matching [`CHANGELOG.md`](CHANGELOG.md) section as the release notes (`scripts/release-notes.sh`). A tag without a changelog section fails that job. That job is the only one granted `contents: write`.
 
 To run the released image instead of building locally, retag it to the name Compose expects:
 
 ```bash
-docker pull ghcr.io/titanbgg/notification-system:1.1.0
-docker tag ghcr.io/titanbgg/notification-system:1.1.0 notification-system:local
+docker pull ghcr.io/titanbgg/notification-system:1.1.1
+docker tag ghcr.io/titanbgg/notification-system:1.1.1 notification-system:local
 docker compose up --no-build
 ```
 

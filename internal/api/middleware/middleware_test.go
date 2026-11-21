@@ -171,6 +171,8 @@ func TestCORS(t *testing.T) {
 		assert.Equal(t, "Idempotent-Replayed, X-Correlation-ID", rec.Header().Get("Access-Control-Expose-Headers"))
 		assert.Contains(t, rec.Header().Get("Access-Control-Allow-Headers"), "Idempotency-Key")
 		assert.Contains(t, rec.Header().Get("Access-Control-Allow-Headers"), "X-Correlation-ID")
+		assert.Contains(t, rec.Header().Get("Access-Control-Allow-Headers"), "traceparent")
+		assert.Contains(t, rec.Header().Get("Access-Control-Allow-Headers"), "tracestate")
 	})
 
 	t.Run("disallowed origin receives no allow header", func(t *testing.T) {

@@ -7,6 +7,25 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-22
+
+API contract fixes from a pre-submission audit: the OpenAPI spec now matches every status code and
+error code the handlers return, and two browser-facing gaps are closed.
+
+### Fixed
+
+- WebSocket upgrades from disallowed `Origin` headers now answer `403 forbidden_origin` in the
+  standard JSON `ErrorResponse` envelope before subscribing to the Hub or querying the snapshot,
+  instead of returning the library's `text/plain` `403`. The check mirrors `coder/websocket`'s own
+  origin rules, and a parity test compares both decisions over a matrix of origins and patterns.
+- CORS preflight (`Access-Control-Allow-Headers`) now allows `traceparent` and `tracestate`,
+  matching the OpenAPI header parameters.
+- Synchronized `api/openapi.yaml` with handler responses (`503` on single/batch detail/cancel/retry,
+  `400` cursor/JSON variants, `403`/`500` on `/api/v1/ws`, full `error.code` catalog, and optional
+  `variables` when a template has no placeholders).
+- `scripts/verify.sh` now removes its temporary log directory when all steps pass (preserving logs
+  only on failure).
+
 ## [1.1.0] - 2026-11-21
 
 A test program aimed at breaking the system: fuzzing, race storms, chaos, constrained resources,

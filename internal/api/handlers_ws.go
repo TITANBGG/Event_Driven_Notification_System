@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -60,6 +61,18 @@ func (h *handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Enforce the Origin allowlist before subscribing to the Hub or reading the snapshot so a
+	// disallowed origin receives a standard JSON 403 without consuming a hub slot or DB query.
+	originPatterns := buildWSOriginPatterns(h.cfg.CORSAllowedOrigins, r.Host)
+	if !isAllowedWSOrigin(r.Host, r.Header.Get("Origin"), originPatterns) {
+		writeError(w, r, h.logger, &apiError{
+			status:  http.StatusForbidden,
+			code:    "forbidden_origin",
+			message: "request origin is not allowed for WebSocket connections",
+		})
+		return
+	}
+
 	if h.hub == nil {
 		writeError(w, r, h.logger, &apiError{
 			status:  http.StatusServiceUnavailable,
@@ -95,7 +108,7 @@ func (h *handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	conn, acceptErr := websocket.Accept(w, r, &websocket.AcceptOptions{
-		OriginPatterns: buildWSOriginPatterns(h.cfg.CORSAllowedOrigins, r.Host),
+		OriginPatterns: originPatterns,
 	})
 	if acceptErr != nil {
 		return
@@ -312,4 +325,31 @@ func buildWSOriginPatterns(origins []string, reqHost string) []string {
 	add("localhost:*")
 	add("127.0.0.1:*")
 	return patterns
+}
+
+// isAllowedWSOrigin mirrors coder/websocket's authenticateOrigin (v1.8.14) rule for rule, so the
+// handler can answer a refused origin with the standard JSON envelope before websocket.Accept would
+// write its own text/plain 403. Any divergence would let one of the two checks decide differently:
+// a stricter copy rejects origins the library accepts, a looser one lets the plain-text 403 through.
+func isAllowedWSOrigin(reqHost, origin string, patterns []string) bool {
+	if origin == "" {
+		return true // not a browser request; the library allows it too
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(reqHost, u.Host) {
+		return true
+	}
+	for _, p := range patterns {
+		target := u.Host
+		if strings.Contains(p, "://") {
+			target = u.Scheme + "://" + u.Host
+		}
+		if matched, matchErr := path.Match(strings.ToLower(p), strings.ToLower(target)); matchErr == nil && matched {
+			return true
+		}
+	}
+	return false
 }
