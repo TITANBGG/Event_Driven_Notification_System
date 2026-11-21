@@ -79,10 +79,20 @@ func main() {
 	flag.DurationVar(&cfg.drainTimeout, "drain-timeout", 180*time.Second, "Timeout waiting for flood batches to complete")
 	flag.BoolVar(&cfg.skipBoundaries, "skip-boundaries", false, "Skip HTTP/SMS/Email/Push/WS boundary checks")
 	flag.BoolVar(&cfg.skipWS, "skip-ws", false, "Skip WebSocket flood scenarios")
+	holdFor := flag.Duration("hold", 0, "Instead of the suite: keep -hold-clients readers subscribed this long (soak load)")
+	holdClients := flag.Int("hold-clients", 50, "Readers for -hold, spread over sms/email/push")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	if *holdFor > 0 {
+		if err := runWSHold(ctx, cfg.baseURL, *holdClients, cfg.dialWorkers, *holdFor, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "wsflood -hold failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := runSuite(ctx, cfg, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "wsflood failed: %v\n", err)

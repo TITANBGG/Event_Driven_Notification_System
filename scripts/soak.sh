@@ -16,6 +16,19 @@
 #   FAILURE_RATE     Mock transient failure rate during soak (default: 0.005)
 #   DRAIN_TIMEOUT    Seconds to wait for terminal completion after load stops (default: 900)
 #   SOAK_REPORT      Optional path to keep metrics.csv after a passing run
+#   OUTAGE_EVERY     Seconds between provider outages (default: 600; 0 disables them)
+#   OUTAGE_OFFSET    First outage this many seconds in (default: 300, so every 10-minute slice has one)
+#   OUTAGE_SECONDS   Length of each outage: every provider call answers 500 (default: 30)
+#   WS_CLIENTS       WebSocket readers held open for the whole load window (default: 50; 0 disables)
+#
+# Besides leaks, the run fails if: any WebSocket reader is dropped or starves; the ready queue is not
+# back to its pre-outage level (+2,000) before the next outage (RECOVERY_SECONDS after it ended); the
+# outages never opened a breaker (they would have tested nothing); or end-to-end p99 in the last
+# 10-minute slice is over twice the first.
+#
+# Why not 3 minutes: at 250/s against ~290/s of capacity only ~40/s is spare. In the 2026-11-21 run each
+# 30s outage (plus the breaker's open state) built a backlog of 6,500-8,700 that took 4.4-5.7 minutes
+# to drain. So the check is "no accumulation from one outage to the next", the property that matters.
 set -euo pipefail
 # shellcheck source=scripts/lib.sh
 source "$(dirname "$0")/lib.sh"
@@ -28,6 +41,11 @@ SAMPLE_INTERVAL="${SAMPLE_INTERVAL:-30}"
 FAILURE_RATE="${FAILURE_RATE:-0.005}"
 DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-900}"
 P99_MAX_MS="${P99_MAX_MS:-3000}"
+OUTAGE_EVERY="${OUTAGE_EVERY:-600}"
+OUTAGE_OFFSET="${OUTAGE_OFFSET:-300}"
+OUTAGE_SECONDS="${OUTAGE_SECONDS:-30}"
+WS_CLIENTS="${WS_CLIENTS:-50}"
+RECOVERY_SECONDS="${RECOVERY_SECONDS:-540}"
 
 WORK="$(mktemp -d)"
 SERVICES=(api worker-1 worker-2 redis postgres mockprovider jaeger prometheus)
@@ -36,6 +54,7 @@ SERVICES=(api worker-1 worker-2 redis postgres mockprovider jaeger prometheus)
 cleanup() {
   local rc=$?
   if [[ -n "${WATCH_PID:-}" ]]; then kill "$WATCH_PID" 2>/dev/null || true; fi
+  docker rm -f "soak-ws-${RUN_TAG}" >/dev/null 2>&1 || true
   mock_healthy || true
   if [[ -n "${SOAK_REPORT:-}" && -f "$WORK/metrics.csv" ]]; then
     cp "$WORK/metrics.csv" "$SOAK_REPORT" 2>/dev/null || true
@@ -157,6 +176,27 @@ printf '%s\n' "$baseline_line" >>"$WORK/metrics.csv"
 "$LIB_DIR/prom-snapshot.sh" watch "$SAMPLE_INTERVAL" "$WORK/metrics.csv" >/dev/null 2>&1 &
 WATCH_PID=$!
 
+# WebSocket readers run in the pinned golang image on the Compose network, so the host needs no Go.
+WS_CONTAINER=""
+if ((WS_CLIENTS > 0)); then
+  WS_CONTAINER="soak-ws-${RUN_TAG}"
+  ws_net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$("${COMPOSE[@]}" ps -q api)" | awk '{print $1}')"
+  src="$(cd "$LIB_DIR/.." && (pwd -W 2>/dev/null || pwd))"
+  MSYS_NO_PATHCONV=1 docker run -d --name "$WS_CONTAINER" --network "$ws_net" -v "${src}:/src" -w /src \
+    -v notif-gomod:/go/pkg/mod -v notif-gobuild:/root/.cache/go-build golang:1.27.4 \
+    go run ./cmd/wsflood -url http://api:8080 -hold "${SOAK_SECONDS}s" -hold-clients "$WS_CLIENTS" >/dev/null
+  log "WebSocket readers: ${WS_CLIENTS} in container ${WS_CONTAINER} on ${ws_net}"
+fi
+
+ready_total() { echo $(($(queue_depth sms) + $(queue_depth email) + $(queue_depth push))); }
+next_outage=$(( $(date +%s) + OUTAGE_OFFSET ))
+outage_end=0
+OUTAGES=0
+RECOVERY_DUE=()
+RECOVERY_LIMIT=()
+RECOVERY_FAILS=0
+RECOVERY_LOG=""
+
 t_start=$(date +%s)
 next_progress=$((t_start + 300))
 seq=0
@@ -185,6 +225,32 @@ while (($(date +%s) - t_start < SOAK_SECONDS)); do
   fi
 
   now_s=$(date +%s)
+  # Provider outage: every call answers 500 for OUTAGE_SECONDS. Only started while its recovery check
+  # still falls inside the load window (after the load stops, the queue drains trivially).
+  if ((OUTAGE_EVERY > 0 && outage_end == 0 && now_s >= next_outage && now_s - t_start < SOAK_SECONDS - OUTAGE_SECONDS - RECOVERY_SECONDS)); then
+    before="$(ready_total)"
+    mock_config '{"failureRate":1}'
+    outage_end=$((now_s + OUTAGE_SECONDS))
+    OUTAGES=$((OUTAGES + 1))
+    RECOVERY_DUE+=($((outage_end + RECOVERY_SECONDS)))
+    RECOVERY_LIMIT+=($((before + 2000)))
+    log "provider outage ${OUTAGES} for ${OUTAGE_SECONDS}s (ready queue before: ${before})"
+    next_outage=$((next_outage + OUTAGE_EVERY))
+  elif ((outage_end > 0 && now_s >= outage_end)); then
+    mock_config "{\"failureRate\":${FAILURE_RATE}}"
+    outage_end=0
+    log "provider outage over"
+  fi
+  for i in "${!RECOVERY_DUE[@]}"; do
+    if ((RECOVERY_DUE[i] > 0 && now_s >= RECOVERY_DUE[i])); then
+      after="$(ready_total)"
+      RECOVERY_LOG+="#$((i + 1)): ${after} (limit ${RECOVERY_LIMIT[i]}) "
+      if ((after > RECOVERY_LIMIT[i])); then RECOVERY_FAILS=$((RECOVERY_FAILS + 1)); fi
+      log "outage $((i + 1)) recovery: ready queue ${after} ${RECOVERY_SECONDS}s after it ended (limit ${RECOVERY_LIMIT[i]})"
+      RECOVERY_DUE[i]=0
+    fi
+  done
+
   if ((now_s >= next_progress)); then
     elapsed=$((now_s - t_start))
     last_row="$(tail -n 1 "$WORK/metrics.csv")"
@@ -287,8 +353,13 @@ END {
   e_ga/=ec; e_gw1/=ec; e_gw2/=ec; e_aa/=ec; e_aw1/=ec; e_aw2/=ec; e_fa/=ec; e_fw1/=ec; e_fw2/=ec
   l_ga/=lc; l_gw1/=lc; l_gw2/=lc; l_aa/=lc; l_aw1/=lc; l_aw2/=lc; l_fa/=lc; l_fw1/=lc; l_fw2/=lc
 
-  g_ok = (fin[2] <= base_ga + 20 && fin[3] <= base_gw1 + 20 && fin[4] <= base_gw2 + 20 && l_ga <= e_ga + 30 && l_gw1 <= e_gw1 + 30 && l_gw2 <= e_gw2 + 30) ? 1 : 0
-  fd_ok = (fin[8] <= base_fa + 20 && fin[9] <= base_fw1 + 20 && fin[10] <= base_fw2 + 20 && l_fa <= e_fa + 30 && l_fw1 <= e_fw1 + 30 && l_fw2 <= e_fw2 + 30) ? 1 : 0
+  # Post-drain values are compared with the larger of the cold baseline and the early steady average:
+  # pools (go-redis keeps idle connections for 30 minutes) legitimately grow from a cold start under
+  # load, which is warm-up, not a leak. A leak keeps growing, so late vs early catches it.
+  r_ga = (e_ga > base_ga) ? e_ga : base_ga; r_gw1 = (e_gw1 > base_gw1) ? e_gw1 : base_gw1; r_gw2 = (e_gw2 > base_gw2) ? e_gw2 : base_gw2
+  r_fa = (e_fa > base_fa) ? e_fa : base_fa; r_fw1 = (e_fw1 > base_fw1) ? e_fw1 : base_fw1; r_fw2 = (e_fw2 > base_fw2) ? e_fw2 : base_fw2
+  g_ok = (fin[2] <= r_ga + 20 && fin[3] <= r_gw1 + 20 && fin[4] <= r_gw2 + 20 && l_ga <= e_ga + 30 && l_gw1 <= e_gw1 + 30 && l_gw2 <= e_gw2 + 30) ? 1 : 0
+  fd_ok = (fin[8] <= r_fa + 20 && fin[9] <= r_fw1 + 20 && fin[10] <= r_fw2 + 20 && l_fa <= e_fa + 30 && l_fw1 <= e_fw1 + 30 && l_fw2 <= e_fw2 + 30) ? 1 : 0
 
   lim_aa = (e_aa * 2 > e_aa + 16*1024*1024) ? e_aa * 2 : e_aa + 16*1024*1024
   lim_aw1 = (e_aw1 * 2 > e_aw1 + 16*1024*1024) ? e_aw1 * 2 : e_aw1 + 16*1024*1024
@@ -308,6 +379,37 @@ log "trend: ${trend_detail}"
 check "no_goroutine_leak" "$((g_ok == 1 ? 0 : 1))" "$trend_detail"
 check "no_fd_leak" "$((fd_ok == 1 ? 0 : 1))" "$trend_detail"
 check "no_heap_leak" "$((h_ok == 1 ? 0 : 1))" "$trend_detail"
+
+if [[ -n "$WS_CONTAINER" ]]; then
+  ws_rc="$(docker wait "$WS_CONTAINER" 2>/dev/null || echo 1)"
+  ws_out="$(docker logs "$WS_CONTAINER" 2>&1 | grep 'ws-hold' | tail -n 2 | tr '\n' ' ')"
+  check "websocket_readers_held" "$((ws_rc == 0 ? 0 : 1))" "${WS_CLIENTS} readers for ${SOAK_SECONDS}s: ${ws_out:-no output}"
+fi
+
+if ((OUTAGE_EVERY > 0)); then
+  breaker_defer="$(psql_q "SELECT COUNT(*) FROM delivery_attempts a JOIN notifications n ON n.id = a.notification_id
+    WHERE n.created_at >= '${START}'::timestamptz AND a.outcome = 'circuit_open';")"
+  evaluated=$(( ${#RECOVERY_DUE[@]} ))
+  for d in "${RECOVERY_DUE[@]}"; do ((d > 0)) && evaluated=$((evaluated - 1)); done
+  check "outages_opened_breaker" "$((OUTAGES > 0 && breaker_defer > 0 ? 0 : 1))" \
+    "${OUTAGES} outages of ${OUTAGE_SECONDS}s, ${breaker_defer} circuit_open deferrals"
+  check "recovered_after_outages" "$((evaluated == OUTAGES && RECOVERY_FAILS == 0 ? 0 : 1))" \
+    "ready queue ${RECOVERY_SECONDS}s after each outage: ${RECOVERY_LOG:-none evaluated} (${evaluated}/${OUTAGES} evaluated)"
+fi
+
+# End-to-end latency per slice of creation time: the last slice must not be over twice the first.
+slice=$((SOAK_SECONDS >= 1200 ? 600 : SOAK_SECONDS / 2))
+psql_q "SELECT FLOOR(EXTRACT(EPOCH FROM created_at - '${START}'::timestamptz) / ${slice})::int,
+    ROUND(1000 * EXTRACT(EPOCH FROM percentile_cont(0.50) WITHIN GROUP (ORDER BY sent_at - created_at))),
+    ROUND(1000 * EXTRACT(EPOCH FROM percentile_cont(0.99) WITHIN GROUP (ORDER BY sent_at - created_at)))
+  FROM notifications WHERE created_at >= '${START}'::timestamptz AND status = 'sent'
+    AND created_at < '${START}'::timestamptz + make_interval(secs => ${SOAK_SECONDS} - ${SOAK_SECONDS} % ${slice})
+  GROUP BY 1 ORDER BY 1;" >"$WORK/slices"
+slices_txt="$(awk -v s="$slice" '{printf "%d-%dmin p50 %sms p99 %sms; ", $1 * s / 60, ($1 + 1) * s / 60, $2, $3}' "$WORK/slices")"
+read -r first_p99 last_p99 <<<"$(awk 'NR == 1 {f = $3} {l = $3} END {print f + 0, l + 0}' "$WORK/slices")"
+log "end-to-end latency by ${slice}s slice: ${slices_txt}"
+check "latency_trend" "$((first_p99 > 0 && last_p99 <= 2 * first_p99 ? 0 : 1))" \
+  "p99 first slice ${first_p99}ms, last ${last_p99}ms (need last <= 2x first); ${slices_txt}"
 
 jaeger_final="$(docker stats --no-stream --format '{{.MemUsage}}' "$("${COMPOSE[@]}" ps -q jaeger)" 2>/dev/null || echo "unknown")"
 log "jaeger final container memory: ${jaeger_final}"

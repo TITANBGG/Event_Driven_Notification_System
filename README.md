@@ -57,6 +57,14 @@ To run the whole test suite with only Docker, see [section 10](#10-testing): `./
 | Prometheus | http://localhost:9090 (scrapes the API and both workers every 5s) |
 | Mock provider | http://localhost:8090 (`GET /stats`, `POST /reset`) |
 
+**External provider.** The assignment's provider is `webhook.site`. Out of the box the workers send to the bundled mock provider instead (`cmd/mockprovider`, same request and `202` response contract), so a fresh `docker compose up` works offline and load tests do not exhaust webhook.site's free tier. To deliver to webhook.site, set its `202` response and restart the workers with your URL:
+
+```bash
+PROVIDER_URL="https://webhook.site/<uuid>" docker compose up -d worker-1 worker-2
+```
+
+Step-by-step setup and a verified run for all three channels are in [section 11](#11-mock-provider-vs-webhooksite).
+
 PostgreSQL, Redis and the workers' `:9091` health/metrics port are reachable only inside the Compose network; they are not published on the host. Use `docker compose exec postgres psql -U notif notif` or `docker compose exec redis redis-cli` to inspect them.
 
 ---
@@ -1239,6 +1247,7 @@ make isolation          # 30,000 SMS backlog vs ~50/s email and push: email/push
 make priority           # 1,000 low under 3 min of 2x-capacity high: low >= 8% per 10s slice, high overtakes older low (~9 min)
 make provider-timeout   # provider slower than PROVIDER_TIMEOUT: breaker opens, deferrals not counted, all sent; permanent 4xx: 1 attempt, DLQ (~4 min)
 make stress             # stress profile only: 50k then 200k into a 64 MB Redis; OOM on enqueue, nothing lost, no container killed (~20 min)
+make soak               # 60 min: ~250/s mixed load, 50 WebSocket readers, a 30s provider outage every 10 min; leak, recovery and latency checks (~70 min)
 make races              # concurrent cancel, batch cancel, idempotency, manual retry, scheduled-cancel and template-delete races (~4 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
 make fuzz               # Go native fuzzing of 7 parsers of untrusted input, incl. PII masking, Retry-After and the HTTP API (FUZZTIME=5m each)
@@ -1523,23 +1532,42 @@ The partial index holds only non-terminal rows, so the scans cost the same whate
 
 ### Endurance soak: 60 minutes
 
-`scripts/soak.sh` (`make soak`) runs 60 minutes of continuous mixed-channel, mixed-priority traffic (`1,000` items every `4s`, `~250/s`, `0.5%` mock transient errors) alongside periodic scheduled notifications, idempotent create+replay pairs, and `/health/ready`, `/api/v1/metrics`, and list probes, with `OTEL_SAMPLER_RATIO=0.1` so Jaeger stays within its trace window:
+`scripts/soak.sh` (`make soak`) keeps the system busy for an hour. Measured on 2026-11-21 with `OTEL_SAMPLER_RATIO=0.1`, so Jaeger stays within its trace window. The load:
+
+- **Traffic:** a 1,000-item batch every 4 seconds, mixed channels and priorities, about 250/s. The mock provider fails 0.5% of calls with a transient error.
+- **Probes:** every minute, one scheduled notification, one idempotent create plus replay, and reads of `/health/ready`, `/api/v1/metrics` and the list endpoint.
+- **WebSocket:** 50 readers held open the whole hour (`wsflood -hold`, run in a container on the Compose network).
+- **Provider outages:** every 10 minutes, starting at minute 5, every provider call answers `500` for 30 seconds.
 
 ```bash
 OTEL_SAMPLER_RATIO=0.1 docker compose up -d --force-recreate --wait
 API_URL=http://127.0.0.1:8080 MOCK_URL=http://127.0.0.1:8090 PROM_URL=http://127.0.0.1:9090 ./scripts/soak.sh
 ```
 
-Measured over 60 minutes on 2026-11-21 (`900/900` batches HTTP `202`, batch latency p50 `75 ms`, p99 `126 ms`, `61` probe cycles with `0` errors, `900,122/900,122` sent, `0` container restarts or OOM kills):
+| Check | Result |
+|---|---|
+| Throughput | 898/898 batches `202` (request p50 117 ms, p99 322 ms); 898,120/898,120 sent, 0 failed; 60 probe cycles, 0 errors |
+| Rate limit | busiest 1 s window 97 per channel for the whole hour |
+| WebSocket | all 50 readers stayed connected and received 46.4 million events; none dropped, none starved |
+| Outages | 5 outages, 39,106 `circuit_open` deferrals (no attempt burned). Each built a backlog of 6,500–8,700 that drained 4.4–5.7 minutes after the outage ended. The queue was back at its pre-outage level before every next outage, so nothing accumulated |
+| End-to-end latency | p50 1.9–2.9 s in every 10-minute slice. p99 74–88 s in the five slices with an outage (the 30 s outage plus the breaker's 30 s open state), 4.1 s in the last slice without one; no upward trend |
+| Restarts | 0 container restarts or OOM kills |
+| Invariants | passed (0 stuck, 0 duplicates, Redis consistent with PostgreSQL) |
 
-| Resource (`api` / `worker-1` / `worker-2`) | Baseline | Early steady | Late steady | Post-drain |
+| Resource (`api` / `worker-1` / `worker-2`) | Before load | First quarter | Last quarter | After drain |
 |---|---|---|---|---|
-| Goroutines | `17 / 95 / 95` | `18 / 99 / 99` | `18 / 99 / 99` | `18 / 99 / 99` |
-| Open FDs | `14 / 104 / 103` | — | `15 / 108 / 108` | `15 / 108 / 108` |
-| Go heap (`alloc_bytes`) | — | `4.1 / 15.3 / 14.2 MB` | `4.3 / 14.1 / 14.1 MB` | `3.9 / 16.0 / 15.3 MB` |
-| Redis `used_memory` | `2.31 MB` | — | — | `2.26 MB` |
+| Goroutines | 18 / 91 / 91 | 114 / 99 / 99 | 118 / 99 / 99 | 18 / 99 / 99 |
+| Open FDs | 15 / 87 / 87 | — | 65 / 108 / 108 | 15 / 104 / 104 |
+| Go heap | — | 5.2 / 13.9 / 14.9 MB | 5.3 / 14.4 / 14.6 MB | 6.5 / 16.7 / 17.3 MB |
+| Redis `used_memory` | 3.5 MB | — | — | 2.2 MB |
 
-`jaeger` plateaued at `1006–1007 MiB / 1.5 GiB` (`MEMORY_MAX_TRACES=20000`) from minute 25 through minute 60. `ratecheck.sh` passed (`email 97/s`, `push 97/s`, `sms 97/s`, provider `291/s` vs `300/s` limit) and `invariants.sh` passed across `2,447,435` cumulative `sent` rows (`0` stuck, `0` cancelled sends, `0` Redis–PG mismatches, `0` duplicates across `900,122` mock keys).
+How to read the resource table:
+
+- The API's ~100 extra goroutines and ~50 extra FDs are the 50 WebSocket clients (a reader and a writer each). They return to baseline when the clients disconnect.
+- The workers' small rise is connection-pool warm-up: go-redis keeps idle connections for 30 minutes.
+- Jaeger plateaued at 1,021 MiB of its 1.5 GiB limit.
+
+**Spare capacity.** 250/s against ~290/s of capacity leaves only ~40/s to drain a backlog, which is why a 30-second outage takes ~5 minutes to absorb. If outages like this are expected at peak load, plan for more headroom: a third worker does not help, because the per-channel rate limit caps throughput. Faster recovery needs either more headroom (sending below the cap) or a higher provider limit.
 
 ### CI/CD (GitHub Actions, `B-6`)
 

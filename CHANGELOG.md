@@ -23,6 +23,9 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ### Tests
 
+- Soak test (`make soak`): 60 minutes at ~250/s with 50 WebSocket readers and a 30 s provider outage
+  every 10 minutes; flat goroutines, FDs and heap, 898,120/898,120 sent, no accumulation across outages.
+  `wsflood -hold` keeps WebSocket readers open for a soak.
 - `scripts/verify.sh` (`make verify`): one command, only Docker needed: lint, unit, integration, Compose
   stack up, smoke test and invariants, with a PASS/FAIL table (3m50s on a warm machine).
 - `scripts/test-docker.sh` (`make test-docker`): the Go test suite and linters in the pinned `golang`
