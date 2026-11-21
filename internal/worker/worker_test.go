@@ -28,6 +28,9 @@ type memWorkerStore struct {
 	attempts []domain.DeliveryAttempt
 	claimErr error
 	leaseLos bool
+	// markSentErrs makes the next N MarkSent calls fail with a transient (non-lease) DB error.
+	markSentErrs int
+	markSentHits int
 }
 
 func newMemWorkerStore() *memWorkerStore {
@@ -134,6 +137,11 @@ func (s *memWorkerStore) DeferCircuitOpen(_ context.Context, id uuid.UUID, claim
 func (s *memWorkerStore) MarkSent(_ context.Context, id uuid.UUID, claimedAttempts int, providerMsgID *string) (*domain.Notification, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.markSentHits++
+	if s.markSentErrs > 0 {
+		s.markSentErrs--
+		return nil, errors.New("FATAL: sorry, too many clients already")
+	}
 	if s.leaseLos {
 		return nil, domain.ErrLeaseLost
 	}

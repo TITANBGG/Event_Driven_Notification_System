@@ -30,6 +30,9 @@ func TestLoadFromDefaults(t *testing.T) {
 	assert.Equal(t, "postgres://notif:notif@postgres:5432/notif?sslmode=disable", cfg.DatabaseURL)
 	assert.Equal(t, "redis:6379", cfg.RedisAddr)
 	assert.Equal(t, 95, cfg.RedisPoolSize, "REDIS_POOL_SIZE=0 must auto-size to 3*25 + 20")
+	assert.Equal(t, 0, cfg.DBMaxConns)
+	assert.Equal(t, int32(10), cfg.DBPoolMaxConns(10), "DB_MAX_CONNS=0 must keep the binary default")
+	assert.Equal(t, int32(20), cfg.DBPoolMaxConns(20))
 	assert.Equal(t, "http://mockprovider:8090/", cfg.ProviderURL)
 	assert.Equal(t, 10*time.Second, cfg.ProviderTimeout)
 	assert.False(t, cfg.ProviderExtended)
@@ -79,6 +82,7 @@ func TestLoadFromOverrides(t *testing.T) {
 		"DATABASE_URL":                   "postgres://user:supersecret@db:5432/app",
 		"REDIS_ADDR":                     "localhost:6380",
 		"REDIS_POOL_SIZE":                "120",
+		"DB_MAX_CONNS":                   "7",
 		"PROVIDER_URL":                   "https://webhook.site/abc-123",
 		"PROVIDER_TIMEOUT":               "5s",
 		"PROVIDER_EXTENDED_FIELDS":       "true",
@@ -100,6 +104,8 @@ func TestLoadFromOverrides(t *testing.T) {
 
 	assert.Equal(t, ":18080", cfg.HTTPAddr)
 	assert.Equal(t, 120, cfg.RedisPoolSize)
+	assert.Equal(t, int32(7), cfg.DBPoolMaxConns(10), "DB_MAX_CONNS overrides every binary default")
+	assert.Equal(t, int32(7), cfg.DBPoolMaxConns(20))
 	assert.True(t, cfg.ProviderExtended)
 	assert.Equal(t, 250, cfg.RateLimitPerSec)
 	assert.Equal(t, "worker-custom-1", cfg.WorkerID)
@@ -152,6 +158,16 @@ func TestLoadFromInvalidCases(t *testing.T) {
 			name:    "redis pool negative",
 			env:     map[string]string{"REDIS_POOL_SIZE": "-1"},
 			wantErr: "REDIS_POOL_SIZE",
+		},
+		{
+			name:    "db pool negative",
+			env:     map[string]string{"DB_MAX_CONNS": "-1"},
+			wantErr: "DB_MAX_CONNS",
+		},
+		{
+			name:    "db pool above cap",
+			env:     map[string]string{"DB_MAX_CONNS": "501"},
+			wantErr: "DB_MAX_CONNS",
 		},
 		{
 			name:    "visibility timeout violates 2x provider timeout + 15s",

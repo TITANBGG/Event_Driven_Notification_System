@@ -70,8 +70,11 @@ func run() error {
 		)
 		return errors.New("invalid DATABASE_URL configuration")
 	}
-	poolCfg.MaxConns = 35
-	poolCfg.MinConns = 2
+	// Worker default 10, not one per goroutine: sends are rate-limited to 100/s per channel and each
+	// holds a connection only for a few ms, so 10 leaves headroom while 6 replicas + the API (80) still
+	// fit PostgreSQL's default max_connections of 100. The old fixed 35 exhausted it at 3 replicas.
+	poolCfg.MaxConns = cfg.DBPoolMaxConns(10)
+	poolCfg.MinConns = min(2, poolCfg.MaxConns)
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 30 * time.Second

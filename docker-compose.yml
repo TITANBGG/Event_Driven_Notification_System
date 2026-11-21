@@ -5,6 +5,7 @@ x-worker-env: &worker-env
   DATABASE_URL: ${DATABASE_URL:-postgres://notif:notif@postgres:5432/notif?sslmode=disable}
   REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
   REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-0}
+  DB_MAX_CONNS: ${DB_MAX_CONNS:-0}
   PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8090/}
   PROVIDER_TIMEOUT: ${PROVIDER_TIMEOUT:-10s}
   PROVIDER_EXTENDED_FIELDS: ${PROVIDER_EXTENDED_FIELDS:-false}
@@ -115,6 +116,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgres://notif:notif@postgres:5432/notif?sslmode=disable}
       REDIS_ADDR: ${REDIS_ADDR:-redis:6379}
       REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-0}
+      DB_MAX_CONNS: ${DB_MAX_CONNS:-0}
       WORKER_CONCURRENCY_PER_CHANNEL: ${WORKER_CONCURRENCY_PER_CHANNEL:-25}
       MAX_BODY_BYTES: ${MAX_BODY_BYTES:-524288}
       BATCH_MAX_BODY_BYTES: ${BATCH_MAX_BODY_BYTES:-16777216}

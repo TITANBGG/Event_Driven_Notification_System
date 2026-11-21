@@ -32,6 +32,11 @@ const (
 	shutdownCleanupWait  = 5 * time.Second
 	circuitOpenJitterMax = 5 * time.Second
 	defaultSweepInterval = 15 * time.Second
+
+	sendTokenBudgetMargin       = 5 * time.Second
+	postSendWriteBudget         = 5 * time.Second
+	postSendWriteBackoffInitial = 100 * time.Millisecond
+	postSendWriteBackoffMax     = time.Second
 )
 
 // Deps supplies all dependencies required to construct a Worker.
@@ -254,7 +259,7 @@ func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, 
 			didWork = true
 			w.markActive(meta.ID)
 			defer w.unmarkActive(meta.ID)
-			w.processDequeuedItem(ctx, drainCtx, ch, meta)
+			w.processDequeuedItem(drainCtx, ch, meta)
 		}, func() {
 			panicked = true
 		})
@@ -270,11 +275,10 @@ func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, 
 	}
 }
 
-func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Channel, meta *queue.Meta) {
-	itemCtx := observability.WithCorrelationID(ctx, meta.CorrelationID)
+// processDequeuedItem runs entirely on the drain context: once an item is dequeued, its claim, rate-limit
+// wait, provider call and fenced writes may finish during graceful shutdown (bounded by SHUTDOWN_TIMEOUT).
+func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel, meta *queue.Meta) {
 	itemDrainCtx := observability.WithCorrelationID(drainCtx, meta.CorrelationID)
-
-	itemCtx = observability.ExtractTraceParent(itemCtx, meta.TraceParent)
 	itemDrainCtx = observability.ExtractTraceParent(itemDrainCtx, meta.TraceParent)
 
 	tracer := observability.Tracer("notification-worker")
@@ -286,7 +290,6 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 
 	itemDrainCtx, procSpan := tracer.Start(itemDrainCtx, "worker.process_notification", trace.WithAttributes(baseAttrs...))
 	defer procSpan.End()
-	itemCtx = trace.ContextWithSpan(itemCtx, procSpan)
 
 	_, dqSpan := tracer.Start(itemDrainCtx, "dequeue", trace.WithAttributes(baseAttrs...))
 	dqSpan.End()
@@ -296,29 +299,6 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 		slog.String("channel", ch.String()),
 		slog.String("priority", meta.Priority.String()),
 	)
-
-	// Acquire GCRA rate-limit token BEFORE Claim so rate-limit wait time never eats VISIBILITY_TIMEOUT.
-	rlCtx, rlSpan := tracer.Start(itemCtx, "ratelimit.wait", trace.WithAttributes(baseAttrs...))
-	for {
-		err := w.limiter.Wait(rlCtx, ch)
-		if err == nil {
-			break
-		}
-		if ctx.Err() != nil {
-			rlSpan.RecordError(err)
-			rlSpan.SetStatus(codes.Error, err.Error())
-			rlSpan.End()
-			return
-		}
-		itemLogger.Warn("rate limiter error; failing closed and backing off before claim", slog.String("error", err.Error()))
-		if !waitWithContext(ctx, limiterErrorBackoff) {
-			rlSpan.RecordError(ctx.Err())
-			rlSpan.SetStatus(codes.Error, "context cancelled during rate limit backoff")
-			rlSpan.End()
-			return
-		}
-	}
-	rlSpan.End()
 
 	claimCtx, claimSpan := tracer.Start(itemDrainCtx, "claim", trace.WithAttributes(baseAttrs...))
 	n, claimed, err := w.store.Claim(claimCtx, meta.ID, w.cfg.ClockSkewTolerance)
@@ -358,6 +338,16 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 	)
 	if n.BatchID != nil {
 		attemptLogger = attemptLogger.With(slog.String("batch_id", n.BatchID.String()))
+	}
+
+	// The GCRA token is taken AFTER Claim, immediately before the provider call. The limiter spaces
+	// token grants, not sends: with the token taken before Claim, any stall in between (DB pool wait,
+	// GC, CPU) let sends bunch up and break the 100/s window (measured 107 in one second with 6 worker
+	// replicas while PostgreSQL refused connections). The wait is bounded so a claimed row is never
+	// held past its lease; on timeout or limiter outage the claim is handed back without burning an attempt.
+	if !w.waitForSendToken(itemDrainCtx, attemptLogger, tracer, baseAttrs, ch) {
+		w.releaseUnsentClaim(itemDrainCtx, attemptLogger, n, meta, "rate limiter unavailable before send")
+		return
 	}
 
 	startedAt := w.nowFn()
@@ -404,7 +394,7 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 
 	attemptErr := errorStringPtr(res.Err)
 	durationMS := int(res.Duration.Milliseconds())
-	if _, insErr := w.store.InsertAttempt(itemDrainCtx, domain.DeliveryAttempt{
+	attempt := domain.DeliveryAttempt{
 		NotificationID:    n.ID,
 		AttemptNo:         n.Attempts,
 		Counted:           true,
@@ -415,6 +405,10 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 		Error:             attemptErr,
 		ProviderMessageID: res.ProviderMessageID,
 		WorkerID:          &w.cfg.WorkerID,
+	}
+	if insErr := w.retryPostSendWrite(itemDrainCtx, attemptLogger, "InsertAttempt", func(ctx context.Context) error {
+		_, err := w.store.InsertAttempt(ctx, attempt)
+		return err
 	}); insErr != nil {
 		attemptLogger.Warn("failed recording delivery attempt row", slog.String("error", insErr.Error()))
 	}
@@ -425,7 +419,14 @@ func (w *Worker) processDequeuedItem(ctx, drainCtx context.Context, ch domain.Ch
 			attribute.String("notification.id", n.ID.String()),
 			attribute.String("notification.status", domain.StatusSent.String()),
 		))
-		sentRow, err := w.store.MarkSent(stCtx, n.ID, n.Attempts, res.ProviderMessageID)
+		// The provider has accepted the message: failing this write would leave the row in processing
+		// until the reconciler re-sends it, so retry a short DB blip instead of creating a duplicate.
+		var sentRow *domain.Notification
+		err := w.retryPostSendWrite(stCtx, attemptLogger, "MarkSent", func(ctx context.Context) error {
+			row, markErr := w.store.MarkSent(ctx, n.ID, n.Attempts, res.ProviderMessageID)
+			sentRow = row
+			return markErr
+		})
 		if err != nil {
 			stSpan.RecordError(err)
 			stSpan.SetStatus(codes.Error, err.Error())
@@ -628,6 +629,86 @@ func (w *Worker) publishEvent(ctx context.Context, logger *slog.Logger, n domain
 	}
 	if err := w.publisher.Publish(ctx, realtime.NewEvent(n, w.nowFn(), correlationID)); err != nil {
 		logger.Warn("failed publishing realtime status event", slog.String("error", err.Error()))
+	}
+}
+
+// sendTokenBudget bounds the rate-limit wait of a claimed row. The provider call that follows may take
+// up to PROVIDER_TIMEOUT, so the wait must leave room for it plus a margin before VISIBILITY_TIMEOUT,
+// after which the reconciler may hand the row to another worker. The startup guard
+// VISIBILITY_TIMEOUT >= 2*PROVIDER_TIMEOUT + 15s keeps this at 10s or more with valid config.
+func (w *Worker) sendTokenBudget() time.Duration {
+	return max(w.cfg.VisibilityTimeout-2*w.cfg.ProviderTimeout-sendTokenBudgetMargin, time.Second)
+}
+
+// waitForSendToken blocks for a GCRA token of channel ch. It uses the drain context so a claimed row
+// still gets sent during graceful shutdown, and fails closed (returns false) when the limiter is
+// unavailable for the whole budget.
+func (w *Worker) waitForSendToken(
+	ctx context.Context,
+	logger *slog.Logger,
+	tracer trace.Tracer,
+	attrs []attribute.KeyValue,
+	ch domain.Channel,
+) bool {
+	waitCtx, cancel := context.WithTimeout(ctx, w.sendTokenBudget())
+	defer cancel()
+	waitCtx, span := tracer.Start(waitCtx, "ratelimit.wait", trace.WithAttributes(attrs...))
+	defer span.End()
+	for {
+		err := w.limiter.Wait(waitCtx, ch)
+		if err == nil {
+			return true
+		}
+		if waitCtx.Err() == nil {
+			logger.Warn("rate limiter error; failing closed and backing off before send", slog.String("error", err.Error()))
+			if waitWithContext(waitCtx, limiterErrorBackoff) {
+				continue
+			}
+		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "no rate-limit token within budget")
+		return false
+	}
+}
+
+// releaseUnsentClaim hands a claimed row back when it could not be sent. DeferCircuitOpen is the
+// existing fenced "not attempted" transition (processing -> retrying, attempts-1, deferrals+1), so no
+// attempt is burned; the row is retried after a second through the delayed set.
+func (w *Worker) releaseUnsentClaim(ctx context.Context, logger *slog.Logger, n *domain.Notification, meta *queue.Meta, reason string) {
+	// The drain context may already be cancelled (shutdown timeout); the hand-back must still be written.
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownCleanupWait)
+	defer cancel()
+	nextAt := w.nowFn().Add(time.Second)
+	updated, err := w.store.DeferCircuitOpen(writeCtx, n.ID, n.Attempts, nextAt, reason)
+	if err != nil {
+		w.handleFencedError(writeCtx, logger, n.ID, "DeferCircuitOpen", err)
+		return
+	}
+	if schedErr := w.queue.Schedule(writeCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
+		logger.Warn("failed scheduling unsent claim", slog.String("error", schedErr.Error()))
+	}
+	logger.Warn("claimed notification released without sending", slog.String("reason", reason))
+}
+
+// retryPostSendWrite retries a database write that follows a provider call for up to
+// postSendWriteBudget. Giving up leaves the row in processing until the reconciler re-sends it after
+// VISIBILITY_TIMEOUT, so a short DB blip (pool exhaustion, failover) would otherwise turn an accepted
+// send into a duplicate. A lost lease is final and is never retried.
+func (w *Worker) retryPostSendWrite(ctx context.Context, logger *slog.Logger, op string, write func(context.Context) error) error {
+	writeCtx, cancel := context.WithTimeout(ctx, postSendWriteBudget)
+	defer cancel()
+	backoff := postSendWriteBackoffInitial
+	for retry := 1; ; retry++ {
+		err := write(writeCtx)
+		if err == nil || errors.Is(err, domain.ErrLeaseLost) {
+			return err
+		}
+		if !waitWithContext(writeCtx, backoff) {
+			return err
+		}
+		logger.Warn("retrying database write after provider call",
+			slog.String("op", op), slog.Int("retry", retry), slog.String("error", err.Error()))
+		backoff = min(backoff*2, postSendWriteBackoffMax)
 	}
 }
 

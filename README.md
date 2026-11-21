@@ -207,7 +207,7 @@ Each consumer goroutine cycles through a fixed 10-slot schedule `[h,h,h,h,h,h,n,
 
 ### Rate limit: distributed GCRA with `Burst = 1`
 
-Workers acquire a token from `{notif}:rl:{channel}` before they claim a row, so time spent waiting for a token does not count against the visibility timeout. The limiter is `Rate = 100/s, Burst = 1`, which spaces consecutive sends at least 10ms apart. Any one-second window therefore contains at most 100 sends, or 101 at an exact boundary. Integration test `g` measured a maximum of 97 sends in any one-second window over 1000 SMS across two workers. If Redis is unavailable, the limiter fails closed: no sends rather than unlimited sends. Concurrency is sized with Little's law: 100 msg/s × 0.3s p99 latency ≈ 30 concurrent sends per channel. Each replica runs 25 goroutines per channel × 2 replicas, which leaves headroom.
+Workers acquire a token from `{notif}:rl:{channel}` after they claim a row, immediately before the provider call. The limiter spaces token grants, not sends, so anything between the two (a wait for a database connection, a GC pause) would let sends bunch up. That is what a stress test showed when the token was still taken before the claim: with 6 worker replicas exhausting PostgreSQL connections, the busiest second reached 107 sends per channel. The wait for a token is bounded (`VISIBILITY_TIMEOUT − 2 × PROVIDER_TIMEOUT − 5s`), so a claimed row is never held past its lease; if no token comes in time (Redis down), the claim is handed back with the same "not attempted" transition the circuit breaker uses, and no attempt is burned. The limiter is `Rate = 100/s, Burst = 1`, which spaces consecutive sends at least 10ms apart. Any one-second window therefore contains at most 100 sends, or 101 at an exact boundary. Integration test `g` measured a maximum of 97 sends in any one-second window over 1000 SMS across two workers. If Redis is unavailable, the limiter fails closed: no sends rather than unlimited sends. Concurrency is sized with Little's law: 100 msg/s × 0.3s p99 latency ≈ 30 concurrent sends per channel. Each replica runs 25 goroutines per channel × 2 replicas, which leaves headroom.
 
 ### Retry classification
 
@@ -281,6 +281,7 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Ea
 | **Redis down for workers** | Dequeue backs off with context-aware timer; GCRA rate limiter **fails closed** (no sends) to protect the `100/s` provider SLA. | Workers resume automatically as soon as Redis responds. |
 | **Redis loses last ~1s (`AOF everysec`)** | Some IDs vanish from ready lists or `{notif}:delayed` ZSET. | Reconciler steps `(a)` (stale `pending`) and `(b)` (untracked `retrying`/`scheduled` due within 5m) restore them from PostgreSQL. |
 | **PostgreSQL down** | API create returns `503 service_unavailable`; `/health/ready` returns `503`; worker `Claim` errors schedule the item `now+1s` out of inflight. | Resumes automatically when PostgreSQL recovers. |
+| **PostgreSQL refuses connections right after the provider accepted a send** | `InsertAttempt` and `MarkSent` are retried for up to 5s with backoff, so a short outage or a full connection pool does not leave the row in `processing`. | If the database is still unavailable after 5s, the row stays `processing`; reconciler step `(c)` resets it after `VISIBILITY_TIMEOUT` and it is sent again (at-least-once, same `Idempotency-Key`). |
 | **Worker crash (`SIGKILL`) mid-send** | Row stays `processing` in DB; ID stays in `{notif}:inflight:<deadWorkerId>`. | Step `(d)` requeues orphaned inflight list after `HEARTBEAT_TTL` (`15s`); step `(c)` resets `processing -> pending` (or `failed` if attempts exhausted) after `VISIBILITY_TIMEOUT` (`60s`) and records `outcome='abandoned'`. |
 | **Redis write fails after DB transition (worker alive)** | Row transitioned in DB, but follow-up `Ack`/`Schedule`/`DeadLetter` failed; ID remains in live worker's inflight list. | Live worker's **Inflight Sweeper** detects IDs inactive across two consecutive sweeps and requeues them via `requeue_ids.lua`. |
 | **API crash after DB commit, before Redis enqueue** | Row is `pending` in PostgreSQL and absent from `{notif}:msg`. | Reconciler step `(a)` (`force_enqueue.lua`) after `PENDING_STALE_AFTER` (`30s`). |
@@ -298,7 +299,7 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Ea
 |---|---|---|
 | 1. Redis down during create | `docker compose stop redis`, then `POST` a notification | `202` in ~3s (all post-commit Redis work shares one 2s budget), `/health/ready` = `503`; sent 36s after Redis restarted (reconciler step a: `PENDING_STALE_AFTER` 30s + cycle) |
 | 2. PostgreSQL down | `docker compose stop postgres`, then `POST` | `503 service_unavailable`, `/health/ready` = `503`; after restart a new notification was sent within 1s |
-| 3. Worker SIGKILL mid-batch | 300 SMS with 200ms provider latency, `docker compose kill worker-1` after 1s | 300/300 sent 64s after the kill (orphaned inflight list requeued after the heartbeat expired, abandoned `processing` rows reclaimed after `VISIBILITY_TIMEOUT`); 4 to 11 duplicate provider calls across runs, one per send in flight at the moment of the kill, all with the same `Idempotency-Key`; the invariants check counts the same number of provider calls the system never recorded and of `abandoned` attempts |
+| 3. Worker SIGKILL mid-batch | 300 SMS with 200ms provider latency, `docker compose kill worker-1` after 1s | 300/300 sent 64s after the kill (orphaned inflight list requeued after the heartbeat expired, abandoned `processing` rows reclaimed after `VISIBILITY_TIMEOUT`); 4 to 11 duplicate provider calls across runs, one per send in flight at the moment of the kill, all with the same `Idempotency-Key`; the invariants check counts the same number of provider calls the system never recorded. `abandoned` attempts can be higher (24 vs 11 in one run): rows that were claimed and still waiting for a rate-limit token when the worker died were never sent, are reset by the reconciler, and lose one attempt |
 | 4. Provider outage | Mock provider returns 500 for everything, 40 SMS | Breaker open (`circuit_breaker_state=2`) 6s into the outage, 0 notifications failed; 40/40 sent 25s after the provider recovered |
 | 5. Redis data loss | `FLUSHALL` while a 500-SMS batch is being delivered (138 already sent) | 500/500 sent 34s later, rebuilt from PostgreSQL by the reconciler; 0 duplicates |
 
@@ -1152,6 +1153,7 @@ Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so 
 | `DATABASE_URL` | `postgres://notif:notif@postgres:5432/notif?sslmode=disable` | PostgreSQL connection string (password masked in logs) |
 | `REDIS_ADDR` | `redis:6379` | Redis `host:port` |
 | `REDIS_POOL_SIZE` | `0` (`auto`) | `0` auto-sizes to `3 * WORKER_CONCURRENCY_PER_CHANNEL + 20` |
+| `DB_MAX_CONNS` | `0` (`auto`) | PostgreSQL pool size per process; `0` = API 20, worker 10. Every replica opens its own pool, so keep `replicas × pool + API ≤ max_connections` (100 by default) |
 | `PROVIDER_URL` | `http://mockprovider:8090/` | External `EXT-1` provider endpoint (`http`/`https`) |
 | `PROVIDER_TIMEOUT` | `10s` | Per-attempt HTTP client timeout (`> 0`) |
 | `PROVIDER_EXTENDED_FIELDS` | `false` | Include optional `subject`/`title` in provider JSON body |
@@ -1208,6 +1210,7 @@ make drills             # live failure drills against the running stack (~5 min,
 make invariants         # check system invariants on the settled stack (no stuck rows, no cancelled or double sends, Redis matches PostgreSQL);
                         # covers the full history, so pass --since=<RFC3339> to ignore duplicates from an earlier crash drill
 make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, queue depths, DB pool, Redis memory
+make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
 make fuzz               # Go native fuzzing of SMS segmenting, validation, cursor decoding and templates (FUZZTIME=5m each)
 ```
 
@@ -1290,6 +1293,19 @@ Prometheus during a 24,000-notification run (`sum by (channel) (rate(notificatio
 
 ![Prometheus graph: sms, email and push send rates plateau at about 95 per second under the 100 per second limit](docs/images/prometheus-rate-limit.png)
 
+### Rate limit precision and horizontal scaling
+
+`scripts/ratecheck.sh --since=<RFC3339>` measures the busiest sliding one-second window per channel from two clocks: `delivery_attempts.started_at` (taken right before the provider call) and the mock provider's own arrival timestamps. Measured on 2026-11-21, each run followed by `scripts/invariants.sh` (all passed: no loss, no stuck rows):
+
+| Run | Setup | Busiest 1s window per channel | Effective rate |
+|---|---|---|---|
+| SMS only (before the fix) | 12,000 SMS, 2 workers | 99 (system) = 99 (provider) | 95.3/s |
+| Mixed (after the fix) | 15,000, 2 workers | email 97, push 97, sms 97; provider total 290 of 300 | 95.2/s per channel |
+| Scaled, before the fix | 30,000, **6 workers**, provider latency 100 ± 50ms | **105 / 106 / 107**, provider total **318** | 70–88/s |
+| Scaled, after the fix | same | **94 / 94 / 97**, provider total 281; peak PostgreSQL connections 68 | 86.5/s per channel |
+
+The scaled run found two real defects. The worker pool was fixed at 35 connections, so 6 replicas + API asked for 230 connections against PostgreSQL's 100, and requests failed with `too many clients`. And because the token was taken before the claim, sends that waited for a connection bunched up when connections freed, breaking the 100/s window. One send was also duplicated: the provider accepted it, the result could not be written, and the reconciler re-sent it. The fixes: `DB_MAX_CONNS` (worker default 10), the token taken right before the provider call, and a 5s retry for the writes that follow an accepted send. With 6 replicas and 100ms provider latency the effective rate is 86.5/s rather than 95/s: 150 senders per channel contend for each 10ms GCRA slot and some slots go unused. The limit, the hard requirement, holds.
+
 ### CI/CD (GitHub Actions, `B-6`)
 
 `.github/workflows/ci.yml` runs on every branch push and pull request (`permissions: contents: read`, superseded runs on the same ref are cancelled):
@@ -1366,6 +1382,8 @@ What is deliberately missing or simplified, and what I would do with more time:
 
 - **No authentication, authorization or multi-tenancy.** Idempotency keys are global. Next steps: API keys or OAuth2 client credentials, a `tenant_id` on every table and key, and per-tenant rate limits.
 - **Duplicates on provider timeouts.** At-least-once is the honest guarantee. Exactly-once would need a provider that deduplicates on `Idempotency-Key`.
+- **Each replica opens its own PostgreSQL pool.** `DB_MAX_CONNS` (worker default 10) fits 6 worker replicas + the API into PostgreSQL's default 100 connections; beyond that I would put PgBouncer in transaction mode in front of PostgreSQL.
+- **Limiter contention at many replicas.** With 6 replicas and 100ms provider latency, 150 senders per channel contend for each 10ms GCRA slot and the effective rate drops to ~86/s (95/s with 2 replicas). The 100/s ceiling holds; a per-channel token dispatcher (one process hands out slots) would recover the unused slots.
 - **The circuit breaker is per replica.** With N replicas, a provider outage costs up to N × 10 failed calls before every breaker is open. A shared breaker in Redis is possible but adds a round trip per send and fails when Redis does.
 - **No Turkish national language shift table for SMS.** `ç ğ ı İ ş Ş` force UCS-2 (70/67 characters per segment) instead of the 3GPP TS 23.038 Turkish single-shift table that some carriers support.
 - **The Redis DLQ list is capped at 100,000 IDs.** PostgreSQL (`status='failed'` plus `delivery_attempts`) keeps the full history; the list only drives `dlq_depth`. A manual retry removes the ID from the list.

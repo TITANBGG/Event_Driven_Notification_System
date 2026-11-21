@@ -24,6 +24,7 @@ type Config struct {
 	DatabaseURL        string
 	RedisAddr          string
 	RedisPoolSize      int
+	DBMaxConns         int
 	ProviderURL        string
 	ProviderTimeout    time.Duration
 	ProviderExtended   bool
@@ -174,6 +175,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		DatabaseURL:        getStr("DATABASE_URL", "postgres://notif:notif@postgres:5432/notif?sslmode=disable"),
 		RedisAddr:          getStr("REDIS_ADDR", "redis:6379"),
 		RedisPoolSize:      getInt("REDIS_POOL_SIZE", 0),
+		DBMaxConns:         getInt("DB_MAX_CONNS", 0),
 		ProviderURL:        getStr("PROVIDER_URL", "http://mockprovider:8090/"),
 		ProviderTimeout:    getDuration("PROVIDER_TIMEOUT", 10*time.Second),
 		ProviderExtended:   getBool("PROVIDER_EXTENDED_FIELDS", false),
@@ -249,6 +251,9 @@ func (c Config) Validate() error {
 	}
 	if c.RedisPoolSize < 0 {
 		errs = append(errs, fmt.Errorf("REDIS_POOL_SIZE (%d) must be >= 0", c.RedisPoolSize))
+	}
+	if c.DBMaxConns < 0 || c.DBMaxConns > maxDBMaxConns {
+		errs = append(errs, fmt.Errorf("DB_MAX_CONNS (%d) must be between 0 (auto) and %d", c.DBMaxConns, maxDBMaxConns))
 	}
 
 	parsedURL, urlErr := url.Parse(c.ProviderURL)
@@ -377,6 +382,21 @@ func (c Config) Validate() error {
 	return errors.Join(errs...)
 }
 
+// maxDBMaxConns caps DB_MAX_CONNS well below PostgreSQL's usual max_connections scale; a single process
+// never needs more (Little's law: ~300 sends/s x ~4 queries x ~5 ms is a handful of busy connections).
+const maxDBMaxConns = 500
+
+// DBPoolMaxConns returns the PostgreSQL pool size for one process: DB_MAX_CONNS when set, otherwise the
+// binary's own default. Every replica opens its own pool, so the cluster needs
+// replicas*pool + api pools <= PostgreSQL max_connections (100 by default) minus a margin for tools.
+func (c Config) DBPoolMaxConns(binaryDefault int32) int32 {
+	// The explicit upper bound repeats Validate so the int -> int32 conversion is provably safe.
+	if c.DBMaxConns > 0 && c.DBMaxConns <= maxDBMaxConns {
+		return int32(c.DBMaxConns)
+	}
+	return binaryDefault
+}
+
 // LogValue implements slog.LogValuer so startup logs redact DATABASE_URL credentials automatically.
 func (c Config) LogValue() slog.Value {
 	return slog.GroupValue(
@@ -385,6 +405,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("database_url", observability.MaskDatabaseURL(c.DatabaseURL)),
 		slog.String("redis_addr", c.RedisAddr),
 		slog.Int("redis_pool_size", c.RedisPoolSize),
+		slog.Int("db_max_conns", c.DBMaxConns),
 		slog.String("provider_url", c.ProviderURL),
 		slog.String("provider_timeout", c.ProviderTimeout.String()),
 		slog.Bool("provider_extended_fields", c.ProviderExtended),

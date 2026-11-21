@@ -352,12 +352,12 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 ### Worker Loop (per channel, `WORKER_CONCURRENCY_PER_CHANNEL` goroutines per replica)
 
 1. `item := queue.Dequeue(ctx, channel, workerID)` (`LMOVE` into worker's inflight list). If none → idle backoff (`select` on `ctx.Done()` / timer) → `continue`.
-2. `limiter.Wait(ctx, channel)` — acquire GCRA token **BEFORE** `Claim` so rate-limit wait time never counts against `VISIBILITY_TIMEOUT`.
-3. `n, ok := repo.Claim(ctx, id)` (atomically increments `attempts`).
+2. `n, ok := repo.Claim(ctx, id)` (atomically increments `attempts`).
    - If `!ok` (cancelled / already terminal / not due yet) → `queue.Ack` → `continue`.
    - On DB error → `queue.Schedule(id, now+1s, inflight)` (moves the item out of the inflight list and retries it via the delayed mover) → `continue`.
+3. `limiter.Wait(drainCtx, channel)` — acquire the GCRA token **AFTER** `Claim`, immediately before the provider call, so the limiter spaces actual sends (decided 2026-11-21 after a stress test: with the token taken before `Claim`, a DB pool stall bunched sends to 107/s per channel with 6 replicas). The wait is bounded by `VISIBILITY_TIMEOUT - 2*PROVIDER_TIMEOUT - 5s` (≥ 10s with valid config, worst observed wait ~1.5s) so a claimed row is never held past its lease; on timeout or limiter outage the claim is handed back with `repo.DeferCircuitOpen` (`attempts-1`, `deferrals+1`, no attempt burned) + `queue.Schedule(now+1s)`.
 4. `outcome := breaker[channel].Execute(provider.Send(sendCtx, n))` (`sendCtx` timeout = `PROVIDER_TIMEOUT`).
-5. `repo.InsertAttempt(...)` — every attempt is recorded in `delivery_attempts`.
+5. `repo.InsertAttempt(...)` — every attempt is recorded in `delivery_attempts`. `InsertAttempt` and `MarkSent` retry non-lease DB errors for up to `5s` (backoff `100ms → 1s`): after the provider accepted a message, a short DB blip must not leave the row in `processing` for the reconciler to re-send.
 6. Outcome dispatch (all DB updates **fenced** on `WHERE id=$1 AND status='processing' AND attempts=$claimedAttempts`):
    - `Sent` → `repo.MarkSent` (`provider_message_id`, `sent_at`) → `queue.Ack`
    - `Transient && attempts < max_attempts` → `repo.ScheduleRetry` (`status='retrying'`, `next_attempt_at`, `last_error`) → `queue.Schedule(id, due, inflight)`
@@ -432,6 +432,7 @@ On `SIGINT` / `SIGTERM`: stop dequeuing immediately → allow in-flight provider
 | Redis down for workers | Dequeue errors → idle backoff; limiter unavailable → **FAIL CLOSED** (no sends) to honor `100/s` cap | Resumes automatically on Redis recovery |
 | Redis loses last ~1s (`AOF everysec`) | Some IDs missing from queues / `delayed` ZSET | Reconciler `(a)` and `(b)` |
 | PostgreSQL down | API create → `503`; worker `Claim` errors → `requeue` + backoff | Automatic on DB recovery |
+| PostgreSQL refuses connections after the provider accepted a send | `InsertAttempt`/`MarkSent` retried for up to `5s` | If still failing: row stays `processing`, `(c)` resets it after `VISIBILITY_TIMEOUT` and it is re-sent (at-least-once duplicate) |
 | Worker crash mid-send | Row stays `processing`; ID stays in dead worker's inflight list | `(d)` requeues ID; `(c)` resets row to `pending` after `VISIBILITY_TIMEOUT`; possible duplicate send (at-least-once) |
 | Redis write fails after a DB transition (worker alive) | ID stays tracked and parked in the live worker's inflight list; reconciler `(a)`/`(b)`/`(d)` cannot see it | Inflight sweeper requeues it after two sweeps; `Claim` then delivers it or `Ack` untracks it for reconciler repair |
 | API crash after commit, before enqueue | Row stays `pending`, untracked in Redis | Reconciler `(a)` |
@@ -446,6 +447,7 @@ On `SIGINT` / `SIGTERM`: stop dequeuing immediately → allow in-flight provider
 - **`Burst = 1` Math:** Requests are spaced `≥ 10ms` apart, guaranteeing any 1-second sliding window contains at most `100` sends (`+1` at exact bucket boundary).
 - **`Wait(ctx, channel)`:** Loops on `Allow`; if denied, waits `RetryAfter` via `select` respecting `ctx.Done()`. Retries consume tokens too (they are real provider HTTP requests). Redis error → **fail closed**.
 - **Little's Law Sizing:** $\text{Concurrency} \approx \text{Rate} \times p_{99}\text{ Latency}$. For `100 msg/s × 0.3s = 30` concurrent sends per channel total → default `WORKER_CONCURRENCY_PER_CHANNEL = 25` per replica × `2` replicas (`= 50` headroom). `REDIS_POOL_SIZE` default (`0 = auto`) = `3 * WORKER_CONCURRENCY_PER_CHANNEL + 20`.
+- **PostgreSQL Pool Sizing:** every process opens its own `pgxpool`, so `replicas × worker pool + API pool ≤ max_connections (100) − margin`. `DB_MAX_CONNS` (`0 = auto`: API `20`, worker `10`) keeps 6 worker replicas + API at 80. A send holds a connection for a few ms only (300 sends/s × ~4 queries × ~5ms ≈ 6 busy connections cluster-wide); the former fixed worker pool of 35 exhausted PostgreSQL at 3 replicas. Beyond that, put PgBouncer (transaction mode) in front of PostgreSQL.
 
 ---
 
@@ -616,6 +618,7 @@ X-Correlation-ID: 7d3c...
 | `DATABASE_URL` | `postgres://notif:notif@postgres:5432/notif?sslmode=disable` | Mask password in all logs |
 | `REDIS_ADDR` | `redis:6379` | Redis `host:port` |
 | `REDIS_POOL_SIZE` | `0` (`auto`) | `0` resolves to `3 * WORKER_CONCURRENCY_PER_CHANNEL + 20` |
+| `DB_MAX_CONNS` | `0` (`auto`) | PostgreSQL pool per process; `0` = API `20`, worker `10`; `0..500`. Keep `replicas × pool + API ≤ max_connections` |
 | `PROVIDER_URL` | `http://mockprovider:8090/` | Switch to `https://webhook.site/<uuid>` for live `EXT-1` proof |
 | `PROVIDER_TIMEOUT` | `10s` | Per-attempt HTTP request context timeout |
 | `PROVIDER_EXTENDED_FIELDS` | `false` | When `true`, adds optional `subject`/`title` to provider JSON |

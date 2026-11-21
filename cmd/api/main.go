@@ -117,8 +117,9 @@ func run() error {
 		)
 		return errors.New("invalid DATABASE_URL configuration")
 	}
-	poolCfg.MaxConns = 20
-	poolCfg.MinConns = 2
+	// API default 20: request handlers hold a connection only for one short transaction.
+	poolCfg.MaxConns = cfg.DBPoolMaxConns(20)
+	poolCfg.MinConns = min(2, poolCfg.MaxConns)
 	poolCfg.MaxConnLifetime = 30 * time.Minute
 	poolCfg.MaxConnIdleTime = 5 * time.Minute
 	poolCfg.HealthCheckPeriod = 30 * time.Second

@@ -4,7 +4,7 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
-.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot fuzz
+.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot ratecheck fuzz
 
 up:
 	$(COMPOSE) up --build -d
@@ -72,6 +72,10 @@ invariants:
 
 prom-snapshot:
 	./scripts/prom-snapshot.sh once
+
+# Busiest sliding 1s send window per channel since SINCE (RFC3339), from DB and provider clocks.
+ratecheck:
+	./scripts/ratecheck.sh --since=$(SINCE)
 
 # Run Go built-in fuzzing across SMS segmenter, validator, cursor decoder, and template engine.
 FUZZTIME ?= 5m
