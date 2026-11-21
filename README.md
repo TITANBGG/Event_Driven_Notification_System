@@ -1210,6 +1210,7 @@ make drills             # live failure drills against the running stack (~5 min,
 make invariants         # check system invariants on the settled stack (no stuck rows, no cancelled or double sends, Redis matches PostgreSQL);
                         # covers the full history, so pass --since=<RFC3339> to ignore duplicates from an earlier crash drill
 make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, queue depths, DB pool, Redis memory
+make shutdown-test      # SIGTERM workers and API under load: drain, no abandoned attempts, no duplicates (~4 min)
 make chaos              # sustained load + worker kills, Redis restart/FLUSHALL, PostgreSQL stop, slow/failing provider (~15 min)
 make races              # concurrent cancel, batch cancel, idempotency and manual retry storms (~2 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
@@ -1359,6 +1360,18 @@ The first version of the script spawned one `curl` per request with `xargs`. On 
 | Invariants | all passed; peak queue 17,009, Redis 14 MB, 25 PostgreSQL connections |
 
 Two earlier runs of the same test found infrastructure problems rather than delivery problems. Jaeger's unbounded in-memory storage (see Distributed tracing) filled the Docker VM after a day of load tests and froze Docker Desktop in the middle of a run; after the restart the system recovered on its own, and the 2,357 notifications that were open at the freeze were all delivered within 40 seconds. The chaos script now retries its database queries and keeps its logs when a run fails.
+
+### Graceful shutdown under load
+
+`scripts/shutdown.sh` (`make shutdown-test`) streams a 1,000-item batch every 2 seconds (more than the 300/s the system may send, so work is always queued) with 300 ± 200ms provider latency, and sends `SIGTERM` to worker-1, then worker-2, then both, then the API. A graceful stop, unlike `SIGKILL`, must leave nothing for the reconciler. Measured on 2026-11-21:
+
+| Stop | Result |
+|---|---|
+| worker-1, worker-2, both at once | each stopped in ~1.3s (limit `SHUTDOWN_TIMEOUT` = 15s); every stop finished **75 sends in flight** (25 goroutines × 3 channels, all mid-send) before exiting; heartbeat key and inflight list removed; nothing had to be requeued |
+| API | stopped in 0.9s; the 3 batch requests that hit the stopped API got connection errors and created **no rows at all** (all-or-nothing), so the client can retry them with the same `Idempotency-Key` |
+| Overall | 47,000 accepted, 47,000 sent, **0 `abandoned` attempts, 0 duplicates**, invariants passed without `--allow-duplicates` |
+
+The script fails a stop during which no send completed, because such a stop says nothing about draining. Its first version built request bodies in a bash loop that was too slow to keep the workers busy, and its first stop passed with an idle worker.
 
 ### CI/CD (GitHub Actions, `B-6`)
 
