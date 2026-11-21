@@ -165,19 +165,26 @@ func LoggerFrom(ctx context.Context, base *slog.Logger) *slog.Logger {
 	return base.With(args...)
 }
 
-// MaskPhone hides middle digits of a phone number while keeping prefix/suffix for log correlation.
+// minHiddenRunes is how many characters of a phone number or push token every mask hides at least.
+// Fuzzing found the old rules hid 0 of 10 characters ("+123456789" -> "+12345***6789" kept all of
+// them) and 1 of 9 for tokens.
+const minHiddenRunes = 3
+
+// MaskPhone hides middle digits of a phone number while keeping prefix/suffix for log correlation
+// (country and operator prefix up to 6 characters, last 4 digits), always hiding at least 3 characters.
 func MaskPhone(phone string) string {
 	r := []rune(strings.TrimSpace(phone))
 	n := len(r)
 	switch {
 	case n == 0:
 		return ""
-	case n <= 4:
+	case n <= 2*minHiddenRunes:
 		return "***"
 	case n <= 9:
 		return string(r[:2]) + "***" + string(r[n-2:])
 	default:
-		return string(r[:6]) + "***" + string(r[n-4:])
+		prefix := min(6, n-4-minHiddenRunes)
+		return string(r[:prefix]) + "***" + string(r[n-4:])
 	}
 }
 
@@ -196,14 +203,15 @@ func MaskEmail(email string) string {
 	return string(local[:1]) + "***" + domain
 }
 
-// MaskToken redacts device push tokens while retaining a short prefix and suffix.
+// MaskToken redacts device push tokens while retaining a short prefix and suffix; tokens too short to
+// hide at least 3 characters behind a 4+4 frame are masked entirely.
 func MaskToken(token string) string {
 	r := []rune(strings.TrimSpace(token))
 	n := len(r)
 	if n == 0 {
 		return ""
 	}
-	if n <= 8 {
+	if n < 8+minHiddenRunes {
 		return "***"
 	}
 	return string(r[:4]) + "***" + string(r[n-4:])

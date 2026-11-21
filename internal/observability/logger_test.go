@@ -23,6 +23,9 @@ func TestMaskPhone(t *testing.T) {
 		{in: "", want: ""},
 		{in: "1234", want: "***"},
 		{in: "5551234", want: "55***34"},
+		{in: "123456", want: "***"},
+		{in: "+123456789", want: "+12***6789"},   // 10 chars: 3 hidden (the old mask hid none)
+		{in: "+1234567890", want: "+123***7890"}, // 11 chars: 3 hidden
 		{in: "+905551234567", want: "+90555***4567"},
 		{in: " +905551234567 ", want: "+90555***4567"},
 	}
@@ -66,6 +69,8 @@ func TestMaskToken(t *testing.T) {
 		{in: "", want: ""},
 		{in: "short", want: "***"},
 		{in: "12345678", want: "***"},
+		{in: "something", want: "***"},           // 9 chars: the old mask hid 1 ("some***hing")
+		{in: "abcdefghijk", want: "abcd***hijk"}, // 11 chars: 3 hidden
 		{in: "fcm_abcdef1234567890xyz", want: "fcm_***0xyz"},
 	}
 	for _, tc := range tests {

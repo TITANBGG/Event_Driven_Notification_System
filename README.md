@@ -1215,7 +1215,7 @@ make shutdown-test      # SIGTERM workers and API under load: drain, no abandone
 make chaos              # sustained load + worker kills, Redis restart/FLUSHALL, PostgreSQL stop, slow/failing provider (~15 min)
 make races              # concurrent cancel, batch cancel, idempotency and manual retry storms (~2 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
-make fuzz               # Go native fuzzing of SMS segmenting, validation, cursor decoding and templates (FUZZTIME=5m each)
+make fuzz               # Go native fuzzing of 7 parsers of untrusted input, incl. PII masking, Retry-After and the HTTP API (FUZZTIME=5m each)
 ```
 
 Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leaves a goroutine behind fails. For stress runs, `docker compose -f docker-compose.yml -f docker-compose.stress.yml up -d --wait` caps the API and workers at 0.5 CPU / 256 MB and Redis at 64 MB with `noeviction`, so resource exhaustion surfaces as errors instead of silent key eviction.
@@ -1246,6 +1246,26 @@ Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leave
 | `r_metrics_windows_and_percentiles_from_known_rows` | Rows with known `sent_at` / `failed_at` offsets and durations: exact 1m/5m/15m counts per channel and p50/p95/p99 (e.g. p95 = 8,600 ms from 1..9 s); non-counted and older attempts excluded |
 
 The full suite (18 scenarios) runs in ~30s locally and in the CI `integration` job.
+
+### Fuzzing
+
+`make fuzz` runs Go's native fuzzer on every function that parses untrusted input. Besides "never panics", each target checks the property below. Measured on 2026-11-21, 5 minutes per target:
+
+| Target | Property | Executions |
+|---|---|---:|
+| `FuzzSMSInfo` | Deterministic; encoding is GSM-7 or UCS-2; segment count matches the 160/153 and 70/67 thresholds | 14.3M |
+| `FuzzValidateNotification` | Never panics; an error always names a field; the idempotency request hash is the same before and after normalization | 7.5M |
+| `FuzzDecodeCursor` | Either a cursor or an error, never both or a zero position; a decoded cursor round-trips through encode/decode | 4.5M |
+| `FuzzTemplateEngine` | Template validation and rendering never panic; an error always names a field | 20.4M |
+| `FuzzMaskRecipientNeverRevealsTheRawValue` | A masked recipient (phone, email, token) never contains the raw value and hides at least 3 characters | 10.5M |
+| `FuzzParseRetryAfterIsNeverNegative` | Any `Retry-After` value gives a delay `>= 0` | 10.8M |
+| `FuzzAPINeverReturns5xxForClientInput` | Any body, idempotency key or query string on 7 routes gets a 2xx or a 4xx with the standard error envelope, never a 5xx | 2.8M |
+
+The new targets found three bugs, now fixed and kept as regression inputs under `testdata/fuzz/`:
+
+- **PII leak in log masking.** The mask kept a 6-character prefix and a 4-character suffix, so a 10-character phone number came out whole (`+123456789` -> `+12345***6789`), and a 9-character push token kept 8 of 9 characters. Every mask now hides at least 3 characters, and values too short for that are replaced by `***`.
+- **`Retry-After` overflow.** `Retry-After: 9227000000` (seconds) overflowed `time.Duration` to a negative delay, so the provider's back-off hint was silently ignored instead of being capped at `RETRY_AFTER_MAX`. The value is now clamped before conversion.
+- **WebSocket `426` without the error envelope.** A plain `GET /api/v1/ws` with a valid filter reached the WebSocket library, which wrote a `text/plain` `426`. The handler now answers `426 upgrade_required` in the standard JSON envelope, with `Upgrade: websocket`.
 
 ### Coverage
 

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -371,6 +372,9 @@ func (c *Client) classifyTransportError(err error, elapsed time.Duration) Result
 	}
 }
 
+// maxRetryAfterSeconds is the largest whole-second Retry-After that fits in a time.Duration.
+const maxRetryAfterSeconds = int(math.MaxInt64 / int64(time.Second))
+
 func parseRetryAfter(raw string, now time.Time) *time.Duration {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {
@@ -379,6 +383,11 @@ func parseRetryAfter(raw string, now time.Time) *time.Duration {
 	if secs, err := strconv.Atoi(trimmed); err == nil {
 		if secs < 0 {
 			secs = 0
+		}
+		// Clamp before multiplying: fuzzing found "9227000000" overflowed time.Duration into a negative
+		// delay. The retry policy caps the hint at RETRY_AFTER_MAX anyway.
+		if secs > maxRetryAfterSeconds {
+			secs = maxRetryAfterSeconds
 		}
 		d := time.Duration(secs) * time.Second
 		return &d

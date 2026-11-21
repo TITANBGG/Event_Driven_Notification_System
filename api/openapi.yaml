@@ -21,7 +21,7 @@ info:
     **Error codes** (`error.code` in the common `ErrorResponse` envelope): `malformed_json`, `unsupported_media_type`,
     `payload_too_large`, `validation_failed`, `batch_too_large`, `invalid_uuid`, `invalid_cursor`, `not_found`,
     `idempotency_conflict`, `item_idempotency_key_exists`, `not_cancellable`, `not_retryable`, `template_name_exists`,
-    `missing_ws_filter`, `too_many_ws_clients`, `method_not_allowed`, `request_timeout`, `service_unavailable`,
+    `missing_ws_filter`, `upgrade_required`, `too_many_ws_clients`, `method_not_allowed`, `request_timeout`, `service_unavailable`,
     `internal_error`. Field-level problems are listed in `error.details[]` with dot/bracket paths such as
     `notifications[3].recipient`.
   license:
@@ -760,6 +760,22 @@ paths:
                 error:
                   code: missing_ws_filter
                   message: at least one filter query parameter (notificationId, batchId, or channel) is required
+                correlationId: 01a1faec-fa8d-7807-bd64-5e7e9125458f
+        "426":
+          description: "Valid filter but not a WebSocket upgrade request (`Connection: Upgrade` and `Upgrade: websocket` are required)"
+          headers:
+            Upgrade:
+              description: Always `websocket`
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error:
+                  code: upgrade_required
+                  message: "this endpoint only accepts WebSocket upgrade requests (Connection: Upgrade, Upgrade: websocket)"
                 correlationId: 01a1faec-fa8d-7807-bd64-5e7e9125458f
         "503":
           description: Maximum concurrent WebSocket clients (`MAX_WS_CLIENTS`) exceeded

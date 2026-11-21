@@ -47,6 +47,19 @@ func (h *handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject plain HTTP requests before subscribing or reading the snapshot from PostgreSQL. Left to the
+	// WebSocket library, they got a text/plain 426 without the error envelope (found by fuzzing) after a
+	// wasted database read.
+	if !isWebSocketUpgrade(r) {
+		w.Header().Set("Upgrade", "websocket")
+		writeError(w, r, h.logger, &apiError{
+			status:  http.StatusUpgradeRequired,
+			code:    "upgrade_required",
+			message: "this endpoint only accepts WebSocket upgrade requests (Connection: Upgrade, Upgrade: websocket)",
+		})
+		return
+	}
+
 	if h.hub == nil {
 		writeError(w, r, h.logger, &apiError{
 			status:  http.StatusServiceUnavailable,
@@ -141,6 +154,22 @@ func (h *handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// isWebSocketUpgrade reports whether r asks for a WebSocket upgrade (RFC 6455 section 4.1).
+func isWebSocketUpgrade(r *http.Request) bool {
+	return headerHasToken(r.Header, "Connection", "upgrade") && headerHasToken(r.Header, "Upgrade", "websocket")
+}
+
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, v := range h.Values(name) {
+		for _, part := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), token) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func parseWSFilter(r *http.Request) (realtime.Filter, error) {

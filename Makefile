@@ -89,13 +89,17 @@ ws-test:
 ratecheck:
 	./scripts/ratecheck.sh --since=$(SINCE)
 
-# Run Go built-in fuzzing across SMS segmenter, validator, cursor decoder, and template engine.
+# Run Go built-in fuzzing: SMS segmenter, validator, cursor decoder, template engine, PII masking,
+# Retry-After parsing and the HTTP API (no 5xx for any client input).
 FUZZTIME ?= 5m
 fuzz:
 	go test -fuzz=FuzzSMSInfo -fuzztime=$(FUZZTIME) ./internal/domain
 	go test -fuzz=FuzzValidateNotification -fuzztime=$(FUZZTIME) ./internal/domain
 	go test -fuzz=FuzzDecodeCursor -fuzztime=$(FUZZTIME) ./internal/api
 	go test -fuzz=FuzzTemplateEngine -fuzztime=$(FUZZTIME) ./internal/template
+	go test -fuzz=FuzzMaskRecipientNeverRevealsTheRawValue -fuzztime=$(FUZZTIME) ./internal/observability
+	go test -fuzz=FuzzParseRetryAfterIsNeverNegative -fuzztime=$(FUZZTIME) ./internal/provider
+	go test -fuzz=FuzzAPINeverReturns5xxForClientInput -fuzztime=$(FUZZTIME) ./internal/api
 
 load:
 	go run ./cmd/loadgen -n 2000

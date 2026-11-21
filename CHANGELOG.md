@@ -7,6 +7,19 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+### Fixed
+
+- Log masking revealed 10-character phone numbers in full and 8 of 9 characters of short push tokens;
+  at least 3 characters are now always hidden (found by fuzzing).
+- A very large `Retry-After` header overflowed to a negative delay, so the hint was ignored; it is now
+  clamped and capped at `RETRY_AFTER_MAX` (found by fuzzing).
+- A non-upgrade `GET /api/v1/ws` returned a plain-text `426`; it now returns `426 upgrade_required`
+  with the standard error envelope (found by fuzzing).
+
+### Tests
+
+- Fuzz targets for PII masking, `Retry-After` parsing and the HTTP API (7 targets, ~70M executions).
+
 ### Documentation
 
 - Live EXT-1 run against webhook.site: one SMS, one email and one push notification were delivered on
