@@ -10,6 +10,8 @@
 #   2  batch cancel storm                   20 concurrent cancels of the same 1000-item batch
 #   3  idempotency storm                    200 concurrent POSTs, same key (same body, then different bodies)
 #   4  manual retry storm                   20 failed notifications x 50 concurrent retries each
+#   5  scheduled send vs cancel             5,000 SMS due in 20s, 2,500 cancelled concurrently just before due
+#   6  template delete vs batch             a template is soft-deleted while its 1,000-item batch is delivered
 # shellcheck disable=SC2028 # curl config strings carry a literal backslash-n that curl expands in write-out
 set -euo pipefail
 
@@ -38,7 +40,8 @@ check() { # check <scenario> <condition-result 0/1> <detail>
 # Relative output paths in the config resolve inside $WORK.
 par_requests() { (cd "$WORK" && curl --parallel --parallel-immediate --parallel-max 200 --max-time 60 -K "$1"); }
 
-psql_q() { "${COMPOSE[@]}" exec -T postgres psql -U notif -d notif -qAt -F ' ' -c "$1" | tr -d '\r'; }
+# </dev/null: `compose exec` reads stdin, which would swallow the input of a `while read` loop around it.
+psql_q() { "${COMPOSE[@]}" exec -T postgres psql -U notif -d notif -qAt -F ' ' -c "$1" </dev/null | tr -d '\r'; }
 mock_env() { env "$@" "${COMPOSE[@]}" up -d --wait mockprovider >/dev/null 2>&1; curl -s -X POST "${MOCK_URL}/reset" >/dev/null; }
 restore_mock() { "${COMPOSE[@]}" up -d --wait mockprovider >/dev/null 2>&1 || true; }
 # mock_count <id> -> provider requests received for that Idempotency-Key since the last reset
@@ -207,6 +210,95 @@ race_4_manual_retry_storm() {
     "20 failed x 50 concurrent retries: ${per_ok}/20 accepted exactly once (rest 409); ${bad} not sent exactly once afterwards; ${dlq} still in the DLQ list"
 }
 
+# scheduled_body <seq> <scheduledAt>: 1,000 SMS due at the same instant (awk is fast enough to keep the
+# five batches well inside the 15s lead time).
+scheduled_body() {
+  awk -v s="$1" -v due="$2" -v tag="$RUN_TAG" 'BEGIN {
+    printf "{\"notifications\":["
+    for (i = 0; i < 1000; i++)
+      printf "%s{\"recipient\":\"+90557%07d\",\"channel\":\"sms\",\"content\":\"scheduled %s %d-%d\",\"scheduledAt\":\"%s\"}", (i ? "," : ""), s * 1000 + i, tag, s, i, due
+    printf "]}"
+  }'
+}
+
+race_5_scheduled_vs_cancel() {
+  local name="5 scheduled send vs cancel" due_epoch due b out t_end c200 other leaks_pg leaks_mock still_delayed bad_sent sent_ok
+  log "== ${name}"
+  mock_env
+  due_epoch=$(($(date +%s) + 20))
+  due="$(date -u -d "@${due_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+  : > "$WORK/sched_ids"
+  : > "$WORK/sched_batches"
+  for b in 0 1 2 3 4; do
+    out="$(scheduled_body "$b" "$due" | curl -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
+    printf '%s' "$out" | grep -oE '"batchId":"[^"]+"' | cut -d'"' -f4 >> "$WORK/sched_batches"
+    printf '%s' "$out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n +2 >> "$WORK/sched_ids"
+  done
+  # Every second notification is cancelled; the other half must still go out once at the due time.
+  awk 'NR % 2 == 1' "$WORK/sched_ids" | sort > "$WORK/cancel_ids"
+  awk 'NR % 2 == 0' "$WORK/sched_ids" | sort > "$WORK/keep_ids"
+  # 2,500 cancels take ~3s from one curl process; starting 6s ahead lets all of them land before the due
+  # time while the rows are already in the delayed set.
+  while (($(date +%s) < due_epoch - 6)); do sleep 0.2; done
+  {
+    echo 'silent'
+    echo 'request = "POST"'
+    echo 'write-out = "%{url} %{http_code}\n"'
+    while read -r id; do printf 'url = "%s/api/v1/notifications/%s/cancel"\noutput = "s_%s"\n' "$API_URL" "$id" "$id"; done < "$WORK/cancel_ids"
+  } > "$WORK/sched_cancel.cfg"
+  par_requests sched_cancel.cfg | sed -E 's#.*/notifications/([0-9a-f-]{36})/cancel ([0-9]+)$#\1 \2#' | sort > "$WORK/sched_cancel.txt"
+  t_end=$(date +%s)
+  # CancelDelayed must have removed every cancelled ID from the delayed set (ZSET member = ID).
+  "${COMPOSE[@]}" exec -T redis redis-cli --raw ZRANGE '{notif}:delayed' 0 -1 | tr -d '\r' | sort > "$WORK/delayed_now"
+  still_delayed="$(comm -12 "$WORK/cancel_ids" "$WORK/delayed_now" | wc -l | tr -d ' ')"
+
+  while read -r b; do wait_terminal "$b" 120 || true; done < "$WORK/sched_batches"
+  local batch_list
+  batch_list="$(awk -v q="'" 'NF {printf "%s%s%s%s", (n++ ? "," : ""), q, $1, q}' "$WORK/sched_batches")"
+  psql_q "SELECT id::text, status FROM notifications WHERE batch_id IN (${batch_list});" | sort > "$WORK/sched_final.txt"
+  mock_counts | sort > "$WORK/mock.txt"
+  c200="$(awk '$2 == 200' "$WORK/sched_cancel.txt" | wc -l | tr -d ' ')"
+  other="$(awk '$2 != 200' "$WORK/sched_cancel.txt" | wc -l | tr -d ' ')"
+  leaks_pg="$(join "$WORK/cancel_ids" "$WORK/sched_final.txt" | awk '$2 != "cancelled"' | wc -l | tr -d ' ')"
+  leaks_mock="$(join "$WORK/cancel_ids" "$WORK/mock.txt" | wc -l | tr -d ' ')"
+  sent_ok="$(join -a1 -e 0 -o '0,2.2' "$WORK/keep_ids" "$WORK/mock.txt" | join - "$WORK/sched_final.txt" | awk '$2 == 1 && $3 == "sent"' | wc -l | tr -d ' ')"
+  bad_sent=$((2500 - sent_ok))
+  # The race only counts if every cancel completed before the due time; otherwise it proved nothing.
+  local early=0
+  if ((t_end < due_epoch)); then early=1; fi
+  check "$name" $((early == 0 || c200 != 2500 || other != 0 || leaks_pg != 0 || leaks_mock != 0 || still_delayed != 0 || bad_sent != 0 ? 1 : 0)) \
+    "5,000 due at ${due}; 2,500 cancels finished $((due_epoch - t_end))s before due: ${c200} x 200, ${other} other; cancelled rows not 'cancelled'=${leaks_pg}, reaching the provider=${leaks_mock}, left in the delayed set=${still_delayed}; kept rows sent exactly once: ${sent_ok}/2500"
+}
+
+race_6_template_delete_vs_batch() {
+  local name="6 template delete vs batch" tpl batch out del_code code2 rows_tpl pending_at_delete rendered raw_left sent
+  log "== ${name}"
+  mock_env MOCK_LATENCY_MS=300
+  tpl="$(printf '{"name":"race_tpl_%s","channel":"sms","body":"Hello {{name}}, your code is {{code}}","variables":["name","code"]}' "$RUN_TAG" |
+    curl -s --max-time 30 -X POST "${API_URL}/api/v1/templates" -H 'Content-Type: application/json' --data-binary @- |
+    grep -oE '"id":"[^"]+"' | head -n1 | cut -d'"' -f4)"
+  out="$(awk -v t="$tpl" 'BEGIN {
+    printf "{\"notifications\":["
+    for (i = 0; i < 1000; i++)
+      printf "%s{\"recipient\":\"+90558%07d\",\"channel\":\"sms\",\"templateId\":\"%s\",\"templateVariables\":{\"name\":\"N%d\",\"code\":\"%d\"}}", (i ? "," : ""), i, t, i, i
+    printf "]}"
+  }' | curl -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
+  batch="$(printf '%s' "$out" | grep -oE '"batchId":"[^"]+"' | cut -d'"' -f4)"
+  sleep 1
+  pending_at_delete="$(psql_q "SELECT COUNT(*) FROM notifications WHERE batch_id = '${batch}' AND status NOT IN ('sent','failed','cancelled');")"
+  del_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "${API_URL}/api/v1/templates/${tpl}")"
+  code2="$(printf '{"notifications":[{"recipient":"+905589999999","channel":"sms","templateId":"%s","templateVariables":{"name":"late","code":"0"}}]}' "$tpl" |
+    curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
+  wait_terminal "$batch" 120 || true
+
+  rows_tpl="$(psql_q "SELECT COUNT(*) FROM notifications WHERE template_id = '${tpl}';")"
+  sent="$(psql_q "SELECT COUNT(*) FROM notifications WHERE batch_id = '${batch}' AND status = 'sent';")"
+  rendered="$(psql_q "SELECT COUNT(*) FROM notifications WHERE batch_id = '${batch}' AND content ~ '^Hello N[0-9]+, your code is [0-9]+\$';")"
+  raw_left="$(psql_q "SELECT COUNT(*) FROM notifications WHERE batch_id = '${batch}' AND content LIKE '%{{%';")"
+  check "$name" $((pending_at_delete == 0 || del_code != 204 || code2 < 400 || code2 >= 500 || rows_tpl != 1000 || sent != 1000 || rendered != 1000 || raw_left != 0 ? 1 : 0)) \
+    "template deleted (${del_code}) with ${pending_at_delete} items still undelivered: ${sent}/1000 sent, ${rendered}/1000 carry the text rendered at create time, ${raw_left} with raw placeholders; a new batch on the deleted template -> ${code2}, rows on the template=${rows_tpl}"
+}
+
 # ---------------------------------------------------------------------------------------------
 
 if [[ "$(curl -s -o /dev/null -w '%{http_code}' "${API_URL}/health/ready")" != "200" ]]; then
@@ -215,13 +307,15 @@ if [[ "$(curl -s -o /dev/null -w '%{http_code}' "${API_URL}/health/ready")" != "
 fi
 
 selected=("$@")
-if ((${#selected[@]} == 0)); then selected=(1 2 3 4); fi
+if ((${#selected[@]} == 0)); then selected=(1 2 3 4 5 6); fi
 for s in "${selected[@]}"; do
   case "$s" in
     1) race_1_cancel_vs_worker ;;
     2) race_2_batch_cancel_storm ;;
     3) race_3_idempotency_storm ;;
     4) race_4_manual_retry_storm ;;
+    5) race_5_scheduled_vs_cancel ;;
+    6) race_6_template_delete_vs_batch ;;
     *) echo "unknown scenario $s" >&2; exit 2 ;;
   esac
 done

@@ -1213,7 +1213,7 @@ make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, que
 make ws-test            # 39 API boundary cases + WebSocket capacity, fast/slow consumers and batch watchers (~5 min)
 make shutdown-test      # SIGTERM workers and API under load: drain, no abandoned attempts, no duplicates (~4 min)
 make chaos              # sustained load + worker kills, Redis restart/FLUSHALL, PostgreSQL stop, slow/failing provider (~15 min)
-make races              # concurrent cancel, batch cancel, idempotency and manual retry storms (~2 min)
+make races              # concurrent cancel, batch cancel, idempotency, manual retry, scheduled-cancel and template-delete races (~4 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
 make fuzz               # Go native fuzzing of 7 parsers of untrusted input, incl. PII masking, Retry-After and the HTTP API (FUZZTIME=5m each)
 ```
@@ -1357,8 +1357,10 @@ Each worker's 10-connection pool was fully used during the burst, and 16% of con
 | Idempotency, same body | 200 `POST`s with one `Idempotency-Key` | 1 created, 199 replayed (`Idempotent-Replayed: true`), one ID returned to all, 1 row |
 | Idempotency, different bodies | 200 `POST`s, one key, 200 different bodies | One `202`, 199 × `409 idempotency_conflict`, 1 row |
 | Manual retry storm | 50 retries for each of 20 failed notifications | Exactly one `200` per notification, the rest `409`; each sent exactly once afterwards and removed from the DLQ list |
+| Scheduled send vs cancel | 5,000 SMS due at the same second; 2,500 of them cancelled concurrently, all cancels landing 3s before the due time | 2,500 × `200`, all `cancelled`, 0 provider calls and 0 left in the delayed set; the other 2,500 each sent exactly once after the due time |
+| Template delete vs batch | A 1,000-item templated batch (300ms provider latency); the template is deleted while 908 items are still undelivered | All 1,000 sent with the text rendered at create time (0 raw `{{` placeholders); a new batch on the deleted template -> `422` |
 
-The first version of the script spawned one `curl` per request with `xargs`. On Windows that spread 1,000 "concurrent" cancels over ~30 seconds, so the batch finished before any cancel arrived and the scenario passed without ever racing. The script now fails a scenario in which no cancel both won and lost.
+The first version of the script spawned one `curl` per request with `xargs`. On Windows that spread 1,000 "concurrent" cancels over ~30 seconds, so the batch finished before any cancel arrived and the scenario passed without ever racing. The script now fails a scenario in which no cancel both won and lost. The scheduled-send race is likewise only counted when every cancel completed before the due time.
 
 ### Chaos under sustained load
 
