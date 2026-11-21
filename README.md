@@ -1306,6 +1306,21 @@ Prometheus during a 24,000-notification run (`sum by (channel) (rate(notificatio
 
 The scaled run found two real defects. The worker pool was fixed at 35 connections, so 6 replicas + API asked for 230 connections against PostgreSQL's 100, and requests failed with `too many clients`. And because the token was taken before the claim, sends that waited for a connection bunched up when connections freed, breaking the 100/s window. One send was also duplicated: the provider accepted it, the result could not be written, and the reconciler re-sent it. The fixes: `DB_MAX_CONNS` (worker default 10), the token taken right before the provider call, and a 5s retry for the writes that follow an accepted send. With 6 replicas and 100ms provider latency the effective rate is 86.5/s rather than 95/s: 150 senders per channel contend for each 10ms GCRA slot and some slots go unused. The limit, the hard requirement, holds.
 
+### Flash sale: 100,000 notifications at once
+
+100 batches of 1,000 (mixed channels, priorities 20/60/20) sent by 16 concurrent clients, with `scripts/prom-snapshot.sh watch 5` sampling every 5 seconds. Measured on 2026-11-21, 2 workers, default settings:
+
+| Metric | Result |
+|---|---|
+| Accepted | 100,000 in 4.2s (23,775/s), batch p50 661ms, p99 828ms, no errors |
+| Peak queue depth | 98,449 ready; it drained in a straight line at ~295/s (6m05s to all terminal; floor at 300/s is 5m33s) |
+| Rate limit | busiest second 97 per channel, provider total 291 of 300; 93.3/s effective per channel |
+| End-to-end latency (p50 / p95) | high 59s / 161s, normal 200s / 313s, low 303s / 351s: the 6:3:1 weighting gives `high` 60% of the slots under full load, and `low` is never starved |
+| Resources (peak → after) | goroutines api 36 → 18, worker 117 → 91; heap api 18 MB, worker 33 MB; Redis 40 MB (~400 bytes per queued notification) → 3 MB; PostgreSQL 38 connections |
+| Invariants | all passed: 0 stuck, 0 duplicates, Redis and PostgreSQL consistent |
+
+Each worker's 10-connection pool was fully used during the burst, and 16% of connection acquires had to wait (`db_pool_empty_acquire_total`). That cost about 2% of throughput (93.3/s against 95.2/s in steady load). Goroutines and file descriptors returned to their baseline afterwards, so nothing leaked.
+
 ### CI/CD (GitHub Actions, `B-6`)
 
 `.github/workflows/ci.yml` runs on every branch push and pull request (`permissions: contents: read`, superseded runs on the same ref are cancelled):
