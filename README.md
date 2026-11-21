@@ -1501,6 +1501,26 @@ Every list query used its composite index, and 30 repeated calls showed no slowd
 
 The partial index holds only non-terminal rows, so the scans cost the same whatever the size of the `sent` history. The key cleanup did not. With `IN (SELECT ... LIMIT)` the planner hash-joined the 10,000 expired keys against every key in the table. With a 24-hour TTL and an `Idempotency-Key` on most requests, the table holds a day of traffic (tens of millions of rows at the stated volume), and the reconciler would have scanned all of it every 15 seconds. Integration scenario `t` covers the rewritten query (bounded batches, live keys kept).
 
+### Endurance soak: 60 minutes
+
+`scripts/soak.sh` (`make soak`) runs 60 minutes of continuous mixed-channel, mixed-priority traffic (`1,000` items every `4s`, `~250/s`, `0.5%` mock transient errors) alongside periodic scheduled notifications, idempotent create+replay pairs, and `/health/ready`, `/api/v1/metrics`, and list probes, with `OTEL_SAMPLER_RATIO=0.1` so Jaeger stays within its trace window:
+
+```bash
+OTEL_SAMPLER_RATIO=0.1 docker compose up -d --force-recreate --wait
+API_URL=http://127.0.0.1:8080 MOCK_URL=http://127.0.0.1:8090 PROM_URL=http://127.0.0.1:9090 ./scripts/soak.sh
+```
+
+Measured over 60 minutes on 2026-11-21 (`900/900` batches HTTP `202`, batch latency p50 `75 ms`, p99 `126 ms`, `61` probe cycles with `0` errors, `900,122/900,122` sent, `0` container restarts or OOM kills):
+
+| Resource (`api` / `worker-1` / `worker-2`) | Baseline | Early steady | Late steady | Post-drain |
+|---|---|---|---|---|
+| Goroutines | `17 / 95 / 95` | `18 / 99 / 99` | `18 / 99 / 99` | `18 / 99 / 99` |
+| Open FDs | `14 / 104 / 103` | — | `15 / 108 / 108` | `15 / 108 / 108` |
+| Go heap (`alloc_bytes`) | — | `4.1 / 15.3 / 14.2 MB` | `4.3 / 14.1 / 14.1 MB` | `3.9 / 16.0 / 15.3 MB` |
+| Redis `used_memory` | `2.31 MB` | — | — | `2.26 MB` |
+
+`jaeger` plateaued at `1006–1007 MiB / 1.5 GiB` (`MEMORY_MAX_TRACES=20000`) from minute 25 through minute 60. `ratecheck.sh` passed (`email 97/s`, `push 97/s`, `sms 97/s`, provider `291/s` vs `300/s` limit) and `invariants.sh` passed across `2,447,435` cumulative `sent` rows (`0` stuck, `0` cancelled sends, `0` Redis–PG mismatches, `0` duplicates across `900,122` mock keys).
+
 ### CI/CD (GitHub Actions, `B-6`)
 
 `.github/workflows/ci.yml` runs on every branch push and pull request (`permissions: contents: read`, superseded runs on the same ref are cancelled):

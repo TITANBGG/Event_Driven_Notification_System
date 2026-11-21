@@ -4,7 +4,7 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
-.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot ratecheck races chaos shutdown-test rolling-test isolation priority provider-timeout stress ws-test fuzz
+.PHONY: up down logs build test test-integration test-all cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot ratecheck races chaos shutdown-test rolling-test isolation priority provider-timeout stress soak ws-test fuzz
 
 up:
 	$(COMPOSE) up --build -d
@@ -97,6 +97,9 @@ provider-timeout:
 # Needs the stress profile: docker compose -f docker-compose.yml -f docker-compose.stress.yml up -d --wait
 stress:
 	./scripts/stress.sh
+
+soak:
+	./scripts/soak.sh
 
 ws-test:
 	./scripts/ws-boundaries.sh

@@ -89,13 +89,15 @@ if [[ "$(redis_cmd PING 2>/dev/null || true)" != "PONG" ]]; then
   exit 2
 fi
 
-STATS_JSON="$(curl -fsS --max-time 15 "${MOCK_URL}/stats")" || {
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+# Download to a file instead of capturing into a shell variable: at ~900k keys /stats is ~40 MB,
+# and MSYS2/Git Bash command-substitution buffering makes curl hit --max-time before finishing.
+curl -fsS --max-time 60 -o "${TMP_DIR}/stats.json" "${MOCK_URL}/stats" || {
   echo "ERROR: MockProvider /stats unreachable at ${MOCK_URL}/stats" >&2
   exit 2
 }
-
-TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
 
 # 1. No stuck pending / processing / retrying / overdue scheduled notifications.
 stuck_active="$(pg_scalar "SELECT COUNT(*) FROM notifications WHERE status IN ('pending', 'processing', 'retrying');")"
@@ -132,7 +134,7 @@ fi
 
 # Parse MockProvider /stats byKey entries: "<uuid> <count>" per line. grep -o is linear; the former awk
 # loop re-copied the rest of the single-line JSON after every match, which took 20+ minutes at 500k keys.
-printf '%s' "$STATS_JSON" | { grep -oE '"[0-9a-fA-F-]{36}":[0-9]+' || true; } \
+{ grep -oE '"[0-9a-fA-F-]{36}":[0-9]+' "${TMP_DIR}/stats.json" || true; } \
   | tr -d '"' | awk -F: '$2 + 0 > 0 { print $1 " " $2 }' > "${TMP_DIR}/mock_by_key.txt"
 
 mock_window="$(wc -l < "${TMP_DIR}/mock_by_key.txt" | tr -d ' ')"
