@@ -193,6 +193,12 @@ services:
     image: jaegertracing/all-in-one:1.63.0
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+      # In-memory storage is unbounded by default: a day of load tests (~430k notifications, ~46 KB of
+      # spans each) grew Jaeger past the Docker VM's memory and froze Docker Desktop. Batch items now get
+      # one small trace each (linked to the batch request), so 20,000 traces stay under ~1 GB, and the
+      # memory limit turns any overrun into a Jaeger restart instead of a frozen host.
+      MEMORY_MAX_TRACES: ${JAEGER_MAX_TRACES:-20000}
+    mem_limit: ${JAEGER_MEM_LIMIT:-1536m}
     ports:
       - "16686:16686"
       - "4318:4318"

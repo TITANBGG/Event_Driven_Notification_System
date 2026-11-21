@@ -25,7 +25,9 @@ type QueueItem struct {
 	Priority      domain.Priority
 	CorrelationID string
 	TraceParent   string
-	ScheduledAt   *time.Time
+	// TraceLink: the worker links its trace to TraceParent instead of joining it (batch items).
+	TraceLink   bool
+	ScheduledAt *time.Time
 }
 
 // Enqueuer abstracts asynchronous queue dispatch plus best-effort Redis cleanup after

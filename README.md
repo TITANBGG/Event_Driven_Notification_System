@@ -1127,7 +1127,7 @@ Logs are JSON from `log/slog`, written to stdout. Every line carries `correlatio
 
 ### Distributed tracing
 
-OpenTelemetry spans cover the API request, every SQL query (`otelpgx`), the Redis enqueue, the worker's dequeue → rate-limit wait → claim → provider call → status update, and the provider side (mockprovider). The W3C `traceparent` is stored in the Redis metadata, so the worker continues the API's trace. Open http://localhost:16686, select service `notification-api` and open any `POST /api/v1/notifications` trace.
+OpenTelemetry spans cover the API request, every SQL query (`otelpgx`), the Redis enqueue, the worker's dequeue → rate-limit wait → claim → provider call → status update, and the provider side (mockprovider). The W3C `traceparent` is stored in the Redis metadata, so for a single notification the worker continues the API's trace. Batch items are different: each one starts its own trace with a span link back to the batch request. As children, one 1,000-item batch produced a single trace of 28,013 spans (~145 MB in Jaeger's memory); with links the batch request trace has 17 spans and each item ~28. Jaeger keeps at most 20,000 traces in memory (`JAEGER_MAX_TRACES`) under a 1.5 GB container limit (`JAEGER_MEM_LIMIT`): before that limit existed, a day of load tests grew it until Docker Desktop froze. Open http://localhost:16686, select service `notification-api` and open any `POST /api/v1/notifications` trace.
 
 ![Trace waterfall of one notification: API insert and enqueue, worker claim, provider call, retry](docs/images/trace.png)
 
@@ -1210,6 +1210,7 @@ make drills             # live failure drills against the running stack (~5 min,
 make invariants         # check system invariants on the settled stack (no stuck rows, no cancelled or double sends, Redis matches PostgreSQL);
                         # covers the full history, so pass --since=<RFC3339> to ignore duplicates from an earlier crash drill
 make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, queue depths, DB pool, Redis memory
+make chaos              # sustained load + worker kills, Redis restart/FLUSHALL, PostgreSQL stop, slow/failing provider (~15 min)
 make races              # concurrent cancel, batch cancel, idempotency and manual retry storms (~2 min)
 make ratecheck SINCE=2026-11-21T10:00:00Z   # busiest 1s window per channel since SINCE (FR-2.2)
 make fuzz               # Go native fuzzing of SMS segmenting, validation, cursor decoding and templates (FUZZTIME=5m each)
@@ -1336,6 +1337,29 @@ Each worker's 10-connection pool was fully used during the burst, and 16% of con
 
 The first version of the script spawned one `curl` per request with `xargs`. On Windows that spread 1,000 "concurrent" cancels over ~30 seconds, so the batch finished before any cancel arrived and the scenario passed without ever racing. The script now fails a scenario in which no cancel both won and lost.
 
+### Chaos under sustained load
+
+`scripts/chaos.sh` (`make chaos`) submits a 1,000-item mixed batch every 5 seconds (~200/s) for 8 minutes while a fixed timeline breaks things, then waits until every accepted notification is terminal and runs `invariants.sh --allow-duplicates` and `ratecheck.sh`. The mock provider's fault profile is switched at runtime (`POST /config`) so its per-key counters survive. Measured on 2026-11-21, 2 workers:
+
+| t | Event |
+|---|---|
+| 30s, 60s | `SIGKILL` worker-1, then worker-2 (each back after 15s) |
+| 90s, 120s | Redis restart, then `FLUSHALL` |
+| 150s–170s | PostgreSQL stopped |
+| 200s, 240s, 280s | Provider 2s ± 0.5s latency, then 30% `500`, then 50% `429` |
+| 300s | `SIGKILL` worker-1 again during the `429` storm |
+| 360s | Provider healthy |
+
+| Result | |
+|---|---|
+| Accepted | 84,000 notifications (3 of 87 batch requests rejected with `503` while PostgreSQL was down) |
+| Final state | 83,994 `sent`, 6 `failed` (5 × `500`, in the DLQ), **0 lost, 0 stuck**; drained 45s after the load ended |
+| Rate limit | busiest second 97 per channel, provider total 291 of 300, throughout the chaos |
+| Duplicates | 147 provider calls the system never recorded, from the 3 worker kills (~49 sends in flight per kill), plus 2 notifications recorded as sent twice: one worker died right after recording its attempt, and one send was accepted at the moment PostgreSQL stopped, so the 5s post-send retry could not write it. All share the same `Idempotency-Key` (at-least-once, as documented) |
+| Invariants | all passed; peak queue 17,009, Redis 14 MB, 25 PostgreSQL connections |
+
+Two earlier runs of the same test found infrastructure problems rather than delivery problems. Jaeger's unbounded in-memory storage (see Distributed tracing) filled the Docker VM after a day of load tests and froze Docker Desktop in the middle of a run; after the restart the system recovered on its own, and the 2,357 notifications that were open at the freeze were all delivered within 40 seconds. The chaos script now retries its database queries and keeps its logs when a run fails.
+
 ### CI/CD (GitHub Actions, `B-6`)
 
 `.github/workflows/ci.yml` runs on every branch push and pull request (`permissions: contents: read`, superseded runs on the same ref are cancelled):
@@ -1382,6 +1406,13 @@ curl -s http://localhost:8090/stats | head -c 300; echo                       # 
 docker compose up -d mockprovider                                             # back to defaults
 ```
 
+The fault profile can also be changed at runtime without restarting the container, which keeps the `/stats` counters that the duplicate checks read. Omitted fields keep their value; rates must be between 0 and 1, latencies between 0 and 60,000 ms:
+
+```bash
+curl -s -X POST http://localhost:8090/config -H 'Content-Type: application/json' -d '{"latencyMs":2000,"latencyJitterMs":500}'
+curl -s -X POST http://localhost:8090/config -H 'Content-Type: application/json' -d '{"latencyMs":0,"latencyJitterMs":0,"failureRate":0,"rate429":0,"permanentRate":0}'
+```
+
 To send to the real external provider used in the assignment, `webhook.site`:
 
 1. Open https://webhook.site and copy your unique URL (`https://webhook.site/<uuid>`).
@@ -1411,6 +1442,7 @@ webhook.site's free tier limits the number of requests, so use the mock provider
 What is deliberately missing or simplified, and what I would do with more time:
 
 - **No authentication, authorization or multi-tenancy.** Idempotency keys are global. Next steps: API keys or OAuth2 client credentials, a `tenant_id` on every table and key, and per-tenant rate limits.
+- **`429` burns attempts.** A `429` is a transient error (it honors `Retry-After`) and counts against `MAX_ATTEMPTS` like a `5xx`. In the chaos test, 37 of 76,000 notifications sent while the provider returned `429` for half of all requests used all 5 attempts and went to the DLQ (recoverable with a manual retry). A `429` means "slow down", not "this message is broken", so treating it like an open circuit (deferral without burning an attempt, capped by `MAX_CIRCUIT_DEFERRALS`) would be the better policy for a long throttling period.
 - **Duplicates on provider timeouts.** At-least-once is the honest guarantee. Exactly-once would need a provider that deduplicates on `Idempotency-Key`.
 - **Each replica opens its own PostgreSQL pool.** `DB_MAX_CONNS` (worker default 10) fits 6 worker replicas + the API into PostgreSQL's default 100 connections; beyond that I would put PgBouncer in transaction mode in front of PostgreSQL.
 - **Limiter contention at many replicas.** With 6 replicas and 100ms provider latency, 150 senders per channel contend for each 10ms GCRA slot and the effective rate drops to ~86/s (95/s with 2 replicas). The 100/s ceiling holds; a per-channel token dispatcher (one process hands out slots) would recover the unused slots.

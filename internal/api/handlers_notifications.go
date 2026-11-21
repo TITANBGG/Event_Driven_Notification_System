@@ -394,6 +394,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 			Priority:      n.Priority,
 			CorrelationID: cid,
 			TraceParent:   tp,
+			TraceLink:     true,
 			ScheduledAt:   n.ScheduledAt,
 		}
 	}

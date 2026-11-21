@@ -64,6 +64,10 @@ type Meta struct {
 	Priority      domain.Priority `json:"priority"`
 	CorrelationID string          `json:"correlationId,omitempty"`
 	TraceParent   string          `json:"traceparent,omitempty"`
+	// TraceLink makes the worker start a new trace linked to TraceParent instead of a child span.
+	// Set for batch items: as children, 1,000 items put ~28,000 spans into one trace (~145 MB in
+	// Jaeger's memory, unreadable in the UI, beyond most backends' per-trace span limits).
+	TraceLink bool `json:"traceLink,omitempty"`
 }
 
 // MetricsDepths captures live queue lengths across channels, priorities, delayed ZSET, DLQ, and inflight lists.

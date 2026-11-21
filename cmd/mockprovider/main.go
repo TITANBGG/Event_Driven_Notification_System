@@ -99,6 +99,7 @@ func (s *mockServer) routes() http.Handler {
 	mux.HandleFunc("GET /health/live", s.handleHealth)
 	mux.HandleFunc("GET /stats", s.handleStats)
 	mux.HandleFunc("POST /reset", s.handleReset)
+	mux.HandleFunc("POST /config", s.handleConfig)
 	mux.HandleFunc("POST /", s.handleSend)
 	return mux
 }
@@ -129,6 +130,77 @@ func (s *mockServer) handleStats(w http.ResponseWriter, _ *http.Request) {
 		ByKey:      byKeyCopy,
 		Timestamps: tsCopy,
 	})
+}
+
+// configUpdate is the body of POST /config. Omitted fields keep their current value.
+type configUpdate struct {
+	LatencyMS       *int     `json:"latencyMs"`
+	LatencyJitterMS *int     `json:"latencyJitterMs"`
+	FailureRate     *float64 `json:"failureRate"`
+	Rate429         *float64 `json:"rate429"`
+	PermanentRate   *float64 `json:"permanentRate"`
+}
+
+type configView struct {
+	LatencyMS       int     `json:"latencyMs"`
+	LatencyJitterMS int     `json:"latencyJitterMs"`
+	FailureRate     float64 `json:"failureRate"`
+	Rate429         float64 `json:"rate429"`
+	PermanentRate   float64 `json:"permanentRate"`
+}
+
+const maxMockLatencyMS = 60000
+
+// handleConfig changes the fault profile at runtime. Chaos tests need this: recreating the container
+// with new MOCK_* variables would wipe /stats, which the duplicate-delivery cross-check depends on.
+func (s *mockServer) handleConfig(w http.ResponseWriter, r *http.Request) {
+	var upd configUpdate
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&upd); err != nil {
+		writeJSON(w, s.logger, http.StatusBadRequest, map[string]string{"error": "invalid config body: " + err.Error()})
+		return
+	}
+	for _, rate := range []*float64{upd.FailureRate, upd.Rate429, upd.PermanentRate} {
+		if rate != nil && (*rate < 0 || *rate > 1) {
+			writeJSON(w, s.logger, http.StatusBadRequest, map[string]string{"error": "rates must be between 0 and 1"})
+			return
+		}
+	}
+	for _, ms := range []*int{upd.LatencyMS, upd.LatencyJitterMS} {
+		if ms != nil && (*ms < 0 || *ms > maxMockLatencyMS) {
+			writeJSON(w, s.logger, http.StatusBadRequest, map[string]string{"error": "latencies must be between 0 and 60000 ms"})
+			return
+		}
+	}
+
+	s.mu.Lock()
+	if upd.LatencyMS != nil {
+		s.cfg.LatencyMS = *upd.LatencyMS
+	}
+	if upd.LatencyJitterMS != nil {
+		s.cfg.LatencyJitterMS = *upd.LatencyJitterMS
+	}
+	if upd.FailureRate != nil {
+		s.cfg.FailureRate = *upd.FailureRate
+	}
+	if upd.Rate429 != nil {
+		s.cfg.Rate429 = *upd.Rate429
+	}
+	if upd.PermanentRate != nil {
+		s.cfg.PermanentRate = *upd.PermanentRate
+	}
+	view := configView{
+		LatencyMS: s.cfg.LatencyMS, LatencyJitterMS: s.cfg.LatencyJitterMS,
+		FailureRate: s.cfg.FailureRate, Rate429: s.cfg.Rate429, PermanentRate: s.cfg.PermanentRate,
+	}
+	s.mu.Unlock()
+
+	if view.FailureRate+view.Rate429+view.PermanentRate > 1 {
+		s.logger.Warn("fault rates sum above 1; later outcomes in the roll order can never happen")
+	}
+	s.logger.Info("mock provider config changed", slog.Any("config", view))
+	writeJSON(w, s.logger, http.StatusOK, view)
 }
 
 func (s *mockServer) handleReset(w http.ResponseWriter, _ *http.Request) {

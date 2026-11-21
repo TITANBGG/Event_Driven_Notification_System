@@ -44,6 +44,7 @@ func (e redisEnqueuer) Enqueue(ctx context.Context, items []api.QueueItem) error
 			Priority:      item.Priority,
 			CorrelationID: item.CorrelationID,
 			TraceParent:   item.TraceParent,
+			TraceLink:     item.TraceLink,
 		}
 		if item.ScheduledAt != nil {
 			scheduled = append(scheduled, meta)

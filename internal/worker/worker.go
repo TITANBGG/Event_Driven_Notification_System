@@ -288,7 +288,14 @@ func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel
 		attribute.String("notification.priority", meta.Priority.String()),
 	}
 
-	itemDrainCtx, procSpan := tracer.Start(itemDrainCtx, "worker.process_notification", trace.WithAttributes(baseAttrs...))
+	startOpts := []trace.SpanStartOption{trace.WithAttributes(baseAttrs...)}
+	if meta.TraceLink {
+		// Batch item: start a new trace per notification and link it to the batch request's span.
+		if parent := trace.SpanContextFromContext(itemDrainCtx); parent.IsValid() {
+			startOpts = append(startOpts, trace.WithNewRoot(), trace.WithLinks(trace.Link{SpanContext: parent}))
+		}
+	}
+	itemDrainCtx, procSpan := tracer.Start(itemDrainCtx, "worker.process_notification", startOpts...)
 	defer procSpan.End()
 
 	_, dqSpan := tracer.Start(itemDrainCtx, "dequeue", trace.WithAttributes(baseAttrs...))
@@ -856,6 +863,9 @@ func metaFromNotification(n *domain.Notification, fallback *queue.Meta) queue.Me
 	} else if fallback != nil {
 		meta.TraceParent = fallback.TraceParent
 	}
+	// Derived from the row, not only the fallback, so items rebuilt by the reconciler after Redis data
+	// loss keep linking instead of growing the batch request's trace.
+	meta.TraceLink = n.BatchID != nil || (fallback != nil && fallback.TraceLink)
 	return meta
 }
 

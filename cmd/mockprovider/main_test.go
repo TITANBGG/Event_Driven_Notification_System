@@ -264,3 +264,42 @@ func TestMockProviderRingBufferEvictionOrder(t *testing.T) {
 		assert.Equal(t, expected[2:], stats.Timestamps)
 	})
 }
+
+// POST /config must change the fault profile at runtime without wiping /stats: chaos tests switch the
+// provider between healthy, slow and failing while the duplicate cross-check reads the same counters.
+func TestMockProviderRuntimeConfigKeepsStats(t *testing.T) {
+	t.Parallel()
+	ms := newMockServer(mockConfig{Seed: 1}, observability.NewLogger("error", io.Discard), nil)
+	ts := httptest.NewServer(ms.routes())
+	defer ts.Close()
+
+	post := func(path, body string, headers map[string]string) int {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, ts.URL+path, bytes.NewBufferString(body))
+		require.NoError(t, err)
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := ts.Client().Do(req)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		return resp.StatusCode
+	}
+	send := func() int {
+		return post("/", validSMSPayload, map[string]string{"Idempotency-Key": "key-1"})
+	}
+
+	assert.Equal(t, http.StatusAccepted, send())
+	assert.Equal(t, http.StatusOK, post("/config", `{"failureRate":1}`, nil))
+	assert.Equal(t, http.StatusInternalServerError, send(), "new fault profile applies immediately")
+	assert.Equal(t, http.StatusOK, post("/config", `{"failureRate":0,"rate429":1}`, nil))
+	assert.Equal(t, http.StatusTooManyRequests, send())
+
+	ms.mu.Lock()
+	assert.Equal(t, 3, ms.byKey["key-1"], "stats survive config changes")
+	ms.mu.Unlock()
+
+	for _, bad := range []string{`{"failureRate":1.5}`, `{"latencyMs":-1}`, `{"latencyMs":60001}`, `{"unknown":1}`, `not json`} {
+		assert.Equal(t, http.StatusBadRequest, post("/config", bad, nil), bad)
+	}
+}

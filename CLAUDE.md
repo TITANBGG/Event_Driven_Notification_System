@@ -129,7 +129,7 @@ A single multi-stage `Dockerfile` builds all binaries (`CGO_ENABLED=0`, `-trimpa
   - `api` (port `8080`; owns `build:` for `notification-system:local`)
   - `worker-1` and `worker-2` (identical template via YAML anchor `x-worker: &worker` + shared env anchor, distinct `WORKER_ID`; proves the distributed rate limiter across replicas)
   - `mockprovider` (port `8090`)
-  - `jaeger` all-in-one (`16686` UI, `4318` OTLP HTTP)
+  - `jaeger` all-in-one (`16686` UI, `4318` OTLP HTTP; `MEMORY_MAX_TRACES` + `mem_limit` so in-memory traces cannot exhaust the host)
   - `prometheus` (`9090`)
   - `swagger-ui` (`8081`, `./api` mounted as `/spec`)
 
@@ -683,7 +683,7 @@ X-Correlation-ID: 7d3c...
 - **Load Generator:** Custom Go program `cmd/loadgen` (no `k6`).
 - **Database Tracing:** `github.com/exaring/otelpgx` on `pgxpool.Config`.
 - **Templates:** Small safe custom renderer (`regex` scan + `strings.Builder`, no `text/template`), soft delete (`deleted_at`), rendered at **create time** (Phase 9).
-- **Worker Tracing Relationship:** Worker span is a **CHILD** of the API request span for clean end-to-end demo visualization; OpenTelemetry span links are documented as the alternative for long-delayed retries (Phase 11).
+- **Worker Tracing Relationship:** For a single notification the worker span is a **CHILD** of the API request span (clean end-to-end demo). For **batch items** the worker starts a **new trace linked** to the batch request span (`queue.Meta.TraceLink`, also derived from `batch_id` when the reconciler rebuilds metadata) — decided 2026-11-21 after measuring one 1,000-item batch trace at 28,013 spans (~145 MB in Jaeger), which made long load tests exhaust Docker Desktop's memory. Jaeger runs with `MEMORY_MAX_TRACES=20000` and `mem_limit: 1536m`.
 - **Learning Notes:** `.notes/NOTES.md` in Turkish, `.gitignore`d, **never** committed or pushed to GitHub.
 
 ---
