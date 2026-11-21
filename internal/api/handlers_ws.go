@@ -111,17 +111,24 @@ func (h *handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			_ = conn.Close(websocket.StatusNormalClosure, "connection closed")
 			return
 
-		case <-client.Dropped():
-			_ = conn.Close(websocket.StatusPolicyViolation, "slow client: send buffer full")
+		case <-client.Closed():
+			// Closed fires for every removal; Dropped tells a backpressure drop (1008) from a normal one.
+			// A client whose TCP window is full cannot receive any close frame: such a client is cut by
+			// the write timeout instead and sees 1006.
+			select {
+			case <-client.Dropped():
+				_ = conn.Close(websocket.StatusPolicyViolation, "slow client: not reading")
+			default:
+				_ = conn.Close(websocket.StatusNormalClosure, "hub closed subscription")
+			}
 			return
 
-		case ev, ok := <-client.Events():
-			if !ok {
-				_ = conn.Close(websocket.StatusNormalClosure, "hub closed subscription")
-				return
-			}
-			if writeErr := writeWSJSON(connCtx, conn, ev); writeErr != nil {
-				return
+		case <-client.Ready():
+			for _, frame := range client.Drain() {
+				if writeErr := writeWSFrame(connCtx, conn, frame); writeErr != nil {
+					return
+				}
+				client.MarkProgress()
 			}
 
 		case <-pingTicker.C:
@@ -236,9 +243,14 @@ func writeWSJSON(ctx context.Context, conn *websocket.Conn, payload any) error {
 	if err != nil {
 		return err
 	}
+	return writeWSFrame(ctx, conn, raw)
+}
+
+// writeWSFrame writes one pre-encoded JSON frame; live events arrive already encoded by the Hub.
+func writeWSFrame(ctx context.Context, conn *websocket.Conn, frame []byte) error {
 	writeCtx, cancel := context.WithTimeout(ctx, wsWriteTimeout)
 	defer cancel()
-	return conn.Write(writeCtx, websocket.MessageText, raw)
+	return conn.Write(writeCtx, websocket.MessageText, frame)
 }
 
 func buildWSOriginPatterns(origins []string, reqHost string) []string {

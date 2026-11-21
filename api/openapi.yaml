@@ -702,7 +702,10 @@ paths:
         At least one filter query parameter (`notificationId`, `batchId`, or `channel`) is required; multiple filters are AND-combined.
         On connect, the server subscribes to the Hub first, then sends a `WSSnapshotMessage` (`{"type":"snapshot",...}`) for `notificationId` or `batchId`,
         and finally streams live `RealtimeStatusEvent` JSON frames from Redis pub/sub (`notif:events`).
-        Slow clients whose 64-message send buffer fills up are disconnected with WebSocket close code `1008` (Policy Violation).
+        Each client has its own queue that absorbs bursts (one 1,000-item batch publishes 1,000 events at once). A client is
+        disconnected as slow when more than 1,024 frames are queued and it has delivered none for 5 seconds, or when more
+        than 8,192 are queued. It receives close code `1008` (Policy Violation) when the close frame can still be delivered;
+        a client that has stopped reading entirely (full TCP window) is cut by the 5-second write timeout and sees `1006`.
       parameters:
         - name: notificationId
           in: query

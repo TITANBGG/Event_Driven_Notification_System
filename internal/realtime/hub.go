@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -19,13 +20,19 @@ import (
 )
 
 const (
-	// ClientSendBufferSize is the per-client outbound event channel capacity.
-	// Clients whose buffer fills up are disconnected with WebSocket close code 1008 (Policy Violation)
-	// so a slow consumer never blocks the Hub or other subscribers.
-	ClientSendBufferSize = 64
-
 	// DefaultMaxClients is the default cap on concurrent WebSocket connections per API replica.
 	DefaultMaxClients = 1000
+
+	// DefaultQueueSoftLimit is the queue length above which a client that has not written a frame for
+	// DefaultSlowClientAfter is dropped as slow. A fixed-size buffer cannot tell a burst from a stalled
+	// reader: one 1,000-item batch publishes 1,000 "pending" events at once, and a 64- or even
+	// 1024-slot buffer dropped clients that were reading as fast as the server could write.
+	DefaultQueueSoftLimit = 1024
+	// DefaultQueueHardLimit drops a client regardless of progress. Queues grow on demand, so idle
+	// clients hold no memory; this bounds a progressing client to ~2 MB of queued frames.
+	DefaultQueueHardLimit = 8192
+	// DefaultSlowClientAfter is how long a client above the soft limit may go without delivering a frame.
+	DefaultSlowClientAfter = 5 * time.Second
 )
 
 // ErrTooManyClients is returned by Hub.Subscribe when MAX_WS_CLIENTS is reached.
@@ -144,28 +151,94 @@ func (p *RedisPublisher) Publish(ctx context.Context, events ...Event) error {
 	return nil
 }
 
-// Client represents a single subscribed WebSocket consumer managed by Hub.
+// Client represents a single subscribed WebSocket consumer managed by Hub. The Hub appends
+// pre-encoded JSON frames to the client's queue; the connection's writer drains them.
 type Client struct {
-	filter   Filter
-	sendCh   chan Event
-	slowCh   chan struct{}
-	slowOnce sync.Once
+	filter Filter
+
+	mu     sync.Mutex
+	queue  [][]byte
+	closed bool
+
+	readyCh      chan struct{} // capacity 1: "frames are waiting"
+	slowCh       chan struct{} // closed when the Hub drops the client for backpressure
+	closedCh     chan struct{} // closed when the client is removed for any reason
+	lastProgress atomic.Int64  // unix nanos of the last frame the writer delivered (or of subscribe)
 }
 
-// Events returns the read-only channel of filtered events for this client.
-func (c *Client) Events() <-chan Event {
-	return c.sendCh
+// Ready signals that frames are waiting; call Drain to take them.
+func (c *Client) Ready() <-chan struct{} { return c.readyCh }
+
+// Drain takes every queued frame (oldest first). Each frame is one complete JSON event.
+func (c *Client) Drain() [][]byte {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	frames := c.queue
+	c.queue = nil
+	return frames
 }
 
-// Dropped returns a channel that is closed if the Hub drops this client due to a full send buffer (backpressure).
-func (c *Client) Dropped() <-chan struct{} {
-	return c.slowCh
+// MarkProgress records that the writer delivered a frame. A client that keeps making progress is never
+// dropped for a burst below the hard queue limit, however large the burst.
+func (c *Client) MarkProgress() { c.lastProgress.Store(time.Now().UnixNano()) }
+
+// Dropped returns a channel that is closed if the Hub drops this client for backpressure.
+func (c *Client) Dropped() <-chan struct{} { return c.slowCh }
+
+// Closed returns a channel that is closed when the client is removed (unsubscribe, drop or Hub stop).
+func (c *Client) Closed() <-chan struct{} { return c.closedCh }
+
+// QueueLen reports how many frames are waiting (tests and diagnostics).
+func (c *Client) QueueLen() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.queue)
 }
 
-func (c *Client) markSlow() {
-	c.slowOnce.Do(func() {
+type enqueueResult int
+
+const (
+	enqueued enqueueResult = iota
+	droppedSlow
+	alreadyClosed
+)
+
+// enqueue is called only from the Hub loop and never blocks.
+func (c *Client) enqueue(frame []byte, now time.Time, softLimit, hardLimit int, slowAfter time.Duration) enqueueResult {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return alreadyClosed
+	}
+	n := len(c.queue)
+	stalled := now.Sub(time.Unix(0, c.lastProgress.Load())) > slowAfter
+	if n >= hardLimit || (n >= softLimit && stalled) {
+		c.mu.Unlock()
+		return droppedSlow
+	}
+	c.queue = append(c.queue, frame)
+	c.mu.Unlock()
+	select {
+	case c.readyCh <- struct{}{}:
+	default: // a wake-up is already pending
+	}
+	return enqueued
+}
+
+// close marks the client removed; slow additionally signals Dropped. Called only from the Hub loop.
+func (c *Client) close(slow bool) {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.queue = nil
+	c.mu.Unlock()
+	if slow {
 		close(c.slowCh)
-	})
+	}
+	close(c.closedCh)
 }
 
 type registerReq struct {
@@ -178,12 +251,14 @@ type registerResp struct {
 	err    error
 }
 
-// HubConfig configures a Hub instance.
+// HubConfig configures a Hub instance. Zero values select the Default* constants.
 type HubConfig struct {
-	Redis      redis.UniversalClient
-	Logger     *slog.Logger
-	MaxClients int
-	BufferSize int
+	Redis           redis.UniversalClient
+	Logger          *slog.Logger
+	MaxClients      int
+	QueueSoftLimit  int
+	QueueHardLimit  int
+	SlowClientAfter time.Duration
 }
 
 // Hub subscribes ONCE per API process to Redis pub/sub `notif:events` and fans out matching
@@ -192,11 +267,13 @@ type Hub struct {
 	rdb        redis.UniversalClient
 	logger     *slog.Logger
 	maxClients int
-	bufferSize int
+	softLimit  int
+	hardLimit  int
+	slowAfter  time.Duration
 
 	regCh       chan registerReq
 	unregCh     chan *Client
-	broadcastCh chan Event
+	broadcastCh chan encodedEvent
 	countCh     chan chan int
 	doneCh      chan struct{}
 }
@@ -211,18 +288,28 @@ func NewHub(cfg HubConfig) *Hub {
 	if maxClients <= 0 {
 		maxClients = DefaultMaxClients
 	}
-	bufSize := cfg.BufferSize
-	if bufSize <= 0 {
-		bufSize = ClientSendBufferSize
+	soft := cfg.QueueSoftLimit
+	if soft <= 0 {
+		soft = DefaultQueueSoftLimit
+	}
+	hard := cfg.QueueHardLimit
+	if hard <= 0 {
+		hard = DefaultQueueHardLimit
+	}
+	slowAfter := cfg.SlowClientAfter
+	if slowAfter <= 0 {
+		slowAfter = DefaultSlowClientAfter
 	}
 	return &Hub{
 		rdb:         cfg.Redis,
 		logger:      logger,
 		maxClients:  maxClients,
-		bufferSize:  bufSize,
+		softLimit:   soft,
+		hardLimit:   hard,
+		slowAfter:   slowAfter,
 		regCh:       make(chan registerReq),
 		unregCh:     make(chan *Client),
-		broadcastCh: make(chan Event, 256),
+		broadcastCh: make(chan encodedEvent, 2048),
 		countCh:     make(chan chan int),
 		doneCh:      make(chan struct{}),
 	}
@@ -256,11 +343,16 @@ func (h *Hub) Run(ctx context.Context) error {
 						h.logger.Warn("ignoring malformed pub/sub event", slog.String("error", err.Error()))
 						continue
 					}
+					// The payload already is the client frame; re-encode only to fill a missing type.
+					frame := []byte(msg.Payload)
 					if ev.Type == "" {
-						ev.Type = "event"
+						var encErr error
+						if frame, encErr = encodeEvent(&ev); encErr != nil {
+							continue
+						}
 					}
 					select {
-					case h.broadcastCh <- ev:
+					case h.broadcastCh <- encodedEvent{ev: ev, frame: frame}:
 					case <-ctx.Done():
 						return
 					}
@@ -270,10 +362,10 @@ func (h *Hub) Run(ctx context.Context) error {
 	}
 
 	clients := make(map[*Client]struct{})
-	removeClient := func(c *Client) {
+	removeClient := func(c *Client, slow bool) {
 		if _, exists := clients[c]; exists {
 			delete(clients, c)
-			close(c.sendCh)
+			c.close(slow)
 		}
 	}
 
@@ -281,7 +373,7 @@ func (h *Hub) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			for c := range clients {
-				removeClient(c)
+				removeClient(c, false)
 			}
 			subWg.Wait()
 			return nil
@@ -292,27 +384,27 @@ func (h *Hub) Run(ctx context.Context) error {
 				continue
 			}
 			c := &Client{
-				filter: req.filter,
-				sendCh: make(chan Event, h.bufferSize),
-				slowCh: make(chan struct{}),
+				filter:   req.filter,
+				readyCh:  make(chan struct{}, 1),
+				slowCh:   make(chan struct{}),
+				closedCh: make(chan struct{}),
 			}
+			c.MarkProgress()
 			clients[c] = struct{}{}
 			req.reply <- registerResp{client: c}
 
 		case c := <-h.unregCh:
-			removeClient(c)
+			removeClient(c, false)
 
-		case ev := <-h.broadcastCh:
+		case item := <-h.broadcastCh:
+			now := time.Now()
 			for c := range clients {
-				if !c.filter.Matches(ev) {
+				if !c.filter.Matches(item.ev) {
 					continue
 				}
-				select {
-				case c.sendCh <- ev:
-				default:
-					// Slow client backpressure: drop and disconnect with 1008 instead of blocking the hub.
-					c.markSlow()
-					removeClient(c)
+				// Every matching client shares the same encoded frame; the Hub never blocks on a client.
+				if c.enqueue(item.frame, now, h.softLimit, h.hardLimit, h.slowAfter) == droppedSlow {
+					removeClient(c, true)
 				}
 			}
 
@@ -358,17 +450,35 @@ func (h *Hub) Subscribe(ctx context.Context, filter Filter) (*Client, func(), er
 
 // Broadcast injects an event directly into the Hub (used by unit tests and in-process fan-out).
 func (h *Hub) Broadcast(ctx context.Context, ev Event) error {
-	if ev.Type == "" {
-		ev.Type = "event"
+	frame, err := encodeEvent(&ev)
+	if err != nil {
+		return err
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-h.doneCh:
 		return errors.New("realtime hub is stopped")
-	case h.broadcastCh <- ev:
+	case h.broadcastCh <- encodedEvent{ev: ev, frame: frame}:
 		return nil
 	}
+}
+
+// encodedEvent pairs an event (used for filtering) with its JSON frame (sent unchanged to every match).
+type encodedEvent struct {
+	ev    Event
+	frame []byte
+}
+
+func encodeEvent(ev *Event) ([]byte, error) {
+	if ev.Type == "" {
+		ev.Type = "event"
+	}
+	frame, err := json.Marshal(ev)
+	if err != nil {
+		return nil, fmt.Errorf("encoding realtime event: %w", err)
+	}
+	return frame, nil
 }
 
 // ClientCount returns the current number of active subscribed clients.

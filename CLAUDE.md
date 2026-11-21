@@ -680,7 +680,8 @@ X-Correlation-ID: 7d3c...
 - **Status & Channel Columns:** PostgreSQL `text` + `CHECK` constraints (not PostgreSQL `ENUM`) — adding a channel like `whatsapp` later is a clean migration without `ALTER TYPE ... ADD VALUE` transaction caveats.
 - **`updated_at` Maintenance:** Maintained automatically by a PostgreSQL trigger `set_updated_at()` (invariant holds even for manual SQL); application code still never relies on the client clock for state ordering.
 - **Redis Unit vs. Integration Tests:** Unit tests use `alicebob/miniredis/v2` (supports Lua); integration tests use real `redis:7-alpine` via `testcontainers-go`.
-- **Load Generator:** Custom Go program `cmd/loadgen` (no `k6`).
+- **Load Generator:** Custom Go program `cmd/loadgen` (no `k6`); `cmd/wsflood` drives the WebSocket flood and API boundary tests.
+- **WebSocket Backpressure:** per-client queue that grows on demand; a client is dropped when > 1,024 frames are queued and it delivered none for 5s, or when > 8,192 are queued; events are encoded once and shared by all clients (decided 2026-11-21: a fixed 64/1024-slot channel dropped fast readers on every 1,000-item batch burst).
 - **Database Tracing:** `github.com/exaring/otelpgx` on `pgxpool.Config`.
 - **Templates:** Small safe custom renderer (`regex` scan + `strings.Builder`, no `text/template`), soft delete (`deleted_at`), rendered at **create time** (Phase 9).
 - **Worker Tracing Relationship:** For a single notification the worker span is a **CHILD** of the API request span (clean end-to-end demo). For **batch items** the worker starts a **new trace linked** to the batch request span (`queue.Meta.TraceLink`, also derived from `batch_id` when the reconciler rebuilds metadata) — decided 2026-11-21 after measuring one 1,000-item batch trace at 28,013 spans (~145 MB in Jaeger), which made long load tests exhaust Docker Desktop's memory. Jaeger runs with `MEMORY_MAX_TRACES=20000` and `mem_limit: 1536m`.
