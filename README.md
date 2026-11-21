@@ -1210,6 +1210,7 @@ make drills             # live failure drills against the running stack (~5 min,
 make invariants         # check system invariants on the settled stack (no stuck rows, no cancelled or double sends, Redis matches PostgreSQL);
                         # covers the full history, so pass --since=<RFC3339> to ignore duplicates from an earlier crash drill
 make prom-snapshot      # one-line resource snapshot: goroutines, heap, FDs, queue depths, DB pool, Redis memory
+make ws-test            # 39 API boundary cases + WebSocket capacity, fast/slow consumers and batch watchers (~5 min)
 make shutdown-test      # SIGTERM workers and API under load: drain, no abandoned attempts, no duplicates (~4 min)
 make chaos              # sustained load + worker kills, Redis restart/FLUSHALL, PostgreSQL stop, slow/failing provider (~15 min)
 make races              # concurrent cancel, batch cancel, idempotency and manual retry storms (~2 min)
@@ -1242,8 +1243,9 @@ Every test package runs `go.uber.org/goleak` in `TestMain`, so a test that leave
 | `o_worker_crash_mid_batch_recovered_by_reconciler_with_bounded_duplicates` | Exact state of a SIGKILLed worker (10 items in its inflight list + claimed, 5 already accepted by the provider, heartbeat gone): reconciler (d) drains the orphan list, (c) reclaims 10 `abandoned` rows -> 30/30 sent; **duplicates = 5 = sends in flight at crash**, all with the same `Idempotency-Key` |
 | `p_idempotency_20_concurrent_posts_same_key_create_exactly_one_row` | 20 simultaneous POSTs with one key: all `202`, one id, exactly one non-replayed response, one DB row |
 | `q_manual_retry_failed_to_sent` | `failed` (DLQ) -> `POST /retry` resets attempts -> `sent`; retrying a `sent` row -> `409` |
+| `r_metrics_windows_and_percentiles_from_known_rows` | Rows with known `sent_at` / `failed_at` offsets and durations: exact 1m/5m/15m counts per channel and p50/p95/p99 (e.g. p95 = 8,600 ms from 1..9 s); non-counted and older attempts excluded |
 
-The full suite (17 scenarios) runs in ~25s locally and in the CI `integration` job.
+The full suite (18 scenarios) runs in ~30s locally and in the CI `integration` job.
 
 ### Coverage
 
@@ -1372,6 +1374,32 @@ Two earlier runs of the same test found infrastructure problems rather than deli
 | Overall | 47,000 accepted, 47,000 sent, **0 `abandoned` attempts, 0 duplicates**, invariants passed without `--allow-duplicates` |
 
 The script fails a stop during which no send completed, because such a stop says nothing about draining. Its first version built request bodies in a bash loop that was too slow to keep the workers busy, and its first stop passed with an idle worker.
+
+### WebSocket flood and boundary values
+
+`scripts/ws-boundaries.sh` (`make ws-test`) runs `cmd/wsflood`: 39 HTTP boundary cases (SMS segment limits, E.164, email and push limits, batch size and body limits, idempotency keys, `scheduledAt` window, WebSocket filters) and three WebSocket scenarios against the live stack, followed by `invariants.sh` and `ratecheck.sh`. Measured on 2026-11-21:
+
+| Scenario | Result |
+|---|---|
+| Capacity | 1,000 clients connect (`MAX_WS_CLIENTS`); 10 more get `503 too_many_ws_clients`; 200 closed slots are reused by 200 new clients |
+| Fast and slow consumers | 400 clients reading on `channel=sms` and 50 that never read, while 4 × 1,000 SMS are delivered: all 400 readers received every one of the 4,000 events and none was dropped, in 3 of 3 runs; all 50 non-readers were disconnected; `/health/ready` stayed under 260ms |
+| Batch watchers | 20 clients on `batchId`: 20/20 snapshots, 1,000/1,000 live events each |
+
+The fast/slow scenario first failed: 324 of the 400 readers were dropped. Each client had a fixed 64-slot channel, and the Hub dropped any client whose channel was full at the moment an event arrived. But creating a 1,000-item batch publishes 1,000 `pending` events at once, so a reader that kept up was indistinguishable from one that had stopped. Raising the buffer to 1,024 only moved the threshold: four batches in a row still dropped 37 of 100 readers. The Hub now keeps a per-client queue that grows on demand and drops a client only when more than 1,024 frames are waiting **and** it has delivered none for 5 seconds, or when more than 8,192 are waiting. Each event is JSON-encoded once and the same bytes go to every client (before, every client re-encoded every event). A client that has stopped reading entirely cannot receive a close frame through its full TCP window, so it is cut by the 5-second write timeout and sees `1006`; `1008` is sent when the frame can still be delivered.
+
+### Data growth: 2 million notifications
+
+A separate database was seeded with 2,000,000 notifications (1,000 batches of 1,000 plus 1,000,000 singles over 30 days; 95% sent, 3% failed, 1.9% cancelled, a few hundred pending and retrying) and 1.96 million delivery attempts (1.46 GB), with ~280,000 sends in the last 15 minutes, which is what a steady 300/s looks like. A second API instance pointed at it; 7 calls per endpoint, measured on 2026-11-21:
+
+| Endpoint | Median |
+|---|---|
+| List, first page / `status=failed` (3%) / `status=pending` (0.05%) | 4.3 / 6.0 / 5.1 ms |
+| List, `channel` + `priority` / one-day `from`–`to` range | 3.7 / 3.6 ms |
+| Notification by ID with attempts / batch of 1,000 with counts | 3.5 / 5.2 ms |
+| Keyset pagination, 100 pages × 200 rows | page 1: 10 ms, page 100: 12 ms (depth does not matter) |
+| `/api/v1/metrics`, uncached | **1.7 s before**, 0.33–0.53 s after the fix below |
+
+Every list query used its composite index, and 30 repeated calls showed no slowdown when PostgreSQL switches prepared statements to a generic plan. The metrics snapshot was the outlier: its window counts ran 27 correlated subqueries and its latency query 6 separate percentile scans, each over the last 15 minutes. With the 2s cache, every API replica would spend most of a CPU core on it. The rewrite reads each outcome once (the 1m and 5m windows are `FILTER`s of the 15m scan) and computes p50/p95/p99 with one `percentile_cont(ARRAY[...])` per source. Run side by side in one transaction on the same data, the old and new queries returned identical results, and the time dropped from 0.8–1.6 s to 127–144 ms (window counts) and from 1.5–1.7 s to 0.53–0.59 s (percentiles). The rest is sorting ~280k rows; at higher volume these numbers should come from Prometheus histograms instead (section 12). Integration scenario `r` pins both queries to hand-computed answers.
 
 ### CI/CD (GitHub Actions, `B-6`)
 
@@ -1502,7 +1530,7 @@ Every item from the assignment, where it is implemented, and how it is tested. "
 | **D-3** | One-command zero-config Docker Compose (`docker compose up` & `docker-compose up`) | `docker-compose.yml`, `Dockerfile`, `.env.example` | Live Docker Compose build + `scripts/smoke.sh` | **DONE** |
 | **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
 | **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
-| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (17 scenarios), `make cover`, 10k load test | **DONE** |
+| **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (18 scenarios), `make cover`, 10k load test | **DONE** |
 | **Context: burst traffic** | Flash sales / breaking news: absorb bursts without dropping or overrunning the provider | `POST /batch` (1000 items, one `CopyFrom`), Redis queues as buffer, per-channel GCRA limiter | Load test: 10,000 notifications accepted in 287ms (34,787/s), drained at ~95/s/channel with 0 failures; integration `c`, `g` | **DONE** |
 | **Context: intelligent retry** | Retry only what can succeed, back off, protect a failing provider | `internal/provider/client.go` (classification), `internal/worker/retry.go` (full jitter + `Retry-After`), `internal/worker/breaker.go` | `internal/worker/retry_test.go`, `internal/provider/client_test.go`, integration `e`, `n`, `q` | **DONE** |
 | **Context: visibility for internal teams** | Metrics, logs and traces for operators | Prometheus `/metrics` (API + workers), `slog` JSON with `correlation_id`/`trace_id`, OpenTelemetry → Jaeger | `internal/observability/*_test.go`, integration `m`, PromQL queries in section 8 run against Prometheus | **DONE** |

@@ -299,4 +299,65 @@ func runExtendedScenarios(t *testing.T, inf *testInfra) {
 		code, _ = doJSON(t, http.MethodPost, detailURL+"/retry", nil, nil, nil)
 		assert.Equal(t, http.StatusConflict, code, "only failed notifications can be retried")
 	})
+
+	// The metrics queries were rewritten for speed (one scan per outcome, array percentiles); this pins
+	// their results on rows with known timestamps so any later rewrite must keep the same answers.
+	t.Run("r_metrics_windows_and_percentiles_from_known_rows", func(t *testing.T) {
+		inf.resetState(t)
+		ctx := t.Context()
+		// sms sent at now-s, created k seconds earlier (end-to-end k s), provider call k*100 ms.
+		_, err := inf.pool.Exec(ctx, `
+			WITH n AS (
+			  INSERT INTO notifications (id, channel, priority, status, recipient, content, max_attempts, created_at, sent_at)
+			  SELECT gen_random_uuid(), 'sms', 'normal', 'sent', '+905550000000', 'metrics', 5,
+			         now() - make_interval(secs => v.s + v.k), now() - make_interval(secs => v.s)
+			  FROM (VALUES (30,1),(30,2),(180,3),(180,4),(180,5),(600,6),(600,7),(600,8),(600,9),(1200,10)) AS v(s, k)
+			  RETURNING id, created_at, sent_at
+			)
+			INSERT INTO delivery_attempts (notification_id, attempt_no, counted, started_at, duration_ms, outcome)
+			SELECT id, 1, true, sent_at, (EXTRACT(EPOCH FROM sent_at - created_at) * 100)::int, 'sent' FROM n`)
+		require.NoError(t, err)
+		_, err = inf.pool.Exec(ctx, `
+			INSERT INTO notifications (id, channel, priority, status, recipient, content, max_attempts, created_at, failed_at)
+			SELECT gen_random_uuid(), 'email', 'normal', 'failed', 'a@example.com', 'metrics', 5, now() - make_interval(secs => s), now() - make_interval(secs => s)
+			FROM (VALUES (30),(240),(240)) AS v(s)`)
+		require.NoError(t, err)
+		_, err = inf.pool.Exec(ctx, `
+			INSERT INTO notifications (id, channel, priority, status, recipient, content, max_attempts)
+			SELECT gen_random_uuid(), 'push', 'normal', 'retrying', 'token', 'metrics', 5 FROM generate_series(1, 2)`)
+		require.NoError(t, err)
+		// Must not move the provider percentiles: a non-counted attempt now and a counted one 20 minutes ago.
+		_, err = inf.pool.Exec(ctx, `
+			INSERT INTO delivery_attempts (notification_id, attempt_no, counted, started_at, duration_ms, outcome)
+			SELECT id, 2, c, now() - make_interval(secs => s), 99999, o
+			FROM (SELECT id FROM notifications WHERE channel = 'sms' LIMIT 1) n,
+			     (VALUES (false, 0, 'circuit_open'), (true, 1200, 'sent')) AS v(c, s, o)`)
+		require.NoError(t, err)
+
+		rows, err := inf.repo.MetricsWindowCounts(ctx)
+		require.NoError(t, err)
+		require.Len(t, rows, 9, "3 windows x 3 channels, all present even when zero")
+		got := map[string][3]int64{}
+		for _, r := range rows {
+			got[r.Window+"/"+string(r.Channel)] = [3]int64{r.SentCount, r.FailedCount, r.RetryingCount}
+		}
+		want := map[string][3]int64{
+			"1m/sms": {2, 0, 0}, "5m/sms": {5, 0, 0}, "15m/sms": {9, 0, 0},
+			"1m/email": {0, 1, 0}, "5m/email": {0, 3, 0}, "15m/email": {0, 3, 0},
+			"1m/push": {0, 0, 2}, "5m/push": {0, 0, 2}, "15m/push": {0, 0, 2},
+		}
+		assert.Equal(t, want, got)
+		assert.Equal(t, "1m", rows[0].Window, "windows stay in chronological order")
+		assert.Equal(t, "15m", rows[8].Window)
+
+		lat, err := inf.repo.LatencyPercentiles(ctx)
+		require.NoError(t, err)
+		// 9 values 1000..9000 ms: p50 = 5000, p95 = 8000 + 0.6*1000, p99 = 8000 + 0.92*1000 (linear interpolation).
+		assert.InDelta(t, 5000, lat.EndToEndP50MS, 1)
+		assert.InDelta(t, 8600, lat.EndToEndP95MS, 1)
+		assert.InDelta(t, 8920, lat.EndToEndP99MS, 1)
+		assert.InDelta(t, 500, lat.ProviderP50MS, 0.01)
+		assert.InDelta(t, 860, lat.ProviderP95MS, 0.01)
+		assert.InDelta(t, 892, lat.ProviderP99MS, 0.01)
+	})
 }
