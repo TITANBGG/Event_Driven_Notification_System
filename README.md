@@ -1284,7 +1284,15 @@ The effective rate is ~5% below the configured 100/s because a denied worker sle
 | `openapi-lint` | `@redocly/cli` (pinned) lints `api/openapi.yaml` using `redocly.yaml` |
 | `docker` | Builds the image with `docker/build-push-action` (no push, GHA layer cache) and validates `docker compose config` without any `.env` |
 
-`.github/workflows/release.yml` is the CD part: pushing a tag such as `v1.0.0` builds `linux/amd64` + `linux/arm64` images and pushes them to `ghcr.io/titanbgg/notification-system` (`{{version}}`, `{{major}}.{{minor}}`, `sha-<short>` tags) using `GITHUB_TOKEN`, with `packages: write` granted only to that job.
+`.github/workflows/release.yml` is the CD part: pushing a tag such as `v1.0.0` builds `linux/amd64` + `linux/arm64` images and pushes them to `ghcr.io/titanbgg/notification-system` (`{{version}}`, `{{major}}.{{minor}}`, `sha-<short>` tags) using `GITHUB_TOKEN`, with `packages: write` granted only to that job. A second job then creates the GitHub Release, using the matching [`CHANGELOG.md`](CHANGELOG.md) section as the release notes (`scripts/release-notes.sh`). A tag without a changelog section fails that job. That job is the only one granted `contents: write`.
+
+To run the released image instead of building locally, retag it to the name Compose expects:
+
+```bash
+docker pull ghcr.io/titanbgg/notification-system:1.0.0
+docker tag ghcr.io/titanbgg/notification-system:1.0.0 notification-system:local
+docker compose up --no-build
+```
 
 Actions are pinned to **major versions** (`actions/checkout@v7`): they receive security/bug fixes automatically while breaking changes require a deliberate bump. Pinning to full commit SHAs is the stricter supply-chain alternative (immutable, typically paired with Dependabot/Renovate to keep them current). Tool versions (`golangci-lint`, `sqlc`, `migrate`, Redocly) are pinned exactly in the workflow `env:` block so CI results are reproducible.
 

@@ -1,5 +1,6 @@
 # Continuous delivery: pushing a semver tag (v1.2.3) builds the multi-binary image and publishes it to
-# GitHub Container Registry as ghcr.io/<owner>/notification-system.
+# GitHub Container Registry as ghcr.io/<owner>/notification-system, then creates a GitHub Release whose
+# body is the matching CHANGELOG.md section.
 name: Release
 
 on:
@@ -61,3 +62,25 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  github-release:
+    name: Create GitHub Release from CHANGELOG.md
+    # Publish the release only after the image it announces exists in GHCR.
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Extract release notes for this tag
+        run: bash scripts/release-notes.sh "$GITHUB_REF_NAME" > release-notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # --verify-tag refuses to create a tag implicitly; pre-release tags (v1.1.0-rc.1) are marked as such.
+        run: |
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md "${prerelease[@]}"
