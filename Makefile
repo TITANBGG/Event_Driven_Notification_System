@@ -4,7 +4,7 @@ COMPOSE := $(shell docker compose version >/dev/null 2>&1 && echo "docker compos
 GOTESTFLAGS ?=
 DATABASE_URL ?= postgres://notif:notif@localhost:5432/notif?sslmode=disable
 
-.PHONY: up down logs build test test-integration test-all test-docker verify cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot ratecheck races chaos shutdown-test rolling-test isolation priority provider-timeout stress soak ws-test fuzz
+.PHONY: up down logs build test test-integration test-all test-docker verify diagrams cover cover-all lint fmt migrate-up migrate-down sqlc smoke drills load run-api run-worker invariants prom-snapshot ratecheck races chaos shutdown-test rolling-test isolation priority provider-timeout stress soak ws-test fuzz
 
 up:
 	$(COMPOSE) up --build -d
@@ -38,6 +38,10 @@ test-docker:
 # One-command health check: lint, unit, integration, then the live stack (up, smoke, invariants).
 verify:
 	./scripts/verify.sh
+
+# Render every README Mermaid diagram with mermaid-cli (fails on a diagram GitHub could not render).
+diagrams:
+	./scripts/check-diagrams.sh
 
 # Unit-test coverage (no Docker): coverage.html + per-package table.
 cover:

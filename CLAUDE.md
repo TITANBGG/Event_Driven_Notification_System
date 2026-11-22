@@ -1,11 +1,12 @@
 # CLAUDE.md — Event-Driven Notification System
 
-## Engineering Role & Context
+## Purpose
 
-You are acting as a **Senior Go Engineer, Senior Software Architect, and AI/Engineering Mentor** for the **Insider One Software Engineer Assessment 2026** take-home assignment.
+The engineering specification for this service, written before the code and kept in sync with it.
+Every design decision here must be production-grade, verifiable and defensible in review: clarity,
+observability and explicit failure handling matter as much as throughput and correctness. Section 10
+records decisions that were measured and settled; the README explains the reasoning for readers.
 
-- **Primary Engineer Context:** AI/ML engineer (strong in Python, FastAPI, Docker) writing production Go (`1.2x`) for the first time.
-- **Core Mandate:** Every design decision and line of code must be **production-grade, verifiable, and interview-defensible**—clarity, observability, and explicit failure handling matter as much as throughput and correctness.
 - **Module Path:** `github.com/TITANBGG/notification-system`
 
 ---
@@ -160,7 +161,6 @@ db/queries/         # sqlc queries; sqlc.yaml at repo root
 api/openapi.yaml    # OpenAPI 3.0.3 spec (kept in sync every phase)
 deploy/             # prometheus.yml
 scripts/            # smoke.sh (curl examples for every endpoint)
-.notes/NOTES.md     # Turkish learning notes — in .gitignore, NEVER part of repo
 ```
 
 ### Pre-Approved Libraries
@@ -686,33 +686,19 @@ X-Correlation-ID: 7d3c...
 - **Database Tracing:** `github.com/exaring/otelpgx` on `pgxpool.Config`.
 - **Templates:** Small safe custom renderer (`regex` scan + `strings.Builder`, no `text/template`), soft delete (`deleted_at`), rendered at **create time** (Phase 9).
 - **Worker Tracing Relationship:** For a single notification the worker span is a **CHILD** of the API request span (clean end-to-end demo). For **batch items** the worker starts a **new trace linked** to the batch request span (`queue.Meta.TraceLink`, also derived from `batch_id` when the reconciler rebuilds metadata) — decided 2026-11-21 after measuring one 1,000-item batch trace at 28,013 spans (~145 MB in Jaeger), which made long load tests exhaust Docker Desktop's memory. Jaeger runs with `MEMORY_MAX_TRACES=20000` and `mem_limit: 1536m`.
-- **Learning Notes:** `.notes/NOTES.md` in Turkish, `.gitignore`d, **never** committed or pushed to GitHub.
 
 ---
 
-## 11. Workflow Rules
+## 11. Development Workflow
 
-1. **Scope Discipline:** Work **ONLY** on the active phase requested. Do not jump ahead.
-2. **Pre-Code Plan:** Before writing code in a phase, present a short plan (files to create/change, key decisions) in max 15 lines, then implement without waiting unless something is ambiguous.
-3. **Mandatory Verification:** After coding, **ALWAYS** run:
-   - `gofmt -l .`
-   - `go vet ./...`
-   - `go test -race ./...`
-   - (`golangci-lint run` if installed; integration tests when the phase specifies).
-   - Always show actual command output; never claim `"should work"` without running it.
-4. **API & Smoke Sync:** Every phase that adds or changes an HTTP endpoint must update `api/openapi.yaml` and `scripts/smoke.sh` in the **same** phase.
-5. **Requirement Traceability:** At the end of each phase, list which requirement IDs (`FR-*`, `EXT-1`, `B-*`, `D-*`) were covered and how they were tested.
-6. **Turkish Learning Notes:** Append a section to `.notes/NOTES.md` **IN TURKISH** at the end of each implementation phase (starting Phase 1) containing:
-   - `"Bu fazda ne yaptık"` (short summary)
-   - `"Kullanılan Go kavramları"` with tiny code snippets from our codebase
-   - `"Tasarım kararları ve alternatifleri"` (why X and not Y)
-   - `"Mülakatta sorulabilecek 5 soru ve kısa cevapları"`
-   - `"Kendin dene"` (1–2 small modification exercises)
-7. **Commit Governance:** At the end of each phase, propose 2–5 small **Conventional Commits** (`feat:`, `fix:`, `test:`, `docs:`, `chore:`, `ci:`, `refactor:`) with exact `git` commands. **Do NOT commit until the user explicitly types `"commit"`.** Never commit `.env`, `.notes/`, or secrets.
-8. **Stop-and-Ask Triggers:** Stop and ask the user instead of guessing when:
-   - a requirement is ambiguous;
-   - a change would deviate from `CLAUDE.md`;
-   - a dependency cannot be installed;
-   - a test still fails after 2 fix attempts;
-   - an issue would blow past the phase budget.
-9. **Language Split:** Explanations, discussions, and `.notes/NOTES.md` are written in **Turkish**; all code, comments, commit messages, OpenAPI specs, and `README.md` are written in **English**.
+1. **Verify every change:** `gofmt -l .`, `go vet ./...` (and `-tags=integration`), `golangci-lint run`,
+   `go test -race ./...`, and the integration suite when behavior across PostgreSQL/Redis changes.
+   With only Docker, `./scripts/verify.sh` runs all of it plus a live smoke test. Report actual output;
+   never claim something works without running it.
+2. **API & smoke sync:** any change to an HTTP endpoint updates `api/openapi.yaml` and `scripts/smoke.sh`
+   in the same change (`TestOpenAPISpecMatchesRouter` and Redocly enforce the spec).
+3. **Requirement traceability:** every change states which requirement IDs (`FR-*`, `EXT-1`, `B-*`,
+   `D-*`) it covers and how it was tested; README section 13 is the map.
+4. **Commits:** small Conventional Commits (`feat:`, `fix:`, `test:`, `docs:`, `chore:`, `ci:`,
+   `refactor:`, `perf:`). Never commit `.env` or secrets.
+5. **Language:** code, comments, commit messages, OpenAPI and `README.md` are written in English.

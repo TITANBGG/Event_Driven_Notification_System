@@ -2,8 +2,8 @@
 # One-command check that the project builds, passes its tests and works end to end, needing only
 # Docker. Every step runs even if an earlier one fails, and a PASS/FAIL table is printed at the end.
 #
-#   ./scripts/verify.sh              lint, unit, integration, then the live stack: up, smoke, invariants
-#   ./scripts/verify.sh --no-stack   only the Go checks (no docker compose stack)
+#   ./scripts/verify.sh              lint, README diagrams, unit, integration, then the live stack: up, smoke, invariants
+#   ./scripts/verify.sh --no-stack   only the checks that need no Compose stack
 #
 # The live part starts (or reuses) the Compose stack with `docker compose up -d --build --wait` and
 # leaves it running. Takes ~10 minutes on the first run (image builds, module downloads), ~5 after.
@@ -58,6 +58,7 @@ step() {
 stack_up() { "${COMPOSE_CMD[@]}" up -d --build --wait; }
 
 step "lint (Go + shellcheck)" ./scripts/test-docker.sh lint
+step "README diagrams render" ./scripts/check-diagrams.sh
 step "unit tests (-race)" ./scripts/test-docker.sh unit
 step "integration tests" ./scripts/test-docker.sh integration
 if ((STACK)); then

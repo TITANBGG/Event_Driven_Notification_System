@@ -8,6 +8,25 @@ A notification service that accepts SMS, email and push requests over HTTP, stor
 
 It was written in Go 1.27.4 for the Insider One Software Engineer Assessment 2026. Every functional requirement (`FR-1`…`FR-4`), the provider contract (`EXT-1`), all deliverables (`D-1`…`D-6`) and all six bonus features (`B-1`…`B-6`) are implemented and tested. Section 13, the [requirement checklist](#13-requirement-checklist), maps each one to its code and tests.
 
+## At a glance
+
+**Run and check it** (only Docker needed):
+
+```bash
+docker compose up                # API :8080, Swagger UI :8081, live demo :8080/demo, Jaeger :16686
+./scripts/verify.sh              # lint, unit + integration tests, then a smoke test of every endpoint
+```
+
+**Key design decisions** (the reasoning is in [section 4](#4-design-decisions)):
+
+- **PostgreSQL is the source of truth; Redis only holds hints.** Every notification is committed before it is queued. A reconciler rebuilds anything Redis loses, so a Redis failure delays notifications but loses none.
+- **Each state change is one conditional `UPDATE`.** A cancel racing a worker has exactly one winner, and a stale worker cannot overwrite a newer outcome (fenced on `attempts`).
+- **100 messages/s per channel across all replicas**, enforced by a GCRA limiter in Redis and taken right before each provider call.
+- **Retries with exponential backoff and full jitter** honor `Retry-After`. A circuit breaker per channel stops calls to a failing provider without using up attempts, and failures land in a dead-letter queue with manual replay.
+- **Delivery is at-least-once, and the README says so.** Each attempt sends `Idempotency-Key: <notification id>`; [section 5](#5-failure-scenarios) lists the remaining duplicate risks.
+
+**Tested beyond unit tests** ([summary](#test-program-summary)): a 100,000-notification flash sale, a chaos run of 84,000 notifications while workers were killed, Redis was flushed and PostgreSQL was stopped (0 lost), a 64 MB Redis filled past its limit, and a 60-minute soak (898,120 sent, no resource growth). This program found and fixed 12 bugs.
+
 ## Contents
 
 1. [Quick start](#1-quick-start)
@@ -112,15 +131,15 @@ sequenceDiagram
     participant W as Worker
     participant P as Provider
     C->>A: POST /api/v1/notifications (Idempotency-Key)
-    A->>DB: BEGIN; INSERT idempotency_keys + notifications (status=pending); COMMIT
+    A->>DB: one transaction: INSERT idempotency_keys + notifications (status=pending)
     A->>R: enqueue.lua (HSET {notif}:msg, LPUSH {notif}:q:sms:high)
     A-->>C: 202 Accepted {id, status: pending}
     W->>R: dequeue.lua (RPOP queue + LPUSH {notif}:inflight:worker-1)
-    W->>R: GCRA rate limiter (wait for a token on {notif}:rl:sms)
     W->>DB: Claim: UPDATE ... SET status=processing, attempts=attempts+1 WHERE status IN (...)
+    W->>R: GCRA rate limiter: wait for a token on {notif}:rl:sms, right before the send
     W->>P: POST {to, channel, content} + Idempotency-Key: <id>
     P-->>W: 202 {messageId, status: accepted}
-    W->>DB: INSERT delivery_attempts; UPDATE status=sent WHERE status=processing AND attempts=$claimed
+    W->>DB: INSERT delivery_attempts, then UPDATE status=sent WHERE status=processing AND attempts=$claimed
     W->>R: ack.lua (LREM inflight, HDEL msg) + PUBLISH notif:events
     R-->>A: notif:events
     A-->>C: WebSocket frame {type: event, status: sent}
@@ -1267,6 +1286,7 @@ make test-integration   # adds the Testcontainers suite (PostgreSQL 16 + Redis 7
 make test-all           # both
 make test-docker        # the same with only Docker (scripts/test-docker.sh)
 make verify             # one-command check: lint, unit, integration, stack up, smoke, invariants (scripts/verify.sh)
+make diagrams           # render every README Mermaid diagram with mermaid-cli (also in CI)
 make cover              # unit coverage -> coverage.html + per-package table
 make cover-all          # unit + integration coverage per internal package
 make lint               # gofmt, go vet, golangci-lint

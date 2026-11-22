@@ -168,6 +168,16 @@ jobs:
       - name: redocly lint
         run: npx --yes "@redocly/cli@${REDOCLY_CLI_VERSION}" lint api/openapi.yaml
 
+  diagrams:
+    # GitHub shows a Mermaid block that fails to parse as an error box, so render every README diagram.
+    name: README diagrams render (mermaid-cli)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: render every mermaid block
+        run: ./scripts/check-diagrams.sh
+
   docker:
     name: Docker image build + compose validation
     runs-on: ubuntu-latest

@@ -10,3 +10,4 @@ go-warmup/
 *.exe
 .DS_Store
 Thumbs.db
+CLAUDE.local.md

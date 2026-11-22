@@ -7,6 +7,24 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+### Fixed
+
+- The README's notification sequence diagram did not render on GitHub: a `;` inside a Mermaid
+  `sequenceDiagram` message is a statement separator. It also showed the rate-limit token taken before
+  `Claim`; it is taken after `Claim`, right before the provider call.
+
+### Added
+
+- CI renders every README Mermaid diagram with mermaid-cli (`scripts/check-diagrams.sh`, also a
+  `verify.sh` step), so a diagram that would not render fails the build.
+
+### Documentation
+
+- README opens with an "At a glance" section: how to run and check the system, the key design
+  decisions and the test results.
+- `CLAUDE.md` holds only the engineering specification.
+- Swagger UI screenshot shows the current spec (1.1.1).
+
 ## [1.1.1] - 2026-11-22
 
 API contract fixes from a pre-submission audit: the OpenAPI spec now matches every status code and
