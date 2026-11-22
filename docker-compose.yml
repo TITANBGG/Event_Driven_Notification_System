@@ -37,6 +37,7 @@ x-worker-env: &worker-env
   OTEL_SAMPLER_RATIO: ${OTEL_SAMPLER_RATIO:-1.0}
   LOG_LEVEL: ${LOG_LEVEL:-info}
   WORKER_METRICS_ADDR: ${WORKER_METRICS_ADDR:-:9091}
+  METRICS_BEARER_TOKEN: ${METRICS_BEARER_TOKEN:-}
 
 x-worker: &worker
   image: notification-system:local
@@ -142,8 +143,9 @@ services:
       # Auth is on by default with local-dev keys (admin + read-only) so the zero-config stack is never
       # open; set API_KEYS (see .env.example) to replace them. API_KEYS= (empty) disables auth.
       API_KEYS: ${API_KEYS-local-dev:local-dev-key-change-me:admin,local-dev-read:local-dev-read-key-change-me:read}
-      API_RATE_LIMIT_PER_SEC: ${API_RATE_LIMIT_PER_SEC:-0}
+      API_RATE_LIMIT_PER_SEC: ${API_RATE_LIMIT_PER_SEC:-1000}
       INGRESS_MAX_QUEUE_DEPTH: ${INGRESS_MAX_QUEUE_DEPTH:-1000000}
+      METRICS_BEARER_TOKEN: ${METRICS_BEARER_TOKEN:-}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
       OTEL_SAMPLER_RATIO: ${OTEL_SAMPLER_RATIO:-1.0}
       LOG_LEVEL: ${LOG_LEVEL:-info}

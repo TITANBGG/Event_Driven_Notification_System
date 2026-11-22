@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/TITANBGG/notification-system/internal/api/middleware"
+	"github.com/TITANBGG/notification-system/internal/app"
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/realtime"
@@ -34,6 +35,9 @@ type Deps struct {
 	IngressGate *IngressGate
 	// APIRateLimiter limits requests per API key (nil: no per-key limit).
 	APIRateLimiter middleware.KeyedLimiter
+	// Authenticator, when set, is used instead of one built from Config.APIKeys, so the caller can
+	// rotate keys at runtime (SIGHUP + API_KEYS_FILE).
+	Authenticator *middleware.Authenticator
 }
 
 type handler struct {
@@ -54,7 +58,8 @@ type handler struct {
 	// metricsRefresh is non-nil while one request recomputes the snapshot; it is closed when done.
 	metricsRefresh chan struct{}
 
-	gate *IngressGate
+	gate          *IngressGate
+	notifications *app.Notifications
 }
 
 // NewRouter constructs the HTTP API router with the exact middleware chain and routes
@@ -93,6 +98,7 @@ func NewRouter(deps Deps) chi.Router {
 		nowFn:          nowFn,
 		gate:           deps.IngressGate,
 	}
+	h.notifications = app.NewNotifications(deps.Store, deps.Config.IdempotencyTTL, deps.Config.BatchMaxItems)
 
 	r := chi.NewRouter()
 	// Order is significant: Recoverer wraps CorrelationID and Tracing so panics and access logs
@@ -113,13 +119,16 @@ func NewRouter(deps Deps) chi.Router {
 	r.Get("/health", h.handleHealthReady)
 	r.Get("/health/live", h.handleHealthLive)
 	r.Get("/health/ready", h.handleHealthReady)
-	r.Get("/metrics", h.metrics.Handler().ServeHTTP)
+	r.With(middleware.RequireStaticBearer(h.cfg.MetricsToken)).Get("/metrics", h.metrics.Handler().ServeHTTP)
 	r.Get("/openapi.yaml", h.handleOpenAPISpec)
 	r.Get("/demo", h.handleDemoPage)
 
 	// Probes, the spec, the demo page and the Prometheus scrape stay public (the scrape is protected
 	// at the network level); every /api/v1 route needs an API key once API_KEYS is configured.
-	auth := middleware.NewAuthenticator(h.cfg.APIKeys, h.metrics)
+	auth := deps.Authenticator
+	if auth == nil {
+		auth = middleware.NewAuthenticator(h.cfg.APIKeys, h.metrics)
+	}
 	read := middleware.RequireScope(auth, config.ScopeRead)
 	write := middleware.RequireScope(auth, config.ScopeWrite)
 	admin := middleware.RequireScope(auth, config.ScopeAdmin)

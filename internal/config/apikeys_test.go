@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -81,4 +83,36 @@ func TestAPIKeySecretNeverFormatted(t *testing.T) {
 	assert.NotContains(t, buf.String(), goodSecret)
 	assert.Contains(t, buf.String(), `"api_key_names":["ops"]`)
 	assert.Contains(t, buf.String(), `"api_auth_enabled":true`)
+}
+
+func TestAPIKeysFile(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "keys")
+	require.NoError(t, os.WriteFile(path, []byte("# rotated 2026-11-22\nops:"+goodSecret+":admin\n\nshop:another-secret-012345:write|read\n"), 0o600))
+
+	cfg, err := config.LoadFrom(mapLookup(map[string]string{"API_KEYS_FILE": path}))
+	require.NoError(t, err)
+	require.Len(t, cfg.APIKeys, 2)
+	assert.Equal(t, "shop", cfg.APIKeys[1].Name)
+
+	keys, err := config.LoadAPIKeysFile(path)
+	require.NoError(t, err)
+	assert.Len(t, keys, 2)
+
+	_, err = config.LoadFrom(mapLookup(map[string]string{"API_KEYS_FILE": path, "API_KEYS": "x:" + goodSecret + ":read"}))
+	assert.ErrorContains(t, err, "not both")
+
+	empty := filepath.Join(t.TempDir(), "empty")
+	require.NoError(t, os.WriteFile(empty, []byte("# nothing yet\n"), 0o600))
+	_, err = config.LoadAPIKeysFile(empty)
+	assert.ErrorContains(t, err, "contains no keys")
+
+	bad := filepath.Join(t.TempDir(), "bad")
+	require.NoError(t, os.WriteFile(bad, []byte("ops:short:admin\n"), 0o600))
+	_, err = config.LoadAPIKeysFile(bad)
+	assert.ErrorContains(t, err, "secret must be")
+	assert.NotContains(t, err.Error(), "short")
+
+	_, err = config.LoadFrom(mapLookup(map[string]string{"API_KEYS_FILE": filepath.Join(t.TempDir(), "missing")}))
+	assert.ErrorContains(t, err, "reading API_KEYS_FILE")
 }

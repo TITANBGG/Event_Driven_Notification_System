@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,16 +16,12 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 
+	"github.com/TITANBGG/notification-system/internal/app"
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/realtime"
 	"github.com/TITANBGG/notification-system/internal/repository"
 	"github.com/TITANBGG/notification-system/internal/template"
-)
-
-var (
-	errIdempotencyKeyConflictSentinel = errors.New("idempotency key exists")
-	errBatchIdempotencyExistsSentinel = errors.New("batch idempotency key exists")
 )
 
 func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Request) {
@@ -112,11 +107,12 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 		TemplateVars:   norm.TemplateVars,
 	}
 
-	created, replayed, replayStatus, err := h.persistSingleNotification(r.Context(), candidate, idemKey, reqHash, now)
+	res, err := h.notifications.Create(r.Context(), candidate, idemKey, reqHash, now)
 	if err != nil {
 		writeError(w, r, h.logger, err)
 		return
 	}
+	created, replayed, replayStatus := res.Notification, res.Replayed, res.Status
 
 	if replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
@@ -146,69 +142,6 @@ func (h *handler) handleCreateNotification(w http.ResponseWriter, r *http.Reques
 	}
 
 	writeJSON(w, h.logger, http.StatusAccepted, toNotificationResponse(*created))
-}
-
-func (h *handler) persistSingleNotification(
-	ctx context.Context,
-	candidate domain.Notification,
-	idemKey string,
-	reqHash string,
-	now time.Time,
-) (*domain.Notification, bool, int, error) {
-	// At most 2 attempts handles the narrow window where a conflicting key expires between insert and lookup.
-	for attempt := 0; attempt < 2; attempt++ {
-		var inserted *domain.Notification
-		txErr := h.store.WithTx(ctx, func(txCtx context.Context, tx Store) error {
-			if idemKey != "" {
-				_, ok, err := tx.InsertIdempotencyKey(txCtx, domain.IdempotencyKey{
-					Key:            idemKey,
-					RequestHash:    reqHash,
-					ResourceType:   domain.ResourceNotification,
-					ResourceID:     candidate.ID,
-					ResponseStatus: http.StatusAccepted,
-					ExpiresAt:      now.Add(h.cfg.IdempotencyTTL),
-				})
-				if err != nil {
-					return err
-				}
-				if !ok {
-					return errIdempotencyKeyConflictSentinel
-				}
-			}
-
-			row, err := tx.InsertNotification(txCtx, candidate)
-			if err != nil {
-				return err
-			}
-			inserted = row
-			return nil
-		})
-		if txErr == nil {
-			return inserted, false, http.StatusAccepted, nil
-		}
-		if !errors.Is(txErr, errIdempotencyKeyConflictSentinel) {
-			return nil, false, 0, txErr
-		}
-
-		existing, err := h.store.GetIdempotencyKey(ctx, idemKey)
-		if err != nil {
-			if errors.Is(err, domain.ErrNotFound) {
-				continue
-			}
-			return nil, false, 0, err
-		}
-		if existing.ResourceType != domain.ResourceNotification || existing.RequestHash != reqHash {
-			return nil, false, 0, domain.ErrIdempotencyConflict
-		}
-
-		orig, err := h.store.GetNotification(ctx, existing.ResourceID)
-		if err != nil {
-			return nil, false, 0, err
-		}
-		return orig, true, existing.ResponseStatus, nil
-	}
-
-	return nil, false, 0, domain.ErrIdempotencyConflict
 }
 
 func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
@@ -306,9 +239,7 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 		tp = strings.TrimSpace(r.Header.Get("traceparent"))
 	}
 	notifications := make([]domain.Notification, len(renderedItems))
-	itemKeys := make([]string, 0)
-	itemKeyRecords := make([]domain.IdempotencyKey, 0)
-	indexByItemKey := make(map[string]int)
+	itemKeys := make([]app.ItemKey, 0)
 
 	for i, renderedNorm := range renderedItems {
 		normRaw := normalizedRawItems[i]
@@ -342,35 +273,30 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 				writeError(w, r, h.logger, fmt.Errorf("computing item request hash: %w", hErr))
 				return
 			}
-			k := *normRaw.IdempotencyKey
-			itemKeys = append(itemKeys, k)
-			indexByItemKey[k] = i
-			itemKeyRecords = append(itemKeyRecords, domain.IdempotencyKey{
-				Key:            k,
+			itemKeys = append(itemKeys, app.ItemKey{Index: i, Record: domain.IdempotencyKey{
+				Key:            *normRaw.IdempotencyKey,
 				RequestHash:    itemHash,
 				ResourceType:   domain.ResourceNotification,
 				ResourceID:     notifID,
-				ResponseStatus: http.StatusAccepted,
+				ResponseStatus: app.AcceptedStatus,
 				ExpiresAt:      now.Add(h.cfg.IdempotencyTTL),
-			})
+			}})
 		}
 	}
 
-	resp, replayed, replayStatus, err := h.persistBatch(
-		r.Context(),
-		domain.Batch{ID: batchID, Total: len(notifications), CorrelationID: optionalNonEmpty(cid)},
-		notifications,
-		batchKey,
-		batchHash,
-		itemKeys,
-		itemKeyRecords,
-		indexByItemKey,
-		now,
-	)
+	res, err := h.notifications.CreateBatch(r.Context(), app.BatchInput{
+		Batch:         domain.Batch{ID: batchID, Total: len(notifications), CorrelationID: optionalNonEmpty(cid)},
+		Notifications: notifications,
+		BatchKey:      batchKey,
+		BatchHash:     batchHash,
+		ItemKeys:      itemKeys,
+	}, now)
 	if err != nil {
 		writeError(w, r, h.logger, err)
 		return
 	}
+	resp := BatchCreateResponse{BatchID: res.BatchID, Count: len(res.NotificationIDs), NotificationIDs: res.NotificationIDs}
+	replayed, replayStatus := res.Replayed, res.Status
 
 	if replayed {
 		w.Header().Set("Idempotent-Replayed", "true")
@@ -407,168 +333,6 @@ func (h *handler) handleCreateBatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, h.logger, http.StatusAccepted, resp)
-}
-
-func (h *handler) persistBatch(
-	ctx context.Context,
-	batch domain.Batch,
-	notifications []domain.Notification,
-	batchKey string,
-	batchHash string,
-	itemKeys []string,
-	itemKeyRecords []domain.IdempotencyKey,
-	indexByItemKey map[string]int,
-	now time.Time,
-) (BatchCreateResponse, bool, int, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		txErr := h.store.WithTx(ctx, func(txCtx context.Context, tx Store) error {
-			// Insert batch-level key first so whole-batch replay succeeds cleanly before item-key checks.
-			if batchKey != "" {
-				_, ok, err := tx.InsertIdempotencyKey(txCtx, domain.IdempotencyKey{
-					Key:            batchKey,
-					RequestHash:    batchHash,
-					ResourceType:   domain.ResourceBatch,
-					ResourceID:     batch.ID,
-					ResponseStatus: http.StatusAccepted,
-					ExpiresAt:      now.Add(h.cfg.IdempotencyTTL),
-				})
-				if err != nil {
-					return err
-				}
-				if !ok {
-					return errBatchIdempotencyExistsSentinel
-				}
-			}
-
-			if len(itemKeys) > 0 {
-				existing, err := tx.GetIdempotencyKeysByKeys(txCtx, itemKeys)
-				if err != nil {
-					return err
-				}
-				if len(existing) > 0 {
-					return newItemIdempotencyConflictError(existing, indexByItemKey)
-				}
-				// One statement for every item key (was one round trip per item). A key missing from
-				// the result was claimed by a concurrent request after the read above: reject the batch.
-				claimed, err := tx.InsertIdempotencyKeys(txCtx, itemKeyRecords)
-				if err != nil {
-					return err
-				}
-				if len(claimed) != len(itemKeyRecords) {
-					got := make(map[string]struct{}, len(claimed))
-					for _, k := range claimed {
-						got[k] = struct{}{}
-					}
-					var conflicts []domain.IdempotencyKey
-					for _, rec := range itemKeyRecords {
-						if _, ok := got[rec.Key]; ok {
-							continue
-						}
-						if row, getErr := tx.GetIdempotencyKey(txCtx, rec.Key); getErr == nil {
-							conflicts = append(conflicts, *row)
-						}
-					}
-					if len(conflicts) == 0 {
-						return &apiError{
-							status:  http.StatusConflict,
-							code:    "item_idempotency_key_exists",
-							message: "one or more item idempotency keys already exist",
-						}
-					}
-					return newItemIdempotencyConflictError(conflicts, indexByItemKey)
-				}
-			}
-
-			if _, err := tx.InsertBatch(txCtx, batch); err != nil {
-				return err
-			}
-			copied, err := tx.CopyNotifications(txCtx, notifications)
-			if err != nil {
-				return err
-			}
-			if int(copied) != len(notifications) {
-				return fmt.Errorf("copied %d of %d batch notifications", copied, len(notifications))
-			}
-			return nil
-		})
-		if txErr == nil {
-			ids := make([]uuid.UUID, len(notifications))
-			for i, n := range notifications {
-				ids[i] = n.ID
-			}
-			return BatchCreateResponse{
-				BatchID:         batch.ID,
-				Count:           len(ids),
-				NotificationIDs: ids,
-			}, false, http.StatusAccepted, nil
-		}
-		if !errors.Is(txErr, errBatchIdempotencyExistsSentinel) {
-			return BatchCreateResponse{}, false, 0, txErr
-		}
-
-		existing, err := h.store.GetIdempotencyKey(ctx, batchKey)
-		if err != nil {
-			if errors.Is(err, domain.ErrNotFound) {
-				continue
-			}
-			return BatchCreateResponse{}, false, 0, err
-		}
-		if existing.ResourceType != domain.ResourceBatch || existing.RequestHash != batchHash {
-			return BatchCreateResponse{}, false, 0, domain.ErrIdempotencyConflict
-		}
-
-		origBatch, err := h.store.GetBatch(ctx, existing.ResourceID)
-		if err != nil {
-			return BatchCreateResponse{}, false, 0, err
-		}
-		items, err := h.listAllBatchItemsOrdered(ctx, origBatch.ID, origBatch.Total)
-		if err != nil {
-			return BatchCreateResponse{}, false, 0, err
-		}
-		ids := make([]uuid.UUID, len(items))
-		for i, item := range items {
-			ids[i] = item.ID
-		}
-		return BatchCreateResponse{
-			BatchID:         origBatch.ID,
-			Count:           len(ids),
-			NotificationIDs: ids,
-		}, true, existing.ResponseStatus, nil
-	}
-
-	return BatchCreateResponse{}, false, 0, domain.ErrIdempotencyConflict
-}
-
-func (h *handler) listAllBatchItemsOrdered(ctx context.Context, batchID uuid.UUID, total int) ([]domain.Notification, error) {
-	all := make([]domain.Notification, 0, total)
-	var cursor *repository.Cursor
-	pageSize := total
-	if pageSize <= 0 {
-		pageSize = h.cfg.BatchMaxItems
-	}
-
-	for {
-		page, err := h.store.ListBatchItems(ctx, batchID, cursor, pageSize+1)
-		if err != nil {
-			return nil, err
-		}
-		hasMore := len(page) > pageSize
-		if hasMore {
-			page = page[:pageSize]
-		}
-		all = append(all, page...)
-		if !hasMore || len(page) == 0 {
-			break
-		}
-		last := page[len(page)-1]
-		cursor = &repository.Cursor{CreatedAt: last.CreatedAt, ID: last.ID}
-	}
-
-	// Sort by monotonic UUIDv7 bytes ascending to restore original request submission order on replay.
-	sort.Slice(all, func(i, j int) bool {
-		return bytes.Compare(all[i].ID[:], all[j].ID[:]) < 0
-	})
-	return all, nil
 }
 
 func (h *handler) handleGetNotification(w http.ResponseWriter, r *http.Request) {
@@ -933,31 +697,6 @@ func addDuplicateBatchItemKeyErrors(itemKeyIndexes map[string][]int, batchKey st
 				)
 			}
 		}
-	}
-}
-
-func newItemIdempotencyConflictError(existing []domain.IdempotencyKey, indexByKey map[string]int) error {
-	sort.Slice(existing, func(i, j int) bool {
-		return indexByKey[existing[i].Key] < indexByKey[existing[j].Key]
-	})
-	details := make([]domain.FieldError, 0, len(existing))
-	for _, ex := range existing {
-		idx, ok := indexByKey[ex.Key]
-		field := "idempotencyKey"
-		if ok {
-			field = fmt.Sprintf("notifications[%d].idempotencyKey", idx)
-		}
-		details = append(details, domain.FieldError{
-			Field:   field,
-			Code:    "item_idempotency_key_exists",
-			Message: fmt.Sprintf("already exists for %s %s", ex.ResourceType, ex.ResourceID),
-		})
-	}
-	return &apiError{
-		status:  http.StatusConflict,
-		code:    "item_idempotency_key_exists",
-		message: "one or more batch item idempotency keys already exist",
-		details: details,
 	}
 }
 

@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -68,6 +69,40 @@ func parseAPIKeys(raw string) ([]APIKey, error) {
 		keys = append(keys, APIKey{Name: strings.TrimSpace(parts[0]), Secret: parts[1], Scopes: scopes})
 	}
 	return keys, errors.Join(errs...)
+}
+
+// LoadAPIKeysFile reads and validates an API_KEYS_FILE: the same name:secret:scopes entries as
+// API_KEYS, separated by commas or newlines; blank lines and lines starting with # are ignored.
+// It is used at startup and again on SIGHUP to rotate keys without a restart.
+func LoadAPIKeysFile(path string) ([]APIKey, error) {
+	keys, err := readAPIKeysFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAPIKeys(keys); err != nil {
+		return nil, err
+	}
+	if len(keys) == 0 {
+		return nil, fmt.Errorf("API_KEYS_FILE %s contains no keys", path)
+	}
+	return keys, nil
+}
+
+func readAPIKeysFile(path string) ([]APIKey, error) {
+	// #nosec G304 -- the path is operator configuration (API_KEYS_FILE), not request input.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading API_KEYS_FILE: %w", err)
+	}
+	var entries []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		entries = append(entries, line)
+	}
+	return parseAPIKeys(strings.Join(entries, ","))
 }
 
 func validateAPIKeys(keys []APIKey) error {

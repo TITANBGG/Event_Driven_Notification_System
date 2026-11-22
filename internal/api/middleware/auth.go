@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/observability"
@@ -57,43 +59,66 @@ type authKey struct {
 // kept, and every lookup compares against all keys in constant time so response timing reveals
 // neither which key matched nor how much of a guess was right.
 type Authenticator struct {
-	keys     []authKey
+	// enabled is fixed at construction: a reload can rotate keys but never switch auth off or on.
+	enabled  bool
+	keys     atomic.Pointer[[]authKey]
 	observer AuthFailureObserver
 }
 
 // NewAuthenticator builds an Authenticator from validated config keys. With no keys,
 // authentication is disabled and both middlewares become no-ops.
 func NewAuthenticator(keys []config.APIKey, observer AuthFailureObserver) *Authenticator {
-	a := &Authenticator{observer: observer, keys: make([]authKey, 0, len(keys))}
+	a := &Authenticator{observer: observer, enabled: len(keys) > 0}
+	a.keys.Store(hashKeys(keys))
+	return a
+}
+
+func hashKeys(keys []config.APIKey) *[]authKey {
+	out := make([]authKey, 0, len(keys))
 	for _, k := range keys {
 		scopes := make(map[string]bool, len(k.Scopes))
 		for _, s := range k.Scopes {
 			scopes[s] = true
 		}
-		a.keys = append(a.keys, authKey{
+		out = append(out, authKey{
 			hash:      sha256.Sum256([]byte(k.Secret)),
 			principal: Principal{Name: k.Name, scopes: scopes},
 		})
 	}
-	return a
+	return &out
 }
 
-// Enabled reports whether any API key is configured.
+// Reload atomically replaces the key set (SIGHUP with API_KEYS_FILE). In-flight requests keep the
+// set they started with. An empty set is refused so a truncated file cannot lock every client out,
+// and a disabled authenticator stays disabled.
+func (a *Authenticator) Reload(keys []config.APIKey) error {
+	if a == nil || !a.enabled {
+		return errors.New("authentication was disabled at startup; restart with API_KEYS or API_KEYS_FILE to enable it")
+	}
+	if len(keys) == 0 {
+		return errors.New("refusing to reload an empty key set")
+	}
+	a.keys.Store(hashKeys(keys))
+	return nil
+}
+
+// Enabled reports whether authentication was configured at startup.
 func (a *Authenticator) Enabled() bool {
-	return a != nil && len(a.keys) > 0
+	return a != nil && a.enabled
 }
 
 func (a *Authenticator) lookup(token string) (Principal, bool) {
 	sum := sha256.Sum256([]byte(token))
+	keys := *a.keys.Load()
 	var (
 		found Principal
 		ok    bool
 	)
 	// No early return: the loop cost is the same whether the token matches the first key,
 	// the last key or none of them.
-	for i := range a.keys {
-		if subtle.ConstantTimeCompare(sum[:], a.keys[i].hash[:]) == 1 {
-			found, ok = a.keys[i].principal, true
+	for i := range keys {
+		if subtle.ConstantTimeCompare(sum[:], keys[i].hash[:]) == 1 {
+			found, ok = keys[i].principal, true
 		}
 	}
 	return found, ok

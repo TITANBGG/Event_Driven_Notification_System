@@ -63,7 +63,9 @@ type Config struct {
 	ScheduleMaxAhead   time.Duration
 	CORSAllowedOrigins []string
 	APIKeys            []APIKey
+	APIKeysFile        string
 	APIRateLimitPerSec int
+	MetricsToken       string
 	IngressMaxDepth    int64
 	OTELEndpoint       string
 	OTELSamplerRatio   float64
@@ -173,9 +175,19 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		}
 	}
 
+	apiKeysFile := getStrAllowEmpty("API_KEYS_FILE", "")
 	apiKeys, apiKeyErr := parseAPIKeys(getStrAllowEmpty("API_KEYS", ""))
 	if apiKeyErr != nil {
 		parseErrs = append(parseErrs, apiKeyErr)
+	}
+	if apiKeysFile != "" {
+		if len(apiKeys) > 0 {
+			parseErrs = append(parseErrs, errors.New("set either API_KEYS or API_KEYS_FILE, not both"))
+		} else if fileKeys, err := readAPIKeysFile(apiKeysFile); err != nil {
+			parseErrs = append(parseErrs, err)
+		} else {
+			apiKeys = fileKeys
+		}
 	}
 
 	cfg := Config{
@@ -223,7 +235,9 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		ScheduleMaxAhead:   getDuration("SCHEDULE_MAX_AHEAD", 720*time.Hour),
 		CORSAllowedOrigins: parseCSV(getStrAllowEmpty("CORS_ALLOWED_ORIGINS", "http://localhost:8081")),
 		APIKeys:            apiKeys,
+		APIKeysFile:        apiKeysFile,
 		APIRateLimitPerSec: getInt("API_RATE_LIMIT_PER_SEC", 0),
+		MetricsToken:       getStrAllowEmpty("METRICS_BEARER_TOKEN", ""),
 		IngressMaxDepth:    getInt64("INGRESS_MAX_QUEUE_DEPTH", 1000000),
 		OTELEndpoint:       getStrAllowEmpty("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4318"),
 		OTELSamplerRatio:   getFloat("OTEL_SAMPLER_RATIO", 1.0),
@@ -382,6 +396,9 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("MAX_CIRCUIT_DEFERRALS (%d) must be >= 1", c.MaxCircuitDeferral))
 	}
 
+	if c.MetricsToken != "" && (len(c.MetricsToken) < minAPIKeySecretLen || !isTokenSafe(c.MetricsToken)) {
+		errs = append(errs, fmt.Errorf("METRICS_BEARER_TOKEN must be at least %d token characters (letters, digits and !#$%%&'*+-.^_`|~)", minAPIKeySecretLen))
+	}
 	if c.APIRateLimitPerSec < 0 {
 		errs = append(errs, fmt.Errorf("API_RATE_LIMIT_PER_SEC (%d) must be >= 0 (0 disables it)", c.APIRateLimitPerSec))
 	}
@@ -443,6 +460,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("shutdown_timeout", c.ShutdownTimeout.String()),
 		slog.Int("batch_max_items", c.BatchMaxItems),
 		slog.Bool("api_auth_enabled", len(c.APIKeys) > 0),
+		slog.Bool("metrics_auth_enabled", c.MetricsToken != ""),
 		slog.Any("api_key_names", apiKeyNames(c.APIKeys)),
 		slog.String("log_level", c.LogLevel),
 	)

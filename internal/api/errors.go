@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/TITANBGG/notification-system/internal/app"
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 )
@@ -54,6 +55,31 @@ func writeError(w http.ResponseWriter, r *http.Request, logger *slog.Logger, err
 				Message: ae.message,
 				Details: ae.details,
 			},
+			CorrelationID: cid,
+		})
+		return
+	}
+
+	var keyConflict *app.ItemKeyConflictError
+	if errors.As(err, &keyConflict) {
+		details := make([]domain.FieldError, 0, len(keyConflict.Items))
+		for _, it := range keyConflict.Items {
+			field := "idempotencyKey"
+			if it.Index >= 0 {
+				field = fmt.Sprintf("notifications[%d].idempotencyKey", it.Index)
+			}
+			details = append(details, domain.FieldError{
+				Field:   field,
+				Code:    "item_idempotency_key_exists",
+				Message: fmt.Sprintf("already exists for %s %s", it.Existing.ResourceType, it.Existing.ResourceID),
+			})
+		}
+		message := "one or more batch item idempotency keys already exist"
+		if len(details) == 0 {
+			message = "one or more item idempotency keys already exist"
+		}
+		writeJSON(w, logger, http.StatusConflict, ErrorResponse{
+			Error:         ErrorBody{Code: "item_idempotency_key_exists", Message: message, Details: details},
 			CorrelationID: cid,
 		})
 		return

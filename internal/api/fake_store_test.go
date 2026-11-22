@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/TITANBGG/notification-system/internal/api"
+	"github.com/TITANBGG/notification-system/internal/app"
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/repository"
 )
@@ -57,6 +58,12 @@ func (s *fakeDBState) clone() *fakeDBState {
 
 // fakeStore is an in-memory transactional Store implementing Postgres semantics
 // (atomic rollback in WithTx, expired idempotency key reclaim, fenced transitions, keyset pagination).
+// Compile-time checks: the fakes implement the API store and the app use-case store.
+var (
+	_ api.Store = (*fakeStore)(nil)
+	_ app.Store = (*fakeTxStore)(nil)
+)
+
 type fakeStore struct {
 	txMu         sync.Mutex
 	mu           sync.RWMutex
@@ -111,7 +118,7 @@ func (f *fakeStore) Ping(_ context.Context) error {
 	return f.pingErr
 }
 
-func (f *fakeStore) WithTx(ctx context.Context, fn func(ctx context.Context, tx api.Store) error) error {
+func (f *fakeStore) WithTx(ctx context.Context, fn func(ctx context.Context, tx app.Store) error) error {
 	f.mu.RLock()
 	ferr := f.forcedErr
 	f.mu.RUnlock()
@@ -343,7 +350,7 @@ type fakeTxStore struct {
 }
 
 func (t *fakeTxStore) Ping(_ context.Context) error { return nil }
-func (t *fakeTxStore) WithTx(ctx context.Context, fn func(ctx context.Context, tx api.Store) error) error {
+func (t *fakeTxStore) WithTx(ctx context.Context, fn func(ctx context.Context, tx app.Store) error) error {
 	return fn(ctx, t)
 }
 

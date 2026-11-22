@@ -15,6 +15,7 @@ import (
 	"github.com/exaring/otelpgx"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/TITANBGG/notification-system/internal/api/middleware"
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
@@ -216,7 +217,7 @@ func run() error {
 	}
 	mux.HandleFunc("GET /health/ready", readyHandler)
 	mux.HandleFunc("GET /health", readyHandler)
-	mux.Handle("GET /metrics", metrics.Handler())
+	mux.Handle("GET /metrics", middleware.RequireStaticBearer(cfg.MetricsToken)(metrics.Handler()))
 
 	srv := &http.Server{
 		Addr:              cfg.WorkerMetricsAddr,

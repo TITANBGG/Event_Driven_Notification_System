@@ -225,3 +225,28 @@ func TestRequireScopeWithoutAuthenticateFailsClosed(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
 	assert.Equal(t, http.StatusUnauthorized, rec.Code)
 }
+
+// Keys rotate atomically: the new key works and the old one stops at once, while an empty set or
+// reloading a disabled authenticator is refused so a bad edit can neither lock out nor open the API.
+func TestAuthenticatorReloadRotatesKeys(t *testing.T) {
+	t.Parallel()
+	auth := middleware.NewAuthenticator([]config.APIKey{{Name: "old", Secret: readerSecret, Scopes: []string{config.ScopeRead}}}, nil)
+	h := middleware.Authenticate(auth)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	call := func(secret string) int {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+secret)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	require.Equal(t, http.StatusNoContent, call(readerSecret))
+
+	require.NoError(t, auth.Reload([]config.APIKey{{Name: "new", Secret: writerSecret, Scopes: []string{config.ScopeRead}}}))
+	assert.Equal(t, http.StatusNoContent, call(writerSecret), "the new key is accepted")
+	assert.Equal(t, http.StatusUnauthorized, call(readerSecret), "the old key is revoked")
+
+	assert.Error(t, auth.Reload(nil), "an empty key set is refused")
+	assert.Equal(t, http.StatusNoContent, call(writerSecret), "a refused reload keeps the current keys")
+	assert.Error(t, middleware.NewAuthenticator(nil, nil).Reload([]config.APIKey{{Name: "x", Secret: adminSecret, Scopes: []string{"admin"}}}),
+		"a reload cannot switch authentication on")
+}

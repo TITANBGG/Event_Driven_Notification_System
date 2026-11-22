@@ -181,6 +181,7 @@ func run() error {
 	})
 	publisher := realtime.NewRedisPublisher(rdb)
 
+	auth := middleware.NewAuthenticator(cfg.APIKeys, metrics)
 	gate := api.NewIngressGate(cfg.IngressMaxDepth)
 	var apiLimiter middleware.KeyedLimiter
 	if kl := ratelimit.NewKeyed(rdb, cfg.APIRateLimitPerSec); kl != nil {
@@ -197,7 +198,11 @@ func run() error {
 		Metrics:        metrics,
 		IngressGate:    gate,
 		APIRateLimiter: apiLimiter,
+		Authenticator:  auth,
 	})
+	if cfg.APIKeysFile != "" {
+		go reloadAPIKeysOnSIGHUP(ctx, logger, cfg.APIKeysFile, auth)
+	}
 
 	samplerCtx, stopSampler := context.WithCancel(context.Background())
 	defer stopSampler()
@@ -301,6 +306,35 @@ func runQueueDepthSampler(ctx context.Context, logger *slog.Logger, q *queue.Que
 			return
 		case <-ticker.C:
 			sample()
+		}
+	}
+}
+
+// reloadAPIKeysOnSIGHUP rotates API keys without a restart: on SIGHUP it re-reads API_KEYS_FILE and,
+// only if the whole file is valid and non-empty, swaps the key set atomically. A bad edit is logged
+// and the previous keys stay in force, so a typo cannot lock every client out or open the API.
+func reloadAPIKeysOnSIGHUP(ctx context.Context, logger *slog.Logger, path string, auth *middleware.Authenticator) {
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			keys, err := config.LoadAPIKeysFile(path)
+			if err == nil {
+				err = auth.Reload(keys)
+			}
+			if err != nil {
+				logger.Error("API key reload rejected; previous keys stay active", slog.String("error", err.Error()))
+				continue
+			}
+			names := make([]string, len(keys))
+			for i, k := range keys {
+				names[i] = k.Name
+			}
+			logger.Info("API keys reloaded", slog.Any("api_key_names", names))
 		}
 	}
 }
