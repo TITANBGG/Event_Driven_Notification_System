@@ -23,8 +23,16 @@ const (
 	defaultDelayedLookahead  = 5 * time.Minute
 	idempotencyDeleteBatch   = 10000
 	idempotencyMaxBatches    = 10
-	maxPagesPerCycle         = 5
-	abandonedFailMessage     = "visibility timeout; worker presumed dead"
+	// maxPagesPerCycle bounds each step to 5 pages of batchLimit rows per cycle. Repairs are bounded by
+	// the scanned pages, not by a separate repair count: with a repair cap of one batch (the former
+	// rule) a mass Redis loss was rebuilt at only ~1000 rows per 15s cycle (~67/s), below the 300/s
+	// the workers can send; now up to 5000 rows per cycle (~333/s) are repaired.
+	maxPagesPerCycle     = 5
+	abandonedFailMessage = "visibility timeout; worker presumed dead"
+	// abandonedExhaustedMessage is the last_error of a row failed after its final attempt was
+	// abandoned. The worker may have died after the provider accepted the message, so it says the
+	// delivery outcome is unknown instead of implying the message was not delivered.
+	abandonedExhaustedMessage = "delivery outcome unknown: worker died during the final attempt (visibility timeout)"
 )
 
 // ReconcilerStore defines the PostgreSQL queries and mutations used by the distributed reconciler.
@@ -42,6 +50,7 @@ type ReconcilerStore interface {
 type ReconcilerQueue interface {
 	AcquireReconcilerLock(ctx context.Context, owner string, ttl time.Duration) (bool, error)
 	ReleaseReconcilerLock(ctx context.Context, owner string) (bool, error)
+	ExtendReconcilerLock(ctx context.Context, owner string, ttl time.Duration) (bool, error)
 	ScanInflightWorkerIDs(ctx context.Context) ([]string, error)
 	HasHeartbeats(ctx context.Context, workerIDs []string) (map[string]bool, error)
 	RequeueInflight(ctx context.Context, workerID string) (int64, error)
@@ -166,29 +175,36 @@ func (r *DistributedReconciler) RunCycle(ctx context.Context) error {
 		}
 	}()
 
-	var stepErrs []error
 	// Requeue orphaned inflight lists first so step (a) observes recovered Redis tracking entries.
-	if err := r.reconcileOrphanInflight(ctx); err != nil {
-		stepErrs = append(stepErrs, fmt.Errorf("step orphan_inflight: %w", err))
+	steps := []struct {
+		name string
+		run  func(context.Context) error
+	}{
+		{"orphan_inflight", r.reconcileOrphanInflight},
+		{"stale_pending", r.reconcileStalePending},
+		{"delayed_due", r.reconcileDelayedDueSoon},
+		{"abandoned_processing", r.reconcileAbandonedProcessing},
+		{"idempotency_cleanup", r.cleanupExpiredIdempotencyKeys},
 	}
-	if ctx.Err() == nil {
-		if err := r.reconcileStalePending(ctx); err != nil {
-			stepErrs = append(stepErrs, fmt.Errorf("step stale_pending: %w", err))
+	var stepErrs []error
+	for i, step := range steps {
+		if ctx.Err() != nil {
+			break
 		}
-	}
-	if ctx.Err() == nil {
-		if err := r.reconcileDelayedDueSoon(ctx); err != nil {
-			stepErrs = append(stepErrs, fmt.Errorf("step delayed_due: %w", err))
+		// The lease is renewed before every step after the first: a slow cycle (large backlog, slow
+		// database) must not outlive its lease while still repairing, or a second replica would run
+		// the same repairs concurrently.
+		if i > 0 {
+			held, extErr := r.queue.ExtendReconcilerLock(ctx, lockOwner, r.lockTTL)
+			if extErr != nil || !held {
+				r.logger.Warn("reconciler lease lost mid-cycle; stopping before the next step",
+					slog.String("next_step", step.name), slog.Any("error", extErr))
+				stepErrs = append(stepErrs, fmt.Errorf("reconciler lease lost before step %s", step.name))
+				break
+			}
 		}
-	}
-	if ctx.Err() == nil {
-		if err := r.reconcileAbandonedProcessing(ctx); err != nil {
-			stepErrs = append(stepErrs, fmt.Errorf("step abandoned_processing: %w", err))
-		}
-	}
-	if ctx.Err() == nil {
-		if err := r.cleanupExpiredIdempotencyKeys(ctx); err != nil {
-			stepErrs = append(stepErrs, fmt.Errorf("step idempotency_cleanup: %w", err))
+		if err := step.run(ctx); err != nil {
+			stepErrs = append(stepErrs, fmt.Errorf("step %s: %w", step.name, err))
 		}
 	}
 	return errors.Join(stepErrs...)
@@ -236,7 +252,7 @@ func (r *DistributedReconciler) reconcileStalePending(ctx context.Context) error
 	afterID := r.pendingCursor
 	reachedEnd := false
 	repaired := 0
-	for page := 0; page < maxPagesPerCycle && repaired < r.batchLimit; page++ {
+	for page := 0; page < maxPagesPerCycle; page++ {
 		rows, err := r.store.FindStalePending(ctx, r.pendingStaleAfter, afterID, r.batchLimit)
 		if err != nil {
 			return err
@@ -286,7 +302,7 @@ func (r *DistributedReconciler) reconcileDelayedDueSoon(ctx context.Context) err
 	repaired := 0
 	var errs []error
 
-	for page := 0; page < maxPagesPerCycle && repaired < r.batchLimit; page++ {
+	for page := 0; page < maxPagesPerCycle; page++ {
 		rows, err := r.store.FindDelayedDueSoon(ctx, r.pendingStaleAfter, r.delayedLookahead, afterID, r.batchLimit)
 		if err != nil {
 			return err
@@ -334,7 +350,7 @@ func (r *DistributedReconciler) reconcileAbandonedProcessing(ctx context.Context
 	recovered := 0
 	var errs []error
 
-	for page := 0; page < maxPagesPerCycle && recovered < r.batchLimit; page++ {
+	for page := 0; page < maxPagesPerCycle; page++ {
 		rows, err := r.store.FindAbandonedProcessing(ctx, r.visibilityTimeout, afterID, r.batchLimit)
 		if err != nil {
 			return err
@@ -375,7 +391,7 @@ func (r *DistributedReconciler) recoverSingleAbandoned(ctx context.Context, row 
 		err     error
 	)
 	if exhausted {
-		updated, err = r.store.FailAbandoned(ctx, row.ID, row.Attempts, abandonedFailMessage)
+		updated, err = r.store.FailAbandoned(ctx, row.ID, row.Attempts, abandonedExhaustedMessage)
 	} else {
 		updated, err = r.store.RequeueAbandoned(ctx, row.ID, row.Attempts)
 	}

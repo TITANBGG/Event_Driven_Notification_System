@@ -276,7 +276,7 @@ func TestWorkerCircuitBreakerIntegrationAndMaxDeferrals(t *testing.T) {
 		cfg := testWorkerConfig()
 		cfg.CBConsecutiveFail = 10
 		cfg.CBMinRequests = 50
-		cfg.CBOpenTimeout = 120 * time.Millisecond
+		cfg.CBOpenTimeout = 400 * time.Millisecond
 		cfg.CBHalfOpenMax = 3
 		cfg.MaxCircuitDeferral = 5
 		cfg.DelayedMoverIntv = 15 * time.Millisecond
@@ -320,7 +320,8 @@ func TestWorkerCircuitBreakerIntegrationAndMaxDeferrals(t *testing.T) {
 		}, 3*time.Second, 10*time.Millisecond)
 		assert.Equal(t, int32(10), providerCalls.Load())
 
-		// While circuit is open, enqueue an item that must be deferred WITHOUT calling provider.
+		// While the circuit is open, a new item stays queued in Redis: no Claim, no provider call, no
+		// circuit_open attempt row, no DB write at all.
 		deferredID := uuid.Must(uuid.NewV7())
 		store.put(domain.Notification{
 			ID: deferredID, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh,
@@ -328,20 +329,19 @@ func TestWorkerCircuitBreakerIntegrationAndMaxDeferrals(t *testing.T) {
 		})
 		require.NoError(t, q.Enqueue(ctx, queue.Meta{ID: deferredID, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh}))
 
-		require.Eventually(t, func() bool {
-			return store.get(deferredID).Deferrals >= 1
-		}, 2*time.Second, 5*time.Millisecond)
+		time.Sleep(150 * time.Millisecond) // test-only: still well inside the 400ms open state
+		require.Equal(t, gobreaker.StateOpen, breaker.State(domain.ChannelSMS))
 		gotDeferred := store.get(deferredID)
-		assert.Equal(t, 0, gotDeferred.Attempts, "circuit_open must not burn counted attempts")
-		assert.GreaterOrEqual(t, gotDeferred.Deferrals, 1)
-
-		var foundUncountedCircuitOpen bool
+		assert.Equal(t, domain.StatusPending, gotDeferred.Status, "an open circuit must not claim new items")
+		assert.Equal(t, 0, gotDeferred.Attempts)
+		assert.Equal(t, 0, gotDeferred.Deferrals)
 		for _, a := range store.attemptList() {
-			if a.NotificationID == deferredID && a.Outcome == domain.OutcomeCircuitOpen && !a.Counted {
-				foundUncountedCircuitOpen = true
-			}
+			assert.NotEqual(t, deferredID, a.NotificationID, "no attempt row while the circuit is open")
 		}
-		assert.True(t, foundUncountedCircuitOpen)
+		assert.Equal(t, int32(10), providerCalls.Load())
+		queued, err := mr.List(queue.Key(domain.ChannelSMS, domain.PriorityHigh))
+		require.NoError(t, err)
+		assert.Contains(t, queued, deferredID.String(), "the item waits in its Redis queue")
 
 		// Switch provider healthy; 3+ requests after CBOpenTimeout probe half-open and close circuit.
 		return202.Store(true)
@@ -405,7 +405,10 @@ func TestWorkerCircuitBreakerIntegrationAndMaxDeferrals(t *testing.T) {
 			Queue:       q,
 			RateLimiter: noopLimiter{},
 			Sender:      sender,
-			Breaker:     breaker,
+			// blindBreaker hides Open, reproducing the race in which the breaker opens between the
+			// consumer's skip check and Execute: the claimed row must then be deferred and, past
+			// MAX_CIRCUIT_DEFERRALS, failed.
+			Breaker: blindBreaker{breaker},
 		})
 		require.NoError(t, err)
 		require.NoError(t, q.Enqueue(t.Context(), queue.Meta{ID: id, Channel: domain.ChannelSMS, Priority: domain.PriorityNormal}))
@@ -422,3 +425,6 @@ func TestWorkerCircuitBreakerIntegrationAndMaxDeferrals(t *testing.T) {
 		assert.Equal(t, []string{id.String()}, dlq)
 	})
 }
+
+// blindBreaker exposes only Execute, so the worker cannot see that the circuit is open before claiming.
+type blindBreaker struct{ worker.Breaker }

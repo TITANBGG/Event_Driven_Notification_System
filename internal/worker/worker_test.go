@@ -31,6 +31,10 @@ type memWorkerStore struct {
 	// markSentErrs makes the next N MarkSent calls fail with a transient (non-lease) DB error.
 	markSentErrs int
 	markSentHits int
+	// leaseExtensions counts ExtendLease calls; reclaimBeforeExtend makes the next one find the
+	// row already reclaimed by the reconciler.
+	leaseExtensions     int
+	reclaimBeforeExtend bool
 }
 
 func newMemWorkerStore() *memWorkerStore {
@@ -108,6 +112,26 @@ func (s *memWorkerStore) ScheduleRetry(_ context.Context, id uuid.UUID, claimedA
 	s.rows[id] = n
 	cp := n
 	return &cp, nil
+}
+
+func (s *memWorkerStore) ExtendLease(_ context.Context, id uuid.UUID, claimedAttempts int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.leaseExtensions++
+	n, ok := s.rows[id]
+	if s.leaseLos || !ok || n.Status != domain.StatusProcessing || n.Attempts != claimedAttempts {
+		return domain.ErrLeaseLost
+	}
+	if s.reclaimBeforeExtend {
+		// Simulates the reconciler resetting the row while the worker waited for its token.
+		n.Status = domain.StatusPending
+		s.rows[id] = n
+		return domain.ErrLeaseLost
+	}
+	now := time.Now().UTC()
+	n.ProcessingStartedAt = &now
+	s.rows[id] = n
+	return nil
 }
 
 func (s *memWorkerStore) DeferCircuitOpen(_ context.Context, id uuid.UUID, claimedAttempts int, nextAttemptAt time.Time, lastError string) (*domain.Notification, error) {

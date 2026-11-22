@@ -41,6 +41,7 @@ var (
 	requeueIDsScript   = mustLoadScript("requeue_ids.lua")
 	moveDueScript      = mustLoadScript("move_due.lua")
 	unlockScript       = mustLoadScript("unlock.lua")
+	extendLockScript   = mustLoadScript("extend_lock.lua")
 )
 
 var weightedSlotSchedule = [10]domain.Priority{
@@ -94,8 +95,8 @@ func PriorityOrderForSlot(slot int) [3]domain.Priority {
 }
 
 // NewClient constructs a configured *redis.Client matching pool size and timeout bounds.
-func NewClient(addr string, poolSize int) *redis.Client {
-	opts := &redis.Options{
+func NewClient(addr string, poolSize int, opts ...ClientOption) *redis.Client {
+	o := &redis.Options{
 		Addr:         addr,
 		PoolSize:     poolSize,
 		DialTimeout:  5 * time.Second,
@@ -103,7 +104,20 @@ func NewClient(addr string, poolSize int) *redis.Client {
 		WriteTimeout: 3 * time.Second,
 		PoolTimeout:  4 * time.Second,
 	}
-	return redis.NewClient(opts)
+	for _, opt := range opts {
+		if opt != nil {
+			opt(o)
+		}
+	}
+	return redis.NewClient(o)
+}
+
+// ClientOption customizes the Redis client built by NewClient.
+type ClientOption func(*redis.Options)
+
+// WithPassword authenticates every connection (Redis AUTH / requirepass). Empty means no AUTH.
+func WithPassword(password string) ClientOption {
+	return func(o *redis.Options) { o.Password = password }
 }
 
 // Queue manages Redis priority queues, per-worker inflight lists, delayed scheduling, and DLQ operations.
@@ -614,6 +628,22 @@ func (q *Queue) ReleaseReconcilerLock(ctx context.Context, owner string) (bool, 
 			return false, nil
 		}
 		return false, fmt.Errorf("releasing reconciler lock: %w", err)
+	}
+	return res == 1, nil
+}
+
+// ExtendReconcilerLock resets the reconciler lease TTL if owner still holds it. false means the lease
+// expired and possibly belongs to another replica now: the caller must stop its cycle.
+func (q *Queue) ExtendReconcilerLock(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+	if q.rdb == nil {
+		return false, errors.New("redis client is nil")
+	}
+	if owner == "" {
+		return false, errors.New("lock owner must not be empty")
+	}
+	res, err := extendLockScript.Run(ctx, q.rdb, []string{ReconcilerLockKey}, owner, ttl.Milliseconds()).Int64()
+	if err != nil {
+		return false, fmt.Errorf("extending reconciler lock: %w", err)
 	}
 	return res == 1, nil
 }

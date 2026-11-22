@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"time"
 
@@ -25,7 +26,8 @@ const (
 )
 
 // transientBreakerError carries a transient provider Result back through gobreaker so only
-// transient failures count against circuit health while permanent 4xx errors count as successes.
+// transient failures count against circuit health while permanent 4xx errors and 429 throttling
+// (a healthy provider asking us to slow down) count as successes.
 type transientBreakerError struct {
 	res provider.Result
 }
@@ -169,7 +171,7 @@ func (b *ChannelBreaker) Execute(ch domain.Channel, fn func() (provider.Result, 
 			// Send only returns a non-nil error when the caller's own context was cancelled.
 			return out, abortedCallError{err: callErr}
 		}
-		if out.Outcome == provider.OutcomeTransient {
+		if out.Outcome == provider.OutcomeTransient || isProviderAuthRejection(out) {
 			return out, transientBreakerError{res: out}
 		}
 		return out, nil
@@ -190,6 +192,28 @@ func (b *ChannelBreaker) Execute(ch domain.Channel, fn func() (provider.Result, 
 		return res, aborted.err
 	}
 	return res, err
+}
+
+// isProviderAuthRejection reports a permanent 401/403/407: our credentials or the provider URL are
+// wrong, which no payload change can fix and which affects every message on the channel. Counting it
+// as a breaker failure opens the circuit after CB_CONSECUTIVE_FAILURES, so only that many messages
+// reach the DLQ before consumers stop dequeuing, instead of the whole queue draining into it.
+// The message outcome itself stays Permanent.
+func isProviderAuthRejection(res provider.Result) bool {
+	if res.Outcome != provider.OutcomePermanent || res.HTTPStatus == nil {
+		return false
+	}
+	switch *res.HTTPStatus {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusProxyAuthRequired:
+		return true
+	}
+	return false
+}
+
+// Open reports whether ch's breaker is open (not half-open). gobreaker moves an expired open state
+// to half-open inside State, so consumers resume probing on their own after CB_OPEN_TIMEOUT.
+func (b *ChannelBreaker) Open(ch domain.Channel) bool {
+	return b.State(ch) == gobreaker.StateOpen
 }
 
 // State returns the current breaker state for ch (StateClosed if unknown).

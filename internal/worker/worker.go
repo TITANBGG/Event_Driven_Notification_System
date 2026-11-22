@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,6 +38,12 @@ const (
 	postSendWriteBudget         = 5 * time.Second
 	postSendWriteBackoffInitial = 100 * time.Millisecond
 	postSendWriteBackoffMax     = time.Second
+
+	// leaseExtendAfterWait: a rate-limit wait longer than this re-arms the row's visibility timeout
+	// before the send, so wait + provider call + post-send writes never add up past the lease.
+	leaseExtendAfterWait = time.Second
+	// publishTimeout bounds a status-event publish so a slow Redis cannot eat into the row's lease.
+	publishTimeout = time.Second
 )
 
 // Deps supplies all dependencies required to construct a Worker.
@@ -76,6 +83,12 @@ type Worker struct {
 	// live item from one stranded in Redis after a failed post-transition write.
 	activeMu sync.Mutex
 	active   map[uuid.UUID]int
+
+	// consumerTicks holds, per consumer goroutine, the wall time (Unix ns) it last started a loop
+	// iteration. An idle consumer ticks at least once per idleBackoffMax; one item takes at most
+	// ~VISIBILITY_TIMEOUT, so a tick older than livenessStallAfter means a consumer is stuck.
+	consumerTicks []atomic.Int64
+	running       atomic.Bool
 }
 
 // New constructs a Worker with safe defaults for optional dependencies.
@@ -130,20 +143,21 @@ func New(deps Deps) (*Worker, error) {
 	}
 
 	return &Worker{
-		cfg:         deps.Config,
-		logger:      logger,
-		store:       deps.Store,
-		queue:       deps.Queue,
-		limiter:     deps.RateLimiter,
-		sender:      deps.Sender,
-		retryPolicy: retryPolicy,
-		breaker:     breaker,
-		reconciler:  deps.Reconciler,
-		publisher:   publisher,
-		hooks:       deps.Hooks,
-		nowFn:       nowFn,
-		jitterFn:    jitterFn,
-		active:      make(map[uuid.UUID]int),
+		cfg:           deps.Config,
+		logger:        logger,
+		store:         deps.Store,
+		queue:         deps.Queue,
+		limiter:       deps.RateLimiter,
+		sender:        deps.Sender,
+		retryPolicy:   retryPolicy,
+		breaker:       breaker,
+		reconciler:    deps.Reconciler,
+		publisher:     publisher,
+		hooks:         deps.Hooks,
+		nowFn:         nowFn,
+		jitterFn:      jitterFn,
+		active:        make(map[uuid.UUID]int),
+		consumerTicks: make([]atomic.Int64, len(consumerChannels)*max(deps.Config.WorkerConcurrency, 0)),
 	}, nil
 }
 
@@ -157,14 +171,18 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer cancelDrain()
 
 	var consumerWg sync.WaitGroup
-	channels := []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}
-	for _, ch := range channels {
+	startTick := w.nowFn().UnixNano()
+	for i := range w.consumerTicks {
+		w.consumerTicks[i].Store(startTick)
+	}
+	w.running.Store(true)
+	for ci, ch := range consumerChannels {
 		for g := 0; g < w.cfg.WorkerConcurrency; g++ {
 			consumerWg.Add(1)
-			go func(channel domain.Channel, slot int) {
+			go func(channel domain.Channel, slot int, tick *atomic.Int64) {
 				defer consumerWg.Done()
-				w.consumerLoop(ctx, drainCtx, channel, slot)
-			}(ch, g)
+				w.consumerLoop(ctx, drainCtx, channel, slot, tick)
+			}(ch, g, &w.consumerTicks[ci*w.cfg.WorkerConcurrency+g])
 		}
 	}
 
@@ -211,6 +229,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		cancelDrain()
 		<-doneCh
 	}
+	w.running.Store(false)
 
 	cleanCtx, cleanCancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownCleanupWait)
 	defer cleanCancel()
@@ -230,12 +249,24 @@ func (w *Worker) Run(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, workerNum int) {
+func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, workerNum int, tick *atomic.Int64) {
 	backoff := idleBackoffInitial
 
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+		tick.Store(w.nowFn().UnixNano())
+
+		// While the channel's breaker is open every claim would only be handed back (Claim, a
+		// circuit_open attempt row and DeferCircuitOpen per item, plus a burnt GCRA token), so leave
+		// the items queued in Redis and look again after the idle backoff.
+		if w.breakerOpen(ch) {
+			if !waitWithContext(ctx, backoff) {
+				return
+			}
+			backoff = min(backoff*2, idleBackoffMax)
+			continue
 		}
 
 		panicked := false
@@ -273,6 +304,40 @@ func (w *Worker) consumerLoop(ctx, drainCtx context.Context, ch domain.Channel, 
 		}
 		backoff = idleBackoffInitial
 	}
+}
+
+func (w *Worker) breakerOpen(ch domain.Channel) bool {
+	sr, ok := w.breaker.(BreakerStateReader)
+	return ok && sr.Open(ch)
+}
+
+// consumerChannels is the fixed order of consumer pools; consumerTicks is indexed by it.
+var consumerChannels = [...]domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}
+
+// livenessStallAfter is how long a consumer may go without starting a loop iteration before Live
+// reports it. One item is bounded by VISIBILITY_TIMEOUT (claim, token budget, provider call and the
+// post-send writes all fit in it), so twice that never flags a slow-but-healthy send.
+func (w *Worker) livenessStallAfter() time.Duration {
+	return max(2*w.cfg.VisibilityTimeout, 30*time.Second)
+}
+
+// Live reports a consumer goroutine that has not made progress for livenessStallAfter (deadlock,
+// a call that ignores its context, a stuck lock). A worker that is not running reports nothing:
+// readiness, not liveness, covers startup, and shutdown is bounded by SHUTDOWN_TIMEOUT.
+func (w *Worker) Live(now time.Time) error {
+	if !w.running.Load() {
+		return nil
+	}
+	limit := w.livenessStallAfter()
+	conc := max(w.cfg.WorkerConcurrency, 1)
+	for i := range w.consumerTicks {
+		last := time.Unix(0, w.consumerTicks[i].Load())
+		if stalled := now.Sub(last); stalled > limit {
+			return fmt.Errorf("consumer %s/%d made no progress for %s (limit %s)",
+				consumerChannels[i/conc], i%conc, stalled.Truncate(time.Second), limit)
+		}
+	}
+	return nil
 }
 
 // processDequeuedItem runs entirely on the drain context: once an item is dequeued, its claim, rate-limit
@@ -352,9 +417,24 @@ func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel
 	// GC, CPU) let sends bunch up and break the 100/s window (measured 107 in one second with 6 worker
 	// replicas while PostgreSQL refused connections). The wait is bounded so a claimed row is never
 	// held past its lease; on timeout or limiter outage the claim is handed back without burning an attempt.
+	waitStart := w.nowFn()
 	if !w.waitForSendToken(itemDrainCtx, attemptLogger, tracer, baseAttrs, ch) {
 		w.releaseUnsentClaim(itemDrainCtx, attemptLogger, n, meta, "rate limiter unavailable before send")
 		return
+	}
+	// A long token wait used part of the lease. Re-arm it (fenced on the claimed attempt) before the
+	// send; if the reconciler already reclaimed the row, do not send at all: another worker owns it,
+	// and sending here would be exactly the duplicate the fence exists to prevent.
+	if w.nowFn().Sub(waitStart) > leaseExtendAfterWait {
+		if extErr := w.store.ExtendLease(itemDrainCtx, n.ID, n.Attempts); extErr != nil {
+			if errors.Is(extErr, domain.ErrLeaseLost) {
+				w.handleFencedError(itemDrainCtx, attemptLogger, n.ID, "ExtendLease", extErr)
+				return
+			}
+			// A DB error here is not fatal: the token budget alone still keeps the send inside the lease.
+			attemptLogger.Warn("failed extending lease after rate-limit wait; sending within the original lease",
+				slog.String("error", extErr.Error()))
+		}
 	}
 
 	startedAt := w.nowFn()
@@ -380,6 +460,7 @@ func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel
 		sendSpan.SetStatus(codes.Error, sendErr.Error())
 		sendSpan.End()
 		attemptLogger.Warn("provider execution aborted by context cancellation", slog.String("error", sendErr.Error()))
+		w.recordAbortedSend(itemDrainCtx, attemptLogger, ch, n, meta, startedAt)
 		return
 	}
 	if res.HTTPStatus != nil {
@@ -402,9 +483,10 @@ func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel
 	attemptErr := errorStringPtr(res.Err)
 	durationMS := int(res.Duration.Milliseconds())
 	attempt := domain.DeliveryAttempt{
-		NotificationID:    n.ID,
-		AttemptNo:         n.Attempts,
-		Counted:           true,
+		NotificationID: n.ID,
+		AttemptNo:      n.Attempts,
+		// A 429 is not counted: the provider rejected the rate, not the message.
+		Counted:           res.Outcome != provider.OutcomeThrottled,
 		StartedAt:         startedAt,
 		DurationMS:        durationMS,
 		HTTPStatus:        res.HTTPStatus,
@@ -458,6 +540,9 @@ func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel
 	case provider.OutcomeTransient:
 		w.handleTransientOutcome(itemDrainCtx, attemptLogger, ch, n, meta, res, attemptErr, durationMS)
 
+	case provider.OutcomeThrottled:
+		w.handleThrottled(itemDrainCtx, attemptLogger, ch, n, meta, res, attemptErr, durationMS)
+
 	default:
 		w.failNotification(
 			itemDrainCtx,
@@ -472,6 +557,32 @@ func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel
 			meta.CorrelationID,
 		)
 	}
+}
+
+// abortedSendMessage is recorded when SHUTDOWN_TIMEOUT cancels a send already in flight.
+const abortedSendMessage = "send aborted by worker shutdown; provider outcome unknown"
+
+// recordAbortedSend writes what happened to a send cancelled by the shutdown timeout. Without it the
+// row stayed in processing with no attempt row until the reconciler reset it after VISIBILITY_TIMEOUT.
+// The request may already have reached the provider, so it counts as an attempt and is retried like a
+// transient failure (same Idempotency-Key), on a context that survives the cancelled drain context.
+func (w *Worker) recordAbortedSend(ctx context.Context, logger *slog.Logger, ch domain.Channel, n *domain.Notification, meta *queue.Meta, startedAt time.Time) {
+	writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownCleanupWait)
+	defer cancel()
+	msg := abortedSendMessage
+	if _, err := w.store.InsertAttempt(writeCtx, domain.DeliveryAttempt{
+		NotificationID: n.ID,
+		AttemptNo:      n.Attempts,
+		Counted:        true,
+		StartedAt:      startedAt,
+		DurationMS:     int(max(w.nowFn().Sub(startedAt), 0).Milliseconds()),
+		Outcome:        domain.OutcomeTransient,
+		Error:          &msg,
+		WorkerID:       &w.cfg.WorkerID,
+	}); err != nil {
+		logger.Warn("failed recording aborted send attempt", slog.String("error", err.Error()))
+	}
+	w.handleTransientOutcome(writeCtx, logger, ch, n, meta, provider.Result{Outcome: provider.OutcomeTransient}, &msg, 0)
 }
 
 func (w *Worker) handleCircuitOpen(
@@ -525,6 +636,50 @@ func (w *Worker) handleCircuitOpen(
 	logger.Warn("notification deferred while circuit breaker is open",
 		slog.String("outcome", domain.OutcomeCircuitOpen.String()),
 		slog.Int("duration_ms", 0),
+		slog.Int("deferrals", updated.Deferrals),
+		slog.Time("next_attempt_at", nextAt),
+	)
+}
+
+// handleThrottled defers a 429 like an open circuit: the fenced DeferCircuitOpen transition gives the
+// attempt back (attempts-1, deferrals+1), so a long throttling period cannot exhaust MAX_ATTEMPTS and
+// push healthy messages into the DLQ. The delay grows with consecutive deferrals (full-jitter
+// exponential backoff, at least Retry-After) and MAX_CIRCUIT_DEFERRALS still bounds the total wait.
+func (w *Worker) handleThrottled(
+	drainCtx context.Context,
+	logger *slog.Logger,
+	ch domain.Channel,
+	n *domain.Notification,
+	meta *queue.Meta,
+	res provider.Result,
+	attemptErr *string,
+	durationMS int,
+) {
+	errText := errorStringValue(attemptErr, "provider throttled the request (429)")
+	if n.Deferrals+1 > w.cfg.MaxCircuitDeferral {
+		w.failNotification(drainCtx, logger, ch, n.ID, n.Attempts, "provider throttled too long: "+errText,
+			"throttled_exhausted", domain.OutcomeTransient, durationMS, meta.CorrelationID)
+		return
+	}
+	delay := w.retryPolicy.NextDelay(n.Deferrals+1, res.RetryAfter)
+	nextAt := w.nowFn().Add(delay)
+	updated, err := w.store.DeferCircuitOpen(drainCtx, n.ID, n.Attempts, nextAt, errText)
+	if err != nil {
+		w.handleFencedError(drainCtx, logger, n.ID, "DeferCircuitOpen", err)
+		return
+	}
+	if schedErr := w.queue.Schedule(drainCtx, metaFromNotification(updated, meta), nextAt, w.cfg.WorkerID); schedErr != nil {
+		logger.Warn("failed scheduling throttled notification", slog.String("error", schedErr.Error()))
+	}
+	w.publishEvent(drainCtx, logger, *updated, meta.CorrelationID)
+	w.emitProcessed(ch, domain.StatusRetrying)
+	if w.hooks.OnRetryScheduled != nil {
+		w.hooks.OnRetryScheduled(ch)
+	}
+	logger.Warn("provider throttled; notification deferred without using an attempt",
+		slog.String("outcome", string(provider.OutcomeThrottled)),
+		slog.Int("duration_ms", durationMS),
+		slog.Duration("delay", delay),
 		slog.Int("deferrals", updated.Deferrals),
 		slog.Time("next_attempt_at", nextAt),
 	)
@@ -634,6 +789,9 @@ func (w *Worker) publishEvent(ctx context.Context, logger *slog.Logger, n domain
 	if w.publisher == nil {
 		return
 	}
+	// Best effort and bounded: the publish after Claim runs inside the row's lease.
+	ctx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
 	if err := w.publisher.Publish(ctx, realtime.NewEvent(n, w.nowFn(), correlationID)); err != nil {
 		logger.Warn("failed publishing realtime status event", slog.String("error", err.Error()))
 	}

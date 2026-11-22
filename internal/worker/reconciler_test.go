@@ -328,7 +328,7 @@ func TestDistributedReconcilerAllRecoveryStepsAndLock(t *testing.T) {
 	gotFail := store.get(abandonedFail.ID)
 	assert.Equal(t, domain.StatusFailed, gotFail.Status)
 	require.NotNil(t, gotFail.LastError)
-	assert.Equal(t, "visibility timeout; worker presumed dead", *gotFail.LastError)
+	assert.Equal(t, "delivery outcome unknown: worker died during the final attempt (visibility timeout)", *gotFail.LastError)
 	dlq, err := mr.List(queue.DLQListKey)
 	require.NoError(t, err)
 	assert.Equal(t, []string{abandonedFail.ID.String()}, dlq)

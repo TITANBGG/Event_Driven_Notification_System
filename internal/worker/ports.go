@@ -23,6 +23,8 @@ type Store interface {
 	DeferCircuitOpen(ctx context.Context, id uuid.UUID, claimedAttempts int, nextAttemptAt time.Time, lastError string) (*domain.Notification, error)
 	MarkFailed(ctx context.Context, id uuid.UUID, claimedAttempts int, lastError string) (*domain.Notification, error)
 	InsertAttempt(ctx context.Context, a domain.DeliveryAttempt) (*domain.DeliveryAttempt, error)
+	// ExtendLease restarts the visibility timeout of a claimed row (fenced); ErrLeaseLost if reclaimed.
+	ExtendLease(ctx context.Context, id uuid.UUID, claimedAttempts int) error
 }
 
 // Queue defines the Redis queue operations consumed by worker consumers, heartbeat, and delayed mover.
@@ -65,6 +67,12 @@ func (NoopRetryPolicy) NextDelay(_ int, _ *time.Duration) time.Duration {
 // Breaker shields the worker pool from unhealthy provider endpoints (implemented with gobreaker in Phase 5).
 type Breaker interface {
 	Execute(ch domain.Channel, fn func() (provider.Result, error)) (provider.Result, error)
+}
+
+// BreakerStateReader is an optional Breaker capability: when the breaker of a channel is open, the
+// consumer leaves items in Redis instead of claiming them only to defer them again.
+type BreakerStateReader interface {
+	Open(ch domain.Channel) bool
 }
 
 // NoopBreaker passes every send straight through until Phase 5 attaches sony/gobreaker.

@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,6 +80,7 @@ func runExtendedScenarios(t *testing.T, inf *testInfra) {
 		inf.resetState(t)
 		inf.provider.setForceStatus(http.StatusServiceUnavailable)
 
+		var breakerOpened atomic.Bool
 		stopWorker := inf.startWorkerWithDeps(t, func(c *config.Config) {
 			c.WorkerConcurrency = 2
 			c.CBConsecutiveFail = 3
@@ -88,6 +90,15 @@ func runExtendedScenarios(t *testing.T, inf *testInfra) {
 		}, 500, 10, func(d *worker.Deps) {
 			// Zero jitter: circuit deferrals land exactly CB_OPEN_TIMEOUT later (production adds up to 5s).
 			d.Jitter = func(time.Duration) time.Duration { return 0 }
+			d.Breaker = worker.NewChannelBreaker(worker.ChannelBreakerConfig{
+				Config: d.Config,
+				Logger: d.Logger,
+				OnStateChange: func(ch domain.Channel, _, to string) {
+					if ch == domain.ChannelSMS && to == "open" {
+						breakerOpened.Store(true)
+					}
+				},
+			})
 		})
 		defer stopWorker()
 
@@ -96,13 +107,9 @@ func runExtendedScenarios(t *testing.T, inf *testInfra) {
 			map[string]any{"notifications": smsBatchItems(10, 8100000, "Outage")}, &batch)
 		require.Equal(t, http.StatusAccepted, code)
 
-		// The breaker must open: deferrals are recorded as circuit_open attempts that do not count.
-		require.Eventually(t, func() bool {
-			var deferred int
-			_ = inf.pool.QueryRow(t.Context(), `SELECT count(*) FROM delivery_attempts a JOIN notifications n ON n.id = a.notification_id
-				WHERE n.batch_id = $1 AND a.outcome = 'circuit_open'`, batch.BatchID).Scan(&deferred)
-			return deferred >= 10
-		}, 10*time.Second, 25*time.Millisecond)
+		// While open, consumers pause dequeuing so remaining items stay queued in Redis instead of
+		// cycling through Claim/DeferCircuitOpen; only items already in flight hit ErrCircuitOpen.
+		require.Eventually(t, breakerOpened.Load, 10*time.Second, 20*time.Millisecond)
 
 		var countedCircuitOpen int
 		require.NoError(t, inf.pool.QueryRow(t.Context(), `SELECT count(*) FROM delivery_attempts

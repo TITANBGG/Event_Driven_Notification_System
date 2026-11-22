@@ -95,7 +95,7 @@ func run() error {
 		return pingErr
 	}
 
-	rdb := queue.NewClient(cfg.RedisAddr, cfg.RedisPoolSize)
+	rdb := queue.NewClient(cfg.RedisAddr, cfg.RedisPoolSize, queue.WithPassword(cfg.RedisPassword))
 	defer func() {
 		if closeErr := rdb.Close(); closeErr != nil {
 			logger.Warn("failed closing redis client", slog.String("error", closeErr.Error()))
@@ -201,8 +201,15 @@ func run() error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, _ *http.Request) {
-		writeProbeJSON(w, logger, http.StatusOK, map[string]string{"status": "ok"})
+	// Liveness fails when a consumer goroutine is stuck, so Docker/Kubernetes restarts a wedged
+	// worker instead of reporting it healthy forever.
+	mux.HandleFunc("GET /health/live", func(rw http.ResponseWriter, _ *http.Request) {
+		if liveErr := w.Live(time.Now().UTC()); liveErr != nil {
+			logger.Error("worker liveness check failed", slog.String("error", liveErr.Error()))
+			writeProbeJSON(rw, logger, http.StatusServiceUnavailable, map[string]string{"status": "stalled", "error": liveErr.Error()})
+			return
+		}
+		writeProbeJSON(rw, logger, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	readyHandler := func(w http.ResponseWriter, r *http.Request) {
 		checkReady(r.Context(), w, logger, store, q)

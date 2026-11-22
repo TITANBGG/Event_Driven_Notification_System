@@ -39,6 +39,11 @@ func HeartbeatKey(workerID string) string {
 	return HeartbeatPrefix + workerID
 }
 
+// APIRateLimitKey returns the per-API-key redis_rate GCRA key used by the API's request limiter.
+func APIRateLimitKey(name string) string {
+	return RateLimitPrefix + "api:" + name
+}
+
 // RateLimitKey returns the per-channel redis_rate GCRA key.
 func RateLimitKey(ch domain.Channel) string {
 	return RateLimitPrefix + ch.String()

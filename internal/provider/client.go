@@ -36,6 +36,9 @@ const (
 	OutcomeSent      OutcomeKind = "sent"
 	OutcomeTransient OutcomeKind = "transient"
 	OutcomePermanent OutcomeKind = "permanent"
+	// OutcomeThrottled is a 429: the provider is healthy but asks us to slow down. The message itself
+	// is fine, so the worker defers it without using an attempt (see Worker.handleThrottled).
+	OutcomeThrottled OutcomeKind = "throttled"
 )
 
 // Result summarizes the outcome, latency, HTTP status, and parsed metadata of one provider call.
@@ -230,7 +233,17 @@ func (c *Client) Send(ctx context.Context, n domain.Notification) (Result, error
 		}, nil
 	}
 
-	if status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests {
+	if status == http.StatusTooManyRequests {
+		return Result{
+			Outcome:    OutcomeThrottled,
+			HTTPStatus: statusPtr,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After"), c.nowFn()),
+			Duration:   elapsed,
+			Err:        fmt.Errorf("provider throttled the request with HTTP %d", status),
+		}, nil
+	}
+
+	if status == http.StatusRequestTimeout || status == http.StatusTooEarly {
 		return Result{
 			Outcome:    OutcomeTransient,
 			HTTPStatus: statusPtr,
