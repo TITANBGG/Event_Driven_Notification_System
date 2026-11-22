@@ -8,6 +8,12 @@ info:
     (max 100 sends/s per channel, weighted high/normal/low priority, retries with full-jitter backoff,
     per-channel circuit breaker, dead-letter queue and manual retry).
 
+    **Authentication**
+    - When `API_KEYS` is configured, every `/api/v1` operation needs `Authorization: Bearer <api key>`; each operation
+      names its required scope (`read`, `write`, `admin`) in `x-required-scope`. Missing/invalid key: `401 unauthorized`;
+      valid key without the scope: `403 forbidden`. Health probes, `/metrics`, `/openapi.yaml` and `/demo` stay public.
+      In Swagger UI use **Authorize** with the local key `local-dev-key-change-me`.
+
     **Conventions**
     - JSON uses camelCase; timestamps are RFC3339 UTC; IDs are UUIDv7. Unknown JSON fields are rejected (`400`).
     - `X-Correlation-ID` is accepted on every request (or generated) and echoed in the response header and in
@@ -22,7 +28,7 @@ info:
     `payload_too_large`, `validation_failed`, `batch_too_large`, `invalid_uuid`, `invalid_channel`, `invalid_cursor`,
     `not_found`, `invalid_transition`, `idempotency_conflict`, `item_idempotency_key_exists`, `duplicate_idempotency_key`,
     `template_not_found`, `missing_variable`, `not_cancellable`, `not_retryable`, `template_name_exists`,
-    `missing_ws_filter`, `upgrade_required`, `forbidden_origin`, `too_many_ws_clients`, `method_not_allowed`,
+    `missing_ws_filter`, `upgrade_required`, `unauthorized`, `forbidden`, `forbidden_origin`, `too_many_ws_clients`, `method_not_allowed`,
     `request_timeout`, `service_unavailable`, `internal_error`. Field-level problems are listed in `error.details[]`
     with dot/bracket paths such as `notifications[3].recipient`.
   license:
@@ -31,7 +37,8 @@ info:
 servers:
   - url: http://localhost:8080
     description: Local API server
-security: []
+security:
+  - bearerAuth: []
 
 tags:
   - name: System
@@ -49,6 +56,7 @@ paths:
   /health/live:
     get:
       operationId: getHealthLive
+      security: []
       tags: [System]
       summary: Liveness probe
       description: Returns 200 OK when the API process is running and serving HTTP requests.
@@ -68,6 +76,7 @@ paths:
   /openapi.yaml:
     get:
       operationId: getOpenAPISpec
+      security: []
       tags: [System]
       summary: Download OpenAPI specification
       description: Serves the embedded OpenAPI 3.0.3 YAML document.
@@ -85,6 +94,7 @@ paths:
   /demo:
     get:
       operationId: getDemoDashboard
+      security: []
       tags: [Realtime]
       summary: Interactive live WebSocket demo dashboard
       description: Serves a single-page HTML dashboard (`go:embed`) that creates notification batches and streams live status updates over `GET /api/v1/ws`.
@@ -99,6 +109,7 @@ paths:
   /api/v1/notifications:
     post:
       operationId: createNotification
+      x-required-scope: write
       tags: [Notifications]
       summary: Create a single notification
       description: |
@@ -146,6 +157,10 @@ paths:
                   priority: high
                   scheduledAt: "2026-11-21T15:30:00+03:00"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "202":
           description: Notification accepted for asynchronous delivery (or replayed via Idempotency-Key)
           headers:
@@ -193,6 +208,7 @@ paths:
 
     get:
       operationId: listNotifications
+      x-required-scope: read
       tags: [Notifications]
       summary: List notifications with filters and keyset pagination
       parameters:
@@ -239,6 +255,10 @@ paths:
             maximum: 200
             default: 50
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated list of notifications ordered newest first
           headers:
@@ -260,6 +280,7 @@ paths:
   /api/v1/notifications/batch:
     post:
       operationId: createBatch
+      x-required-scope: write
       tags: [Notifications]
       summary: Create a batch of notifications (up to 1000 items, all-or-nothing)
       parameters:
@@ -304,6 +325,10 @@ paths:
                       templateId: 01a1faed-ed53-7075-b03f-819061f52f93
                       templateVariables: {name: "Mehmet", code: "9037"}
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "202":
           description: Batch persisted atomically and queued for delivery
           headers:
@@ -340,12 +365,17 @@ paths:
   /api/v1/notifications/{id}:
     get:
       operationId: getNotification
+      x-required-scope: read
       tags: [Notifications]
       summary: Get notification status and delivery attempts by ID
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
         - $ref: "#/components/parameters/UUIDPathParam"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Notification details with chronological delivery attempts
           headers:
@@ -367,12 +397,17 @@ paths:
   /api/v1/notifications/{id}/cancel:
     post:
       operationId: cancelNotification
+      x-required-scope: write
       tags: [Notifications]
       summary: Cancel a pending, scheduled, or retrying notification
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
         - $ref: "#/components/parameters/UUIDPathParam"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Notification cancelled atomically
           headers:
@@ -396,6 +431,7 @@ paths:
   /api/v1/notifications/{id}/retry:
     post:
       operationId: retryNotification
+      x-required-scope: admin
       tags: [Notifications]
       summary: Manually retry a failed notification (DLQ replay)
       description: Resets attempts and deferrals to 0, clears lastError, transitions status from failed to pending, and re-enqueues.
@@ -403,6 +439,10 @@ paths:
         - $ref: "#/components/parameters/CorrelationIDHeader"
         - $ref: "#/components/parameters/UUIDPathParam"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Notification reset to pending and re-enqueued
           headers:
@@ -426,6 +466,7 @@ paths:
   /api/v1/batches/{id}:
     get:
       operationId: getBatch
+      x-required-scope: read
       tags: [Batches]
       summary: Get batch summary counts and paginated batch items
       parameters:
@@ -443,6 +484,10 @@ paths:
             maximum: 200
             default: 50
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Batch aggregate summary and page of items
           headers:
@@ -466,12 +511,17 @@ paths:
   /api/v1/batches/{id}/cancel:
     post:
       operationId: cancelBatch
+      x-required-scope: write
       tags: [Batches]
       summary: Cancel all cancellable notifications in a batch
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
         - $ref: "#/components/parameters/UUIDPathParam"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Atomic batch cancellation counts
           headers:
@@ -493,6 +543,7 @@ paths:
   /api/v1/templates:
     post:
       operationId: createTemplate
+      x-required-scope: write
       tags: [Templates]
       summary: Create a message template with {{variable}} placeholders
       parameters:
@@ -509,6 +560,10 @@ paths:
               body: "Merhaba {{name}}, doğrulama kodunuz: {{code}}"
               variables: [name, code]
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "201":
           description: Template created
           headers:
@@ -535,6 +590,7 @@ paths:
 
     get:
       operationId: listTemplates
+      x-required-scope: read
       tags: [Templates]
       summary: List active templates with optional channel filter and cursor pagination
       parameters:
@@ -556,6 +612,10 @@ paths:
             maximum: 200
             default: 50
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Paginated list of active templates
           headers:
@@ -577,12 +637,17 @@ paths:
   /api/v1/templates/{id}:
     get:
       operationId: getTemplate
+      x-required-scope: read
       tags: [Templates]
       summary: Get an active template by ID
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
         - $ref: "#/components/parameters/UUIDPathParam"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Template details
           headers:
@@ -603,6 +668,7 @@ paths:
 
     put:
       operationId: updateTemplate
+      x-required-scope: write
       tags: [Templates]
       summary: Update an active template by ID
       parameters:
@@ -615,6 +681,10 @@ paths:
             schema:
               $ref: "#/components/schemas/UpsertTemplateRequest"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Template updated
           headers:
@@ -643,12 +713,17 @@ paths:
 
     delete:
       operationId: deleteTemplate
+      x-required-scope: write
       tags: [Templates]
       summary: Soft-delete a template by ID
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
         - $ref: "#/components/parameters/UUIDPathParam"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "204":
           description: Template soft-deleted
         "400":
@@ -663,6 +738,7 @@ paths:
   /api/v1/templates/{id}/preview:
     post:
       operationId: previewTemplate
+      x-required-scope: read
       tags: [Templates]
       summary: Render a template preview with sample variables and SMS encoding metrics
       parameters:
@@ -679,6 +755,10 @@ paths:
                 name: "Ayşe"
                 code: "4821"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Rendered preview with SMS segmentation info and unused variables list
           headers:
@@ -704,6 +784,7 @@ paths:
   /api/v1/ws:
     get:
       operationId: streamNotificationEventsWS
+      x-required-scope: read
       tags: [Realtime]
       summary: WebSocket stream for real-time notification status transitions
       description: |
@@ -735,6 +816,8 @@ paths:
             type: string
             enum: [sms, email, push]
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "101":
           description: |
             Switching Protocols. OpenAPI 3.0 cannot describe WebSocket frames natively, so the content below documents
@@ -771,7 +854,7 @@ paths:
                   message: at least one filter query parameter (notificationId, batchId, or channel) is required
                 correlationId: 01a1faec-fa8d-7807-bd64-5e7e9125458f
         "403":
-          $ref: "#/components/responses/ForbiddenOrigin"
+          $ref: "#/components/responses/ForbiddenOriginOrScope"
         "426":
           description: "Valid filter but not a WebSocket upgrade request (`Connection: Upgrade` and `Upgrade: websocket` are required)"
           headers:
@@ -800,6 +883,7 @@ paths:
   /health:
     get:
       operationId: getHealth
+      security: []
       tags: [System]
       summary: Dependency readiness alias
       description: Alias for /health/ready checking PostgreSQL and Redis connectivity (1s timeout each).
@@ -825,6 +909,7 @@ paths:
   /health/ready:
     get:
       operationId: getHealthReady
+      security: []
       tags: [System]
       summary: Readiness probe
       description: Pings PostgreSQL and Redis with a 1s timeout each and returns 503 if any fails.
@@ -855,6 +940,7 @@ paths:
   /metrics:
     get:
       operationId: getPrometheusMetrics
+      security: []
       tags: [System]
       summary: Prometheus metrics exposition
       description: Exposes Prometheus text exposition format metrics registered on a dedicated custom Registry.
@@ -869,12 +955,17 @@ paths:
   /api/v1/metrics:
     get:
       operationId: getMetricsSnapshot
+      x-required-scope: read
       tags: [System]
       summary: Real-time JSON observability snapshot
       description: Returns live Redis queue depths, 1m/5m/15m per-channel delivery counts and rates, and 15m p50/p95/p99 latency percentiles (2s cache).
       parameters:
         - $ref: "#/components/parameters/CorrelationIDHeader"
       responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "200":
           description: Metrics snapshot
           headers:
@@ -1525,7 +1616,69 @@ components:
         correlationId:
           type: string
 
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        API key configured in `API_KEYS` (`name:secret:scope1|scope2`), sent as `Authorization: Bearer <secret>`.
+        Each operation lists the scope it needs in `x-required-scope`: `read`, `write` or `admin` (admin implies all).
+        Browsers open the WebSocket with subprotocols `["bearer", "<secret>"]`; the server selects only `bearer`.
+        The local docker compose stack enables the admin key `local-dev-key-change-me`.
   responses:
+    Unauthorized:
+      description: Missing or invalid API key (only when `API_KEYS` is configured)
+      headers:
+        WWW-Authenticate:
+          description: '`Bearer realm="notification-api"`, plus `error="invalid_token"` when a key was sent but not recognized'
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: unauthorized
+              message: "missing API key: send an Authorization: Bearer header"
+            correlationId: 01a1faec-0000-7000-8000-000000000020
+    Forbidden:
+      description: The API key is valid but lacks the scope this operation requires (`x-required-scope`)
+      headers:
+        WWW-Authenticate:
+          description: '`Bearer realm="notification-api", error="insufficient_scope", scope="<scope>"`'
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: forbidden
+              message: "API key lacks the required scope: write"
+            correlationId: 01a1faec-0000-7000-8000-000000000021
+    ForbiddenOriginOrScope:
+      description: |
+        Either the API key lacks the `read` scope (`forbidden`) or the request Origin is not in the allowed
+        WebSocket origins (`forbidden_origin`)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            forbiddenOrigin:
+              value:
+                error:
+                  code: forbidden_origin
+                  message: request origin is not allowed for WebSocket connections
+                correlationId: 01a1faec-0000-7000-8000-000000000019
+            forbiddenScope:
+              value:
+                error:
+                  code: forbidden
+                  message: "API key lacks the required scope: read"
+                correlationId: 01a1faec-0000-7000-8000-000000000022
     MalformedJSON:
       description: Malformed JSON, invalid UTF-8, trailing tokens, or unknown fields
       content:
@@ -1586,17 +1739,6 @@ components:
                   code: malformed_json
                   message: 'malformed JSON request: json: unknown field "foo"'
                 correlationId: 01a1faec-0000-7000-8000-000000000010
-    ForbiddenOrigin:
-      description: Request Origin is not in the allowed WebSocket origins
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: forbidden_origin
-              message: request origin is not allowed for WebSocket connections
-            correlationId: 01a1faec-0000-7000-8000-000000000019
     BadCursor:
       description: Malformed pagination cursor
       content:

@@ -133,6 +133,10 @@
     <div class="card">
       <h2>Dispatch Batch</h2>
       <form id="batchForm">
+        <label for="apiKey">API Key (Bearer; needs read + write scopes, e.g. an admin key)</label>
+        <input id="apiKey" type="password" autocomplete="off" spellcheck="false"
+               placeholder="local stack: local-dev-key-change-me">
+
         <label for="count">Batch Size (N)</label>
         <input id="count" type="number" min="1" max="200" value="20" required>
 
@@ -195,6 +199,27 @@
     const countersEl = document.getElementById('counters');
     const wsStateEl = document.getElementById('wsState');
     const cancelBtn = document.getElementById('cancelBtn');
+    const apiKeyEl = document.getElementById('apiKey');
+
+    // The key is kept per browser tab only (sessionStorage); storage may be unavailable (private
+    // mode, blocked site data), so every access is guarded and the page still works without it.
+    try {
+      const saved = sessionStorage.getItem('notifDemoApiKey');
+      if (saved) apiKeyEl.value = saved;
+    } catch (_) { /* storage unavailable */ }
+    apiKeyEl.addEventListener('change', () => {
+      try { sessionStorage.setItem('notifDemoApiKey', apiKeyEl.value.trim()); } catch (_) { /* storage unavailable */ }
+    });
+
+    function apiKey() {
+      return apiKeyEl.value.trim();
+    }
+
+    function authHeaders(extra) {
+      const h = Object.assign({}, extra || {});
+      if (apiKey()) h['Authorization'] = 'Bearer ' + apiKey();
+      return h;
+    }
 
     function appendLog(msg) {
       const div = document.createElement('div');
@@ -240,7 +265,9 @@
       wsStateEl.textContent = 'WebSocket: connecting...';
       appendLog('Connecting ' + url);
 
-      const ws = new WebSocket(url);
+      // Browsers cannot set Authorization on a WebSocket handshake, so the key travels as the
+      // subprotocol pair ["bearer", key]; the server selects only "bearer" and never echoes the key.
+      const ws = apiKey() ? new WebSocket(url, ['bearer', apiKey()]) : new WebSocket(url);
       activeWS = ws;
 
       ws.onopen = () => {
@@ -318,7 +345,7 @@
       appendLog('POST /api/v1/notifications/batch (' + count + ' ' + ch + ' items)...');
       const res = await fetch('/api/v1/notifications/batch', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ notifications })
       });
       const data = await res.json();
@@ -340,7 +367,8 @@
     cancelBtn.addEventListener('click', async () => {
       if (!activeBatchId) return;
       const res = await fetch('/api/v1/batches/' + encodeURIComponent(activeBatchId) + '/cancel', {
-        method: 'POST'
+        method: 'POST',
+        headers: authHeaders()
       });
       const data = await res.json();
       appendLog('Batch cancel response: ' + JSON.stringify(data));

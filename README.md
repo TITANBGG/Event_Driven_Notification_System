@@ -23,6 +23,7 @@ docker compose up                # API :8080, Swagger UI :8081, live demo :8080/
 - **Each state change is one conditional `UPDATE`.** A cancel racing a worker has exactly one winner, and a stale worker cannot overwrite a newer outcome (fenced on `attempts`).
 - **100 messages/s per channel across all replicas**, enforced by a GCRA limiter in Redis and taken right before each provider call.
 - **Retries with exponential backoff and full jitter** honor `Retry-After`. A circuit breaker per channel stops calls to a failing provider without using up attempts, and failures land in a dead-letter queue with manual replay.
+- **Every `/api/v1` route needs an API key with the right scope** (`read`, `write`, `admin`). The zero-config stack starts with local-dev keys, so it is never open by default ([section 4](#authentication-api-keys-with-scopes)).
 - **Delivery is at-least-once, and the README says so.** Each attempt sends `Idempotency-Key: <notification id>`; [section 5](#5-failure-scenarios) lists the remaining duplicate risks.
 
 **Tested beyond unit tests** ([summary](#test-program-summary)): a 100,000-notification flash sale, a chaos run of 84,000 notifications while workers were killed, Redis was flushed and PostgreSQL was stopped (0 lost), a 64 MB Redis filled past its limit, and a 60-minute soak (898,120 sent, no resource growth). This program found and fixed 12 bugs.
@@ -66,6 +67,8 @@ Both commands were verified from a fresh clone with no `.env`: Docker Compose v5
 ```
 
 To run the whole test suite with only Docker, see [section 10](#10-testing): `./scripts/verify.sh`.
+
+**API key.** Every `/api/v1` request needs `Authorization: Bearer <key>`. The Compose stack enables two local-dev keys: `local-dev-key-change-me` (admin: every scope) and `local-dev-read-key-change-me` (read-only). Use the admin key in Swagger UI (**Authorize**) and on the `/demo` page; the scripts and load tools send it automatically. Replace both with `API_KEYS` (see [section 9](#9-configuration)) anywhere but your own machine.
 
 | What | URL |
 |---|---|
@@ -294,6 +297,20 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Ea
 - **(c)** Reset `processing` rows older than `VISIBILITY_TIMEOUT` (60s) back to `pending`, or to `failed` if their attempts are exhausted, and record an `abandoned` attempt.
 - **(e)** Delete expired idempotency keys.
 
+### Authentication: API keys with scopes
+
+`API_KEYS` lists the clients as `name:secret:scope1|scope2`. A request sends `Authorization: Bearer <secret>`; browsers, which cannot set headers on `new WebSocket(...)`, offer the subprotocols `["bearer", "<secret>"]` and the server selects only `bearer`, so the secret never travels in a URL, a log line or a trace attribute. Each route requires one scope:
+
+| Scope | Routes |
+|---|---|
+| `read` | `GET` notifications, batches and templates, template preview, `/api/v1/ws`, `/api/v1/metrics` |
+| `write` | create (single and batch), cancel (single and batch), create/update/delete templates |
+| `admin` | manual DLQ replay (`POST /notifications/{id}/retry`); implies every other scope |
+
+`read` and `write` are independent on purpose: a producer key that sends notifications cannot list other callers' messages. Health probes, Prometheus `/metrics`, `/openapi.yaml` and `/demo` stay public; the Prometheus scrape is meant to be protected at the network level. A missing or unknown key is `401 unauthorized` (with `WWW-Authenticate`), a key without the scope is `403 forbidden`; both use the standard error envelope and are counted in `http_auth_failures_total{reason}` (`missing`, `invalid`, `forbidden`, never the key name).
+
+Only SHA-256 digests of the secrets are kept in memory, and every lookup compares against all keys with `crypto/subtle.ConstantTimeCompare`, so response time reveals neither which key matched nor how close a guess was. The key name (never the secret) is added to every log line of the request as `api_key_name`. Secrets are 16 to 256 characters from the RFC 7230 token set, which keeps them valid both in a header and as a WebSocket subprotocol. With `API_KEYS` empty the API runs without authentication and logs a warning at startup; `docker-compose.yml` sets local-dev keys so the default stack is never open. There is no tenant model yet: every key sees every notification (see [section 12](#12-known-limitations-and-next-steps)).
+
 ### Other decisions
 
 - **Templates are rendered at create time.** The stored notification contains the exact text that was sent, and later template edits never change notifications already in flight. Templates are soft-deleted. The renderer is a small regex-based `{{variable}}` substitution, not `text/template`: it has no logic and no injection surface, and a missing variable is a `422`.
@@ -374,8 +391,31 @@ The complete contract, with every status code and error example, is in [`api/ope
 
 ```bash
 BASE=http://localhost:8080
+# Local-dev admin key that docker-compose.yml enables; every example below sends it through this wrapper.
+API_KEY=local-dev-key-change-me
+curl() { command curl -H "Authorization: Bearer $API_KEY" "$@"; }
 # Tiny helper so the examples need only curl, grep and cut (no jq).
 json_get() { grep -o "\"$1\":\"[^\"]*\"" | head -n1 | cut -d'"' -f4; }
+```
+
+### Authentication: `401` without a key, `403` without the scope
+
+```bash
+command curl -s -w '\nHTTP %{http_code}\n' "$BASE/api/v1/notifications?limit=1"
+command curl -s -w '\nHTTP %{http_code}\n' -X POST "$BASE/api/v1/notifications" \
+  -H "Authorization: Bearer local-dev-read-key-change-me" -H "Content-Type: application/json" \
+  -d '{"recipient":"+905551234567","channel":"sms","content":"read-only key"}'
+```
+
+Output:
+
+```text
+{"error":{"code":"unauthorized","message":"missing API key: send an Authorization: Bearer header"},"correlationId":"..."}
+
+HTTP 401
+{"error":{"code":"forbidden","message":"API key lacks the required scope: write"},"correlationId":"..."}
+
+HTTP 403
 ```
 
 ### Health probes (`GET /health/live`, `/health/ready`, `/health`) — `FR-4.3`
@@ -1091,7 +1131,7 @@ info:
 GET /demo -> 200 text/html; charset=utf-8
 ```
 
-Swagger UI at http://localhost:8081 renders the same spec, and **Try it out** calls the API on port 8080 (CORS allows that origin):
+Swagger UI at http://localhost:8081 renders the same spec, and **Try it out** calls the API on port 8080 (CORS allows that origin). Click **Authorize** and enter `local-dev-key-change-me` first:
 
 ![Swagger UI listing the System and Notifications endpoints](docs/images/swagger.png)
 
@@ -1223,6 +1263,7 @@ Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so 
 | `IDEMPOTENCY_TTL` | `24h` | TTL for API `idempotency_keys` (`> 0`) |
 | `SCHEDULE_MAX_AHEAD` | `720h` | Maximum future `scheduledAt` horizon (`30` days) |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8081` | Comma-separated allowed CORS origins |
+| `API_KEYS` | *(empty: auth off)*; Compose: `local-dev:local-dev-key-change-me:admin,local-dev-read:local-dev-read-key-change-me:read` | Comma-separated `name:secret:scope1\|scope2` API keys; scopes `read`, `write`, `admin` (admin implies all). Names `^[a-z0-9_-]{1,64}$`, unique; secrets 16..256 token characters, unique. Invalid entries stop the API at startup; empty disables auth with a startup warning |
 | `MAX_WS_CLIENTS` | `1000` | Maximum concurrent WebSocket clients per API replica (`>= 1`); more get `503 too_many_ws_clients` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | OpenTelemetry OTLP HTTP endpoint |
 | `OTEL_SAMPLER_RATIO` | `1.0` | Trace sampling ratio (`[0, 1]`) |
@@ -1706,7 +1747,7 @@ webhook.site's free tier limits the number of requests, so use the mock provider
 
 What is deliberately missing or simplified, and what I would do with more time:
 
-- **No authentication, authorization or multi-tenancy.** Idempotency keys are global. Next steps: API keys or OAuth2 client credentials, a `tenant_id` on every table and key, and per-tenant rate limits.
+- **API keys, but no tenants.** Every `/api/v1` route requires a key with a `read`, `write` or `admin` scope, but there is no tenant model: any key with `read` sees every notification, and idempotency keys are global. Keys are static (changing them means restarting the API) and are not rate limited per key. Next steps: a `tenant_id` on every table and key, keys stored hashed in PostgreSQL with rotation, OAuth2 client credentials for service clients, and per-key rate limits.
 - **`429` burns attempts.** A `429` is a transient error (it honors `Retry-After`) and counts against `MAX_ATTEMPTS` like a `5xx`. In the chaos test, 37 of 76,000 notifications sent while the provider returned `429` for half of all requests used all 5 attempts and went to the DLQ (recoverable with a manual retry). A `429` means "slow down", not "this message is broken", so treating it like an open circuit (deferral without burning an attempt, capped by `MAX_CIRCUIT_DEFERRALS`) would be the better policy for a long throttling period.
 - **Duplicates on provider timeouts.** At-least-once is the honest guarantee. Exactly-once would need a provider that deduplicates on `Idempotency-Key`.
 - **Each replica opens its own PostgreSQL pool.** `DB_MAX_CONNS` (worker default 10) fits 6 worker replicas + the API into PostgreSQL's default 100 connections; beyond that I would put PgBouncer in transaction mode in front of PostgreSQL.
@@ -1755,6 +1796,7 @@ Every item from the assignment, where it is implemented, and how it is tested. "
 | **D-4** | OpenAPI 3.0.3 specification (`api/openapi.yaml`) + Swagger UI (`:8081`) | `api/openapi.yaml`, `api/spec.go` | `internal/api/openapi_test.go` (`TestOpenAPISpecMatchesRouter`), Redocly lint | **DONE** |
 | **D-5** | Versioned database migrations (`migrations/*.up.sql`, `.down.sql`) | `migrations/000001_init.up.sql`, `migrations/000001_init.down.sql`, `migrations/migrations.go` | `TestCoreIntegration` (`golang-migrate`) + Compose `migrate` service + CI `migrations-check` (up -> down -> up) | **DONE** |
 | **D-6** | Single-command test suite (`make test-all` / `go test ./...`) | `Makefile`, `internal/integration/integration_test.go`, `internal/integration/extended_test.go`, `cmd/loadgen` | `go test -race ./...` + `go test -race -tags=integration ./...` (20 scenarios), `make cover`, 10k load test | **DONE** |
+| **Security** | API key authentication + per-route scopes (`read`/`write`/`admin`) on every `/api/v1` route, constant-time key lookup, WebSocket bearer subprotocol (not a requirement in the assignment; added after a security review) | `internal/api/middleware/auth.go`, `internal/api/router.go`, `internal/config/apikeys.go` | `internal/api/middleware/auth_test.go`, `internal/api/auth_test.go` (`TestEveryAPIRouteRequiresAuthentication`), `internal/config/apikeys_test.go`, `scripts/smoke.sh` (401/403) | **DONE** |
 | **Context: burst traffic** | Flash sales / breaking news: absorb bursts without dropping or overrunning the provider | `POST /batch` (1000 items, one `CopyFrom`), Redis queues as buffer, per-channel GCRA limiter | Load test: 10,000 notifications accepted in 287ms (34,787/s), drained at ~95/s/channel with 0 failures; integration `c`, `g` | **DONE** |
 | **Context: intelligent retry** | Retry only what can succeed, back off, protect a failing provider | `internal/provider/client.go` (classification), `internal/worker/retry.go` (full jitter + `Retry-After`), `internal/worker/breaker.go` | `internal/worker/retry_test.go`, `internal/provider/client_test.go`, integration `e`, `n`, `q` | **DONE** |
 | **Context: visibility for internal teams** | Metrics, logs and traces for operators | Prometheus `/metrics` (API + workers), `slog` JSON with `correlation_id`/`trace_id`, OpenTelemetry → Jaeger | `internal/observability/*_test.go`, integration `m`, PromQL queries in section 8 run against Prometheus | **DONE** |

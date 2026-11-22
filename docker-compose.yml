@@ -129,6 +129,9 @@ services:
       SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-15s}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:8081}
       MAX_WS_CLIENTS: ${MAX_WS_CLIENTS:-1000}
+      # Auth is on by default with local-dev keys (admin + read-only) so the zero-config stack is never
+      # open; set API_KEYS (see .env.example) to replace them. API_KEYS= (empty) disables auth.
+      API_KEYS: ${API_KEYS-local-dev:local-dev-key-change-me:admin,local-dev-read:local-dev-read-key-change-me:read}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318}
       OTEL_SAMPLER_RATIO: ${OTEL_SAMPLER_RATIO:-1.0}
       LOG_LEVEL: ${LOG_LEVEL:-info}

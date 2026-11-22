@@ -152,7 +152,7 @@ internal/
   provider/         # HTTP client to external provider + outcome classification
   worker/           # consumer loop, retry policy, circuit breaker, delayed mover, reconciler, heartbeat
   api/              # router, handlers, DTOs, pagination cursor, central error mapping
-  api/middleware/   # recoverer, correlation id, request logger, body limit, timeout, CORS
+  api/middleware/   # recoverer, correlation id, request logger, body limit, timeout, CORS, API key auth + scopes
   template/         # safe template renderer (Phase 9)
   realtime/         # WebSocket hub + Redis pub/sub (Phase 10)
   observability/    # slog logger, Prometheus metrics, OpenTelemetry tracing
@@ -482,6 +482,7 @@ Exposed on a **custom** `prometheus.Registry` (never global default) at `api :80
 - `worker_panics_total` (Counter)
 - `http_requests_total{route, method, code}` (Counter — `route` = chi route pattern, **never** raw URL path)
 - `http_request_duration_seconds{route, method}` (Histogram)
+- `http_auth_failures_total{reason}` (Counter — `reason = missing | invalid | forbidden`, never the key name)
 - `db_pool_acquired_conns`, `db_pool_idle_conns`, `db_pool_total_conns`, `db_pool_max_conns` (Gauge) and `db_pool_empty_acquire_total` (Counter) — `pgxpool.Stat()` read at scrape time, api and worker
 - **Cardinality Rule:** **NEVER** label metrics by `notification_id`, `batch_id`, `recipient`, or `correlation_id`.
 
@@ -533,6 +534,14 @@ Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_c
 
 - **Base Path:** `/api/v1` (except root probes `/health*`, `/metrics`, `/openapi.yaml`, `/demo`).
 - **Conventions:** JSON `camelCase`, timestamps `RFC3339` UTC, IDs `UUIDv7`. Unknown JSON fields rejected (`400`, via `DisallowUnknownFields`). Responses MUST map through explicit public DTOs (never serialize `domain.Notification` directly so internal fields like `processingStartedAt`, `traceparent`, `idempotencyKey`, and `deferrals` stay private).
+
+### Authentication & Authorization (added 2026-11-22 after a security review)
+
+- `API_KEYS` = `name:secret:scope1|scope2,...`; scopes `read`, `write`, `admin` (admin implies all). Empty → auth disabled + startup `WARN`; `docker-compose.yml` sets local-dev keys so the default stack is never open.
+- Clients send `Authorization: Bearer <secret>`; browsers open `/api/v1/ws` with subprotocols `["bearer", "<secret>"]` and the server selects only `bearer` (no query-string tokens).
+- Every `/api/v1` route requires a scope: `read` = GET routes, template preview, `/ws`, `/api/v1/metrics`; `write` = create/cancel/template mutations; `admin` = manual `/retry`. Probes, `/metrics`, `/openapi.yaml`, `/demo` stay public.
+- `401 unauthorized` (+ `WWW-Authenticate`) / `403 forbidden` in the standard error envelope. Only SHA-256 digests of secrets are held; lookup is constant-time over all keys; logs carry `api_key_name`, never the secret.
+- No tenant isolation yet (documented next step).
 
 ### Endpoints
 
@@ -655,6 +664,7 @@ X-Correlation-ID: 7d3c...
 | `IDEMPOTENCY_TTL` | `24h` | Expiration window for API `idempotency_keys` rows |
 | `SCHEDULE_MAX_AHEAD` | `720h` | Maximum future scheduling horizon (`30` days) |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8081` | Comma-separated origins (Swagger UI default) |
+| `API_KEYS` | *(empty = auth off)* | `name:secret:scope1\|scope2` list; scopes `read`/`write`/`admin`; secrets 16..256 RFC 7230 token chars; compose default: local-dev admin + read keys |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | OTLP HTTP collector endpoint (empty disables exporter) |
 | `OTEL_SAMPLER_RATIO` | `1.0` | ParentBased trace sampling ratio |
 | `LOG_LEVEL` | `info` | `debug \| info \| warn \| error` |
