@@ -7,6 +7,40 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+Changes from a technical audit of 1.1.2 (18 findings) and a follow-up review. API contract: 1.2.0.
+
+### Added
+
+- API key authentication on every `/api/v1` route with per-route scopes (`read`, `write`, `admin`),
+  constant-time lookup, a WebSocket bearer subprotocol, `401`/`403` envelopes and
+  `http_auth_failures_total`; `API_KEYS_FILE` with atomic `SIGHUP` rotation.
+- `POST /api/v1/notifications/retry`: bulk DLQ replay (admin) in one fenced `UPDATE ... SKIP LOCKED`.
+- Ingress backpressure (`INGRESS_MAX_QUEUE_DEPTH` → `503 overloaded`) and optional per-key rate
+  limiting (`API_RATE_LIMIT_PER_SEC` → `429 rate_limited`, fails open; on by default in Compose).
+- Optional `METRICS_BEARER_TOKEN` for `/metrics`; Redis `requirepass` (`REDIS_PASSWORD`).
+- `internal/app` use-case layer for the create flows (idempotency transaction, replay, batch).
+
+### Changed
+
+- `429` is deferred without using an attempt and counts as a breaker success; provider
+  `401`/`403`/`407` count as breaker failures; consumers stop dequeuing while their breaker is open.
+- Worker `/health/live` returns `503` when a consumer makes no progress for `2 × VISIBILITY_TIMEOUT`.
+- API `/health/ready` depends on PostgreSQL only (Redis down → `200` `degraded`).
+- The reconciler repairs up to 5 pages per step per cycle and renews its lease between steps.
+- A long rate-limit wait re-arms the row's lease between wait rounds, never between the token and the
+  send (a first version did, and bunched SMS to 103 sends in one second under chaos); a row reclaimed
+  meanwhile is never sent.
+- Compose: `stop_grace_period: 30s`, PostgreSQL and Redis published on `127.0.0.1` only.
+
+### Fixed
+
+- NUL and other control characters are rejected with `422` (they were a `500` from PostgreSQL);
+  email domains must contain a dot.
+- A send cancelled by the shutdown timeout is recorded and rescheduled instead of waiting for the
+  reconciler; a final attempt abandoned by a dead worker is reported as "delivery outcome unknown".
+- Batch item idempotency keys are claimed in one statement; batch cancel no longer re-reads the batch.
+- `/api/v1/metrics` computes one snapshot at a time (single flight) and survives a panic in it.
+
 ## [1.1.2] - 2026-11-22
 
 Repository fixes found while preparing the submission; the service code is unchanged from 1.1.1.

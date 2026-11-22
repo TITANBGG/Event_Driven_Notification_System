@@ -152,6 +152,7 @@ internal/
   ratelimit/        # Redis GCRA limiter per channel
   provider/         # HTTP client to external provider + outcome classification
   worker/           # consumer loop, retry policy, circuit breaker, delayed mover, reconciler, heartbeat
+  app/              # create use cases: idempotency transaction, replay/conflict, batch orchestration (no HTTP)
   api/              # router, handlers, DTOs, pagination cursor, central error mapping
   api/middleware/   # recoverer, correlation id, request logger, body limit, timeout, CORS, API key auth + scopes
   template/         # safe template renderer (Phase 9)
@@ -358,7 +359,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 2. `n, ok := repo.Claim(ctx, id)` (atomically increments `attempts`).
    - If `!ok` (cancelled / already terminal / not due yet) → `queue.Ack` → `continue`.
    - On DB error → `queue.Schedule(id, now+1s, inflight)` (moves the item out of the inflight list and retries it via the delayed mover) → `continue`.
-3. `limiter.Wait(drainCtx, channel)` — acquire the GCRA token **AFTER** `Claim`, immediately before the provider call, so the limiter spaces actual sends (decided 2026-11-21 after a stress test: with the token taken before `Claim`, a DB pool stall bunched sends to 107/s per channel with 6 replicas). The wait is bounded by `VISIBILITY_TIMEOUT - 2*PROVIDER_TIMEOUT - 5s` (≥ 10s with valid config, worst observed wait ~1.5s) so a claimed row is never held past its lease; on timeout or limiter outage the claim is handed back with `repo.DeferCircuitOpen` (`attempts-1`, `deferrals+1`, no attempt burned) + `queue.Schedule(now+1s)`. If the wait took longer than `1s`, `repo.ExtendLease` (fenced `processing_started_at = now()`) re-arms the visibility timeout first; `ErrLeaseLost` there means the reconciler already reclaimed the row → **do not send**, ack and stop (decided 2026-11-22). Status-event publishes are bounded to `1s` so a slow Redis cannot eat the lease.
+3. `limiter.Wait(drainCtx, channel)` — acquire the GCRA token **AFTER** `Claim`, immediately before the provider call, so the limiter spaces actual sends (decided 2026-11-21 after a stress test: with the token taken before `Claim`, a DB pool stall bunched sends to 107/s per channel with 6 replicas). The wait is bounded by `VISIBILITY_TIMEOUT - 2*PROVIDER_TIMEOUT - 5s` (≥ 10s with valid config, worst observed wait ~1.5s) so a claimed row is never held past its lease; on timeout or limiter outage the claim is handed back with `repo.DeferCircuitOpen` (`attempts-1`, `deferrals+1`, no attempt burned) + `queue.Schedule(now+1s)`. The wait runs in `1s` rounds; each round that ends without a token calls `repo.ExtendLease` (fenced `processing_started_at = now()`) **while no token is held**, and `ErrLeaseLost` there means the reconciler already reclaimed the row → **do not send**, ack and stop. Nothing may run between a granted token and the send (decided 2026-11-22: extending after the token bunched sends to 103/s per channel in the chaos test). Status-event publishes are bounded to `1s` so a slow Redis cannot eat the lease.
 4. `outcome := breaker[channel].Execute(provider.Send(sendCtx, n))` (`sendCtx` timeout = `PROVIDER_TIMEOUT`).
 5. `repo.InsertAttempt(...)` — every attempt is recorded in `delivery_attempts`. `InsertAttempt` and `MarkSent` retry non-lease DB errors for up to `5s` (backoff `100ms → 1s`): after the provider accepted a message, a short DB blip must not leave the row in `processing` for the reconciler to re-send.
 6. Outcome dispatch (all DB updates **fenced** on `WHERE id=$1 AND status='processing' AND attempts=$claimedAttempts`):
@@ -671,6 +672,8 @@ X-Correlation-ID: 7d3c...
 | `IDEMPOTENCY_TTL` | `24h` | Expiration window for API `idempotency_keys` rows |
 | `SCHEDULE_MAX_AHEAD` | `720h` | Maximum future scheduling horizon (`30` days) |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8081` | Comma-separated origins (Swagger UI default) |
+| `API_KEYS_FILE` | *(empty)* | Alternative to `API_KEYS`; re-read on `SIGHUP` (atomic swap; invalid/empty file rejected, old keys kept) |
+| `METRICS_BEARER_TOKEN` | *(empty = open)* | Optional bearer token for `/metrics` on API and workers |
 | `API_KEYS` | *(empty = auth off)* | `name:secret:scope1\|scope2` list; scopes `read`/`write`/`admin`; secrets 16..256 RFC 7230 token chars; compose default: local-dev admin + read keys |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | OTLP HTTP collector endpoint (empty disables exporter) |
 | `OTEL_SAMPLER_RATIO` | `1.0` | ParentBased trace sampling ratio |

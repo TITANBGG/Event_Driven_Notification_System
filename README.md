@@ -242,7 +242,7 @@ Each consumer goroutine cycles through a fixed 10-slot schedule `[h,h,h,h,h,h,n,
 
 ### Rate limit: distributed GCRA with `Burst = 1`
 
-Workers acquire a token from `{notif}:rl:{channel}` after they claim a row, immediately before the provider call. The limiter spaces token grants, not sends, so anything between the two (a wait for a database connection, a GC pause) would let sends bunch up. That is what a stress test showed when the token was still taken before the claim: with 6 worker replicas exhausting PostgreSQL connections, the busiest second reached 107 sends per channel. The wait for a token is bounded (`VISIBILITY_TIMEOUT − 2 × PROVIDER_TIMEOUT − 5s`), so a claimed row is never held past its lease; if no token comes in time (Redis down), the claim is handed back with the same "not attempted" transition the circuit breaker uses, and no attempt is burned. A wait longer than 1s also re-arms the lease before the send (fenced `UPDATE processing_started_at = now()`); if that finds the row already reclaimed by the reconciler, the worker does not send at all, so a long wait can no longer turn into a duplicate. The limiter is `Rate = 100/s, Burst = 1`, which spaces consecutive sends at least 10ms apart. Any one-second window therefore contains at most 100 sends, or 101 at an exact boundary. Integration test `g` measured a maximum of 97 sends in any one-second window over 1000 SMS across two workers. If Redis is unavailable, the limiter fails closed: no sends rather than unlimited sends. Concurrency is sized with Little's law: 100 msg/s × 0.3s p99 latency ≈ 30 concurrent sends per channel. Each replica runs 25 goroutines per channel × 2 replicas, which leaves headroom.
+Workers acquire a token from `{notif}:rl:{channel}` after they claim a row, immediately before the provider call. The limiter spaces token grants, not sends, so anything between the two (a wait for a database connection, a GC pause) would let sends bunch up. That is what a stress test showed when the token was still taken before the claim: with 6 worker replicas exhausting PostgreSQL connections, the busiest second reached 107 sends per channel. The wait for a token is bounded (`VISIBILITY_TIMEOUT − 2 × PROVIDER_TIMEOUT − 5s`), so a claimed row is never held past its lease; if no token comes in time (Redis down), the claim is handed back with the same "not attempted" transition the circuit breaker uses, and no attempt is burned. The wait runs in 1s rounds, and each round that ends without a token re-arms the row's lease (fenced `UPDATE processing_started_at = now()`) while no token is held; if that finds the row already reclaimed by the reconciler, the worker does not send at all, so a long wait can no longer turn into a duplicate. Nothing runs between a granted token and the send: a first version extended the lease after the token, and that database round trip bunched SMS sends to 103 in one second during the chaos test's 429 storm. The limiter is `Rate = 100/s, Burst = 1`, which spaces consecutive sends at least 10ms apart. Any one-second window therefore contains at most 100 sends, or 101 at an exact boundary. Integration test `g` measured a maximum of 97 sends in any one-second window over 1000 SMS across two workers. If Redis is unavailable, the limiter fails closed: no sends rather than unlimited sends. Concurrency is sized with Little's law: 100 msg/s × 0.3s p99 latency ≈ 30 concurrent sends per channel. Each replica runs 25 goroutines per channel × 2 replicas, which leaves headroom.
 
 ### Retry classification
 
@@ -300,6 +300,8 @@ The reconciler runs every 15s in the worker binary, guarded by a Redis lease tha
 - **(e)** Delete expired idempotency keys.
 
 ### Authentication: API keys with scopes
+
+Keys come from `API_KEYS` or, for rotation without a restart, from `API_KEYS_FILE` (one entry per line): edit the file and send `SIGHUP` to the API (`docker compose kill -s HUP api`). The new set replaces the old one atomically, so a revoked key stops working on the next request; an invalid or empty file is rejected and the previous keys stay active. Per-key rate limiting (`API_RATE_LIMIT_PER_SEC`) is on in `docker-compose.yml` (1000/s per key). The Prometheus `/metrics` endpoints of the API and the workers accept an optional `METRICS_BEARER_TOKEN`.
 
 `API_KEYS` lists the clients as `name:secret:scope1|scope2`. A request sends `Authorization: Bearer <secret>`; browsers, which cannot set headers on `new WebSocket(...)`, offer the subprotocols `["bearer", "<secret>"]` and the server selects only `bearer`, so the secret never travels in a URL, a log line or a trace attribute. Each route requires one scope:
 
@@ -1130,7 +1132,7 @@ Output:
 openapi: 3.0.3
 info:
   title: Event-Driven Notification System API
-  version: 1.1.1
+  version: 1.2.0
 GET /demo -> 200 text/html; charset=utf-8
 ```
 
@@ -1271,7 +1273,9 @@ Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so 
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8081` | Comma-separated allowed CORS origins |
 | `API_KEYS` | *(empty: auth off)*; Compose: `local-dev:local-dev-key-change-me:admin,local-dev-read:local-dev-read-key-change-me:read` | Comma-separated `name:secret:scope1\|scope2` API keys; scopes `read`, `write`, `admin` (admin implies all). Names `^[a-z0-9_-]{1,64}$`, unique; secrets 16..256 token characters, unique. Invalid entries stop the API at startup; empty disables auth with a startup warning |
 | `MAX_WS_CLIENTS` | `1000` | Maximum concurrent WebSocket clients per API replica (`>= 1`); more get `503 too_many_ws_clients` |
-| `API_RATE_LIMIT_PER_SEC` | `0` (off) | Requests per second per API key across all API replicas (Redis GCRA, burst = rate); over it `429 rate_limited` + `Retry-After`; fails open when Redis is down |
+| `API_RATE_LIMIT_PER_SEC` | `0` (off); Compose: `1000` | Requests per second per API key across all API replicas (Redis GCRA, burst = rate); over it `429 rate_limited` + `Retry-After`; fails open when Redis is down |
+| `API_KEYS_FILE` | *(empty)* | File alternative to `API_KEYS` (one `name:secret:scopes` per line, `#` comments); re-read on `SIGHUP`, invalid or empty files are rejected |
+| `METRICS_BEARER_TOKEN` | *(empty: open)* | Bearer token required by `/metrics` on the API and workers (16+ token characters); add it to `deploy/prometheus.yml` when set |
 | `INGRESS_MAX_QUEUE_DEPTH` | `1000000` | Ready-queue backlog at which creates get `503 overloaded` + `Retry-After`; `0` disables the gate |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | OpenTelemetry OTLP HTTP endpoint |
 | `OTEL_SAMPLER_RATIO` | `1.0` | Trace sampling ratio (`[0, 1]`) |
@@ -1506,7 +1510,7 @@ The first version of the script spawned one `curl` per request with `xargs`. On 
 
 ### Chaos under sustained load
 
-`scripts/chaos.sh` (`make chaos`) submits a 1,000-item mixed batch every 5 seconds (~200/s) for 8 minutes while a fixed timeline breaks things, then waits until every accepted notification is terminal and runs `invariants.sh --allow-duplicates` and `ratecheck.sh`. The mock provider's fault profile is switched at runtime (`POST /config`) so its per-key counters survive. Measured on 2026-11-21, 2 workers:
+`scripts/chaos.sh` (`make chaos`) submits a 1,000-item mixed batch every 5 seconds (~200/s) for 8 minutes while a fixed timeline breaks things, then waits until every accepted notification is terminal and runs `invariants.sh --allow-duplicates` and `ratecheck.sh`. The mock provider's fault profile is switched at runtime (`POST /config`) so its per-key counters survive. Measured on 2026-11-22 (after the audit fixes, with `429` deferred without using attempts), 2 workers:
 
 | t | Event |
 |---|---|
@@ -1519,11 +1523,14 @@ The first version of the script spawned one `curl` per request with `xargs`. On 
 
 | Result | |
 |---|---|
-| Accepted | 84,000 notifications (3 of 87 batch requests rejected with `503` while PostgreSQL was down) |
-| Final state | 83,994 `sent`, 6 `failed` (5 × `500`, in the DLQ), **0 lost, 0 stuck**; drained 45s after the load ended |
+| Accepted | 80,000 notifications (2 of 82 batch requests rejected with `503` while PostgreSQL was down) |
+| Final state | 79,998 `sent`, 2 `failed` (5 × `500` each, in the DLQ), **0 lost, 0 stuck**; drained 7s after the load ended |
+| `429` storm | 0 notifications failed because of `429` (the 2026-11-21 run, when a `429` still used an attempt, lost 37 of 76,000 to the DLQ during the same storm) |
 | Rate limit | busiest second 97 per channel, provider total 291 of 300, throughout the chaos |
-| Duplicates | 147 provider calls the system never recorded, from the 3 worker kills (~49 sends in flight per kill), plus 2 notifications recorded as sent twice: one worker died right after recording its attempt, and one send was accepted at the moment PostgreSQL stopped, so the 5s post-send retry could not write it. All share the same `Idempotency-Key` (at-least-once, as documented) |
-| Invariants | all passed; peak queue 17,009, Redis 14 MB, 25 PostgreSQL connections |
+| Duplicates | 31 provider calls the system never recorded, from the 3 worker kills, plus 3 notifications recorded as sent twice (a worker killed after the provider accepted but before its write survived). All share the same `Idempotency-Key` (at-least-once, as documented) |
+| Invariants | all passed; peak queue 4,667, Redis 7.4 MB, 24 PostgreSQL connections |
+
+The first run after the audit fixes failed this test: the busiest second for SMS reached 103. The lease extension of a long rate-limit wait ran *after* the token was granted, and that database round trip between token and send let sends bunch up, the same failure mode as the 107/s finding above. The extension now runs between wait rounds while no token is held, and the rerun above stayed at 97.
 
 Two earlier runs of the same test found infrastructure problems rather than delivery problems. Jaeger's unbounded in-memory storage (see Distributed tracing) filled the Docker VM after a day of load tests and froze Docker Desktop in the middle of a run; after the restart the system recovered on its own, and the 2,357 notifications that were open at the freeze were all delivered within 40 seconds. The chaos script now retries its database queries and keeps its logs when a run fails.
 
@@ -1755,8 +1762,8 @@ webhook.site's free tier limits the number of requests, so use the mock provider
 
 What is deliberately missing or simplified, and what I would do with more time:
 
-- **API keys, but no tenants.** Every `/api/v1` route requires a key with a `read`, `write` or `admin` scope, but there is no tenant model: any key with `read` sees every notification, and idempotency keys are global. Keys are static (changing them means restarting the API) and are not rate limited per key. Next steps: a `tenant_id` on every table and key, keys stored hashed in PostgreSQL with rotation, OAuth2 client credentials for service clients, and per-key rate limits.
-- **`429` throttling shares the deferral budget with the circuit breaker.** Until 2026-11-22 a `429` counted against `MAX_ATTEMPTS` like a `5xx` (in the chaos test 37 of 76,000 notifications sent during a 50% `429` storm used all 5 attempts and went to the DLQ). A `429` is now deferred without using an attempt; the cost is that a provider throttling for longer than `MAX_CIRCUIT_DEFERRALS` deferrals (~1h with backoff capped at `RETRY_CAP`) still fails the message. The chaos numbers in section 10 predate this change.
+- **API keys, but no tenants.** Every `/api/v1` route requires a key with a `read`, `write` or `admin` scope, but there is no tenant model: any key with `read` sees every notification, and idempotency keys are global. Keys live in configuration (`API_KEYS`, or `API_KEYS_FILE` rotated with `SIGHUP`), not in a database with an admin API. Next steps: a `tenant_id` on every table and key, keys stored hashed in PostgreSQL with self-service rotation, and OAuth2 client credentials for service clients.
+- **`429` throttling shares the deferral budget with the circuit breaker.** Until 2026-11-22 a `429` counted against `MAX_ATTEMPTS` like a `5xx` (in the chaos test 37 of 76,000 notifications sent during a 50% `429` storm used all 5 attempts and went to the DLQ). A `429` is now deferred without using an attempt; the cost is that a provider throttling for longer than `MAX_CIRCUIT_DEFERRALS` deferrals still fails the message. Throttle deferrals back off exponentially up to `RETRY_CAP` (5 min), so 120 of them span roughly 4–5 hours on average (an open circuit's 120 deferrals of ~30s are about 1 hour); both kinds share the counter, so a message that already waited out a long outage has less throttling budget left. A separate budget would need its own column.
 - **Duplicates on provider timeouts.** At-least-once is the honest guarantee. Exactly-once would need a provider that deduplicates on `Idempotency-Key`.
 - **Each replica opens its own PostgreSQL pool.** `DB_MAX_CONNS` (worker default 10) fits 6 worker replicas + the API into PostgreSQL's default 100 connections; beyond that I would put PgBouncer in transaction mode in front of PostgreSQL.
 - **Limiter contention at many replicas.** With 6 replicas and 100ms provider latency, 150 senders per channel contend for each 10ms GCRA slot and the effective rate drops to ~86/s (95/s with 2 replicas). The 100/s ceiling holds; a per-channel token dispatcher (one process hands out slots) would recover the unused slots.
@@ -1766,6 +1773,7 @@ What is deliberately missing or simplified, and what I would do with more time:
 - **One Redis instance, one hash slot.** Every key shares the `{notif}` hash tag so each Lua script stays atomic on one slot; on Redis Cluster that means one shard holds all queue state, so Cluster would add failover but no capacity. Sentinel (failover) is the next step; for capacity the tag would become per channel (`{notif:sms}`), which needs `move_due.lua` and `requeue.lua` (they touch several channels) to split their work per channel first.
 - **Keyset pagination can skip a row committed late.** `created_at` defaults to the transaction's start time, so a row inserted by a long transaction (a 1,000-item batch) can become visible after a client already paged past its `created_at`. The window is the transaction's duration (milliseconds to about a second); a client that needs every row (an export) should page by `id` or re-read the first page. Measured on 1,005,259 rows, every list filter combination (including multiple statuses plus a channel) uses an existing composite index and returns in under 0.4 ms, so no extra index was added.
 - **The reconciler replaces a transactional outbox.** A notification whose Redis enqueue fails waits up to `PENDING_STALE_AFTER + RECONCILE_INTERVAL` (45s) for repair. An outbox table with a relay (or CDC) would make that near-instant at the cost of a second write per notification and another process (section 6).
+- **Idle consumers poll.** A blocking pop cannot serve the weighted 6:3:1 multi-list dequeue (Lua scripts cannot block), so an idle replica makes ~75 cheap `EVALSHA` calls per second. A wake-up list with `BLPOP` would remove that, but changes the hottest path in the worker for little gain under load, so it was left as is.
 - **Metrics windows are computed from PostgreSQL** (cached for 2s; one request computes a snapshot at a time and others get the previous one meanwhile, so polls cannot stampede the database). At higher volume they should come from Prometheus recording rules instead.
 - **Templates have no versioning or localization.** Rendering at create time keeps that safe for in-flight messages, but a template history table would help auditing.
 

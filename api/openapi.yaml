@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Event-Driven Notification System API
-  version: 1.1.1
+  version: 1.2.0
   description: |
     Multi-channel (SMS, email, push) notification API. Requests are validated and persisted in PostgreSQL
     (the source of truth), then queued in Redis for asynchronous delivery by stateless workers
@@ -1030,6 +1030,12 @@ paths:
       summary: Prometheus metrics exposition
       description: Exposes Prometheus text exposition format metrics registered on a dedicated custom Registry.
       responses:
+        "401":
+          description: Missing or wrong bearer token (only when `METRICS_BEARER_TOKEN` is set)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "200":
           description: Prometheus metrics scrape output
           content:

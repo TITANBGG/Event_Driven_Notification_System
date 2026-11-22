@@ -9,6 +9,5 @@ api/openapi.yaml:
     - '#/paths/~1demo/get/responses'
     - '#/paths/~1health/get/responses'
     - '#/paths/~1health~1ready/get/responses'
-    - '#/paths/~1metrics/get/responses'
   operation-2xx-response:
     - '#/paths/~1api~1v1~1ws/get/responses'
