@@ -27,18 +27,9 @@ func (h *handler) handleMetricsSnapshot(w http.ResponseWriter, r *http.Request) 
 		}
 		inflight := h.metricsRefresh
 		if inflight == nil {
-			done := make(chan struct{})
-			h.metricsRefresh = done
+			h.metricsRefresh = make(chan struct{})
 			h.metricsMu.Unlock()
-			snapshot, err := h.computeMetricsSnapshot(r)
-			h.metricsMu.Lock()
-			if err == nil {
-				h.metricsCache, h.metricsHasCache = snapshot, true
-				h.metricsExp = h.nowFn().UTC().Add(metricsCacheTTL)
-			}
-			h.metricsRefresh = nil
-			close(done)
-			h.metricsMu.Unlock()
+			snapshot, err := h.refreshMetricsSnapshot(r)
 			if err != nil {
 				writeError(w, r, h.logger, err)
 				return
@@ -62,6 +53,27 @@ func (h *handler) handleMetricsSnapshot(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 	}
+}
+
+// refreshMetricsSnapshot computes the snapshot as the single in-flight refresher. The deferred
+// cleanup runs even if the computation panics (the Recoverer turns that into a 500): otherwise
+// metricsRefresh would never be cleared and every later request would serve a stale snapshot, or
+// wait forever when there is none.
+func (h *handler) refreshMetricsSnapshot(r *http.Request) (snapshot MetricsSnapshotResponse, err error) {
+	ok := false
+	defer func() {
+		h.metricsMu.Lock()
+		if ok {
+			h.metricsCache, h.metricsHasCache = snapshot, true
+			h.metricsExp = h.nowFn().UTC().Add(metricsCacheTTL)
+		}
+		close(h.metricsRefresh)
+		h.metricsRefresh = nil
+		h.metricsMu.Unlock()
+	}()
+	snapshot, err = h.computeMetricsSnapshot(r)
+	ok = err == nil
+	return snapshot, err
 }
 
 func (h *handler) computeMetricsSnapshot(r *http.Request) (MetricsSnapshotResponse, error) {

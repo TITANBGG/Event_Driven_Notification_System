@@ -3,6 +3,7 @@ package api_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -102,10 +103,30 @@ func TestAPIRateLimitPerKey(t *testing.T) {
 	rec := doJSONRequest(t, h, http.MethodGet, "/api/v1/notifications?limit=1", "", bearer(testAdminKey))
 	assert.Equal(t, http.StatusOK, rec.Code)
 
-	// Redis down: the limiter fails open so the DB-first API keeps working.
-	mr.Close()
-	rec = doJSONRequest(t, h, http.MethodGet, "/api/v1/notifications?limit=1", "", bearer(testReadKey))
-	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+// failingLimiter reports a Redis error on every call, as a limiter would while Redis is down.
+// (Closing a real miniredis instead leaves go-redis' background redial goroutine behind for goleak.)
+type failingLimiter struct{}
+
+func (failingLimiter) AllowKey(context.Context, string) (bool, time.Duration, error) {
+	return false, 0, errors.New("dial tcp: connection refused")
+}
+
+// The API limiter fails open: the DB-first API keeps serving while Redis is down.
+func TestAPIRateLimitFailsOpenWhenRedisIsDown(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.LoadFrom(func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	withTestAPIKeys(&cfg)
+	h := api.NewRouter(api.Deps{
+		Config: cfg, Logger: observability.NewLogger("error", &bytes.Buffer{}), Store: newFakeStore(),
+		APIRateLimiter: failingLimiter{},
+	})
+	for i := 0; i < 3; i++ {
+		rec := doJSONRequest(t, h, http.MethodGet, "/api/v1/notifications?limit=1", "", bearer(testReadKey))
+		assert.Equal(t, http.StatusOK, rec.Code)
+	}
 }
 
 // blockingMetricsStore makes the snapshot's first query block until released, to observe concurrency.
@@ -160,4 +181,34 @@ func TestMetricsSnapshotIsComputedOnceForConcurrentRequests(t *testing.T) {
 		assert.Equal(t, http.StatusOK, poll())
 	}
 	assert.Equal(t, int32(2), store.calls.Load(), "one refresh after expiry, then the fresh cache")
+}
+
+// panickingMetricsStore panics on the first snapshot query only.
+type panickingMetricsStore struct {
+	*fakeStore
+	panicked atomic.Bool
+}
+
+func (s *panickingMetricsStore) MetricsWindowCounts(ctx context.Context) ([]repository.MetricsWindowRow, error) {
+	if s.panicked.CompareAndSwap(false, true) {
+		panic("boom while computing the snapshot")
+	}
+	return s.fakeStore.MetricsWindowCounts(ctx)
+}
+
+// A panic inside the single in-flight refresh must not leave the refresh marked as running:
+// the next request recomputes instead of waiting forever.
+func TestMetricsSnapshotRecoversFromAPanickingRefresh(t *testing.T) {
+	t.Parallel()
+	h := routerWith(t, api.Deps{Store: &panickingMetricsStore{fakeStore: newFakeStore()}})
+
+	poll := func() int {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/v1/metrics", nil))
+		return rec.Code
+	}
+	assert.Equal(t, http.StatusInternalServerError, poll(), "the Recoverer answers the panicking request")
+	assert.Equal(t, http.StatusOK, poll(), "the next request computes a fresh snapshot")
 }

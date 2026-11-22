@@ -325,6 +325,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 | `{notif}:dlq` | `LIST` | IDs of failed notifications (`LTRIM 0 99999` caps at `100k`; PostgreSQL keeps full truth) |
 | `{notif}:reconciler:lock` | `STRING` | `SET NX PX 30000` (ensures one reconciler cycle runs across replicas at a time) |
 | `{notif}:rl:{channel}` | `redis_rate` | Managed by `go-redis/redis_rate` GCRA rate limiter |
+| `{notif}:rl:api:{keyName}` | `redis_rate` | Per-API-key request limiter (`API_RATE_LIMIT_PER_SEC`, fails open) |
 | `notif:events` | `PUB/SUB` | Real-time status events channel for WebSocket fan-out (Phase 10) |
 
 ### Embedded Lua Scripts (`internal/queue/lua/*.lua`, `go:embed`, `redis.NewScript`)

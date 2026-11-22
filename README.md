@@ -211,6 +211,7 @@ All keys share the hash tag `{notif}`, so every multi-key Lua script touches a s
 | `{notif}:dlq` | LIST | IDs of failed notifications (capped at 100k; PostgreSQL has the full history) |
 | `{notif}:reconciler:lock` | STRING | `SET NX PX 30000` lease so only one reconciler cycle runs at a time |
 | `{notif}:rl:{channel}` | GCRA | Distributed rate limiter state (`go-redis/redis_rate`) |
+| `{notif}:rl:api:{keyName}` | GCRA | Per-API-key request limiter (only when `API_RATE_LIMIT_PER_SEC > 0`) |
 | `notif:events` | PUB/SUB | Status events fanned out to every API replica's WebSocket hub |
 
 ### Reliable queue: atomic move to an inflight list + heartbeat
