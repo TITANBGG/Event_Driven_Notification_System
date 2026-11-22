@@ -15,6 +15,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	"github.com/TITANBGG/notification-system/internal/api/middleware"
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/realtime"
 )
@@ -109,6 +110,9 @@ func (h *handler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	conn, acceptErr := websocket.Accept(w, r, &websocket.AcceptOptions{
 		OriginPatterns: originPatterns,
+		// Browsers authenticate by offering ["bearer", <token>]; selecting only "bearer" completes the
+		// handshake without echoing the token. Clients that offer nothing get no subprotocol.
+		Subprotocols: []string{middleware.WSAuthSubprotocol},
 	})
 	if acceptErr != nil {
 		return

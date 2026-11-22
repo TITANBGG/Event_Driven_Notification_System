@@ -27,6 +27,7 @@ type Metrics struct {
 
 	httpRequestsTotal   *prometheus.CounterVec
 	httpRequestDuration *prometheus.HistogramVec
+	httpAuthFailures    *prometheus.CounterVec
 
 	queueDepth    *prometheus.GaugeVec
 	delayedDepth  prometheus.Gauge
@@ -105,7 +106,11 @@ func NewMetrics(opts MetricsOptions) *Metrics {
 			Help:    "HTTP request latency distribution in seconds by matched route pattern and method.",
 			Buckets: prometheus.DefBuckets,
 		}, []string{"route", "method"})
-		reg.MustRegister(m.notificationsCreated, m.httpRequestsTotal, m.httpRequestDuration)
+		m.httpAuthFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "http_auth_failures_total",
+			Help: "Total API requests rejected by authentication or authorization, by reason (missing, invalid, forbidden).",
+		}, []string{"reason"})
+		reg.MustRegister(m.notificationsCreated, m.httpRequestsTotal, m.httpRequestDuration, m.httpAuthFailures)
 	}
 
 	if opts.IncludeQueueDepths {
@@ -279,6 +284,14 @@ func (m *Metrics) ObserveHTTPRequest(route, method string, status int, duration 
 	if m.httpRequestDuration != nil {
 		m.httpRequestDuration.WithLabelValues(route, method).Observe(duration.Seconds())
 	}
+}
+
+// IncAuthFailure counts one rejected API request; reason is a fixed low-cardinality value.
+func (m *Metrics) IncAuthFailure(reason string) {
+	if m == nil || m.httpAuthFailures == nil {
+		return
+	}
+	m.httpAuthFailures.WithLabelValues(reason).Inc()
 }
 
 // SetQueueDepth sets queue_depth for channel and priority.

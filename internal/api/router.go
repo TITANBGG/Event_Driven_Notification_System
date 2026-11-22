@@ -107,26 +107,37 @@ func NewRouter(deps Deps) chi.Router {
 	r.Get("/openapi.yaml", h.handleOpenAPISpec)
 	r.Get("/demo", h.handleDemoPage)
 
+	// Probes, the spec, the demo page and the Prometheus scrape stay public (the scrape is protected
+	// at the network level); every /api/v1 route needs an API key once API_KEYS is configured.
+	auth := middleware.NewAuthenticator(h.cfg.APIKeys, h.metrics)
+	read := middleware.RequireScope(auth, config.ScopeRead)
+	write := middleware.RequireScope(auth, config.ScopeWrite)
+	admin := middleware.RequireScope(auth, config.ScopeAdmin)
+
 	r.Route("/api/v1", func(r chi.Router) {
-		r.Post("/notifications", h.handleCreateNotification)
-		r.Post("/notifications/batch", h.handleCreateBatch)
-		r.Get("/notifications", h.handleListNotifications)
-		r.Get("/notifications/{id}", h.handleGetNotification)
-		r.Post("/notifications/{id}/cancel", h.handleCancelNotification)
-		r.Post("/notifications/{id}/retry", h.handleRetryNotification)
+		r.Use(middleware.Authenticate(auth))
 
-		r.Get("/batches/{id}", h.handleGetBatch)
-		r.Post("/batches/{id}/cancel", h.handleCancelBatch)
+		r.With(write).Post("/notifications", h.handleCreateNotification)
+		r.With(write).Post("/notifications/batch", h.handleCreateBatch)
+		r.With(read).Get("/notifications", h.handleListNotifications)
+		r.With(read).Get("/notifications/{id}", h.handleGetNotification)
+		r.With(write).Post("/notifications/{id}/cancel", h.handleCancelNotification)
+		// Manual DLQ replay re-sends a message that already failed, so it is an operator action.
+		r.With(admin).Post("/notifications/{id}/retry", h.handleRetryNotification)
 
-		r.Post("/templates", h.handleCreateTemplate)
-		r.Get("/templates", h.handleListTemplates)
-		r.Get("/templates/{id}", h.handleGetTemplate)
-		r.Put("/templates/{id}", h.handleUpdateTemplate)
-		r.Delete("/templates/{id}", h.handleDeleteTemplate)
-		r.Post("/templates/{id}/preview", h.handlePreviewTemplate)
+		r.With(read).Get("/batches/{id}", h.handleGetBatch)
+		r.With(write).Post("/batches/{id}/cancel", h.handleCancelBatch)
 
-		r.Get("/ws", h.handleWebSocket)
-		r.Get("/metrics", h.handleMetricsSnapshot)
+		r.With(write).Post("/templates", h.handleCreateTemplate)
+		r.With(read).Get("/templates", h.handleListTemplates)
+		r.With(read).Get("/templates/{id}", h.handleGetTemplate)
+		r.With(write).Put("/templates/{id}", h.handleUpdateTemplate)
+		r.With(write).Delete("/templates/{id}", h.handleDeleteTemplate)
+		// Preview renders without persisting anything, so read is enough.
+		r.With(read).Post("/templates/{id}/preview", h.handlePreviewTemplate)
+
+		r.With(read).Get("/ws", h.handleWebSocket)
+		r.With(read).Get("/metrics", h.handleMetricsSnapshot)
 	})
 
 	return r

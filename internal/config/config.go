@@ -61,6 +61,7 @@ type Config struct {
 	IdempotencyTTL     time.Duration
 	ScheduleMaxAhead   time.Duration
 	CORSAllowedOrigins []string
+	APIKeys            []APIKey
 	OTELEndpoint       string
 	OTELSamplerRatio   float64
 	LogLevel           string
@@ -169,6 +170,11 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		}
 	}
 
+	apiKeys, apiKeyErr := parseAPIKeys(getStrAllowEmpty("API_KEYS", ""))
+	if apiKeyErr != nil {
+		parseErrs = append(parseErrs, apiKeyErr)
+	}
+
 	cfg := Config{
 		HTTPAddr:           getStr("HTTP_ADDR", ":8080"),
 		WorkerMetricsAddr:  getStr("WORKER_METRICS_ADDR", ":9091"),
@@ -212,6 +218,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		IdempotencyTTL:     getDuration("IDEMPOTENCY_TTL", 24*time.Hour),
 		ScheduleMaxAhead:   getDuration("SCHEDULE_MAX_AHEAD", 720*time.Hour),
 		CORSAllowedOrigins: parseCSV(getStrAllowEmpty("CORS_ALLOWED_ORIGINS", "http://localhost:8081")),
+		APIKeys:            apiKeys,
 		OTELEndpoint:       getStrAllowEmpty("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4318"),
 		OTELSamplerRatio:   getFloat("OTEL_SAMPLER_RATIO", 1.0),
 		LogLevel:           strings.ToLower(getStr("LOG_LEVEL", "info")),
@@ -369,6 +376,10 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("MAX_CIRCUIT_DEFERRALS (%d) must be >= 1", c.MaxCircuitDeferral))
 	}
 
+	if err := validateAPIKeys(c.APIKeys); err != nil {
+		errs = append(errs, err)
+	}
+
 	if c.OTELSamplerRatio < 0 || c.OTELSamplerRatio > 1 {
 		errs = append(errs, fmt.Errorf("OTEL_SAMPLER_RATIO (%g) must be in [0, 1]", c.OTELSamplerRatio))
 	}
@@ -418,6 +429,8 @@ func (c Config) LogValue() slog.Value {
 		slog.String("reconcile_interval", c.ReconcileInterval.String()),
 		slog.String("shutdown_timeout", c.ShutdownTimeout.String()),
 		slog.Int("batch_max_items", c.BatchMaxItems),
+		slog.Bool("api_auth_enabled", len(c.APIKeys) > 0),
+		slog.Any("api_key_names", apiKeyNames(c.APIKeys)),
 		slog.String("log_level", c.LogLevel),
 	)
 }

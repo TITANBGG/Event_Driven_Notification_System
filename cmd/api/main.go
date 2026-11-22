@@ -92,6 +92,9 @@ func run() error {
 		slog.String("service", "notification-api"),
 	)
 	logger.Info("config loaded", slog.Any("config", cfg))
+	if len(cfg.APIKeys) == 0 {
+		logger.Warn("API authentication disabled: API_KEYS is empty, every /api/v1 route is open to any caller")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
