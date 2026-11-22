@@ -208,3 +208,29 @@ func TestMetricsSnapshotRecoversFromAPanickingRefresh(t *testing.T) {
 	assert.Equal(t, http.StatusInternalServerError, poll(), "the Recoverer answers the panicking request")
 	assert.Equal(t, http.StatusOK, poll(), "the next request computes a fresh snapshot")
 }
+
+// hangingLimiter blocks until its context ends, as a limiter call does while Redis is unreachable
+// (dial timeouts and retries).
+type hangingLimiter struct{}
+
+func (hangingLimiter) AllowKey(ctx context.Context, _ string) (bool, time.Duration, error) {
+	<-ctx.Done()
+	return false, 0, ctx.Err()
+}
+
+// The limiter's Redis call is bounded, so with Redis down a create still answers 202 at once
+// instead of running into the request deadline (it was a 504 in the Redis-down drill).
+func TestAPIRateLimitDoesNotStallRequestsWhenRedisHangs(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.LoadFrom(func(string) (string, bool) { return "", false })
+	require.NoError(t, err)
+	withTestAPIKeys(&cfg)
+	h := api.NewRouter(api.Deps{
+		Config: cfg, Logger: observability.NewLogger("error", &bytes.Buffer{}), Store: newFakeStore(),
+		APIRateLimiter: hangingLimiter{},
+	})
+	start := time.Now()
+	rec := doJSONRequest(t, h, http.MethodPost, "/api/v1/notifications", smsBody, bearer(testWriteKey))
+	assert.Equal(t, http.StatusAccepted, rec.Code)
+	assert.Less(t, time.Since(start), 2*time.Second, "the limiter must not hold the request")
+}

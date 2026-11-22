@@ -19,6 +19,12 @@ type KeyedLimiter interface {
 // anonymousPrincipal is the limiter key when authentication is disabled (all callers share it).
 const anonymousPrincipal = "anonymous"
 
+// limiterTimeout bounds the Redis call of the per-key limiter. With Redis down, go-redis' dial
+// timeouts and retries take seconds, longer than the request deadline, so an unbounded call turned
+// "fail open" into a 504 for every create (Redis-down drill, 2026-11-22). Past this budget the
+// request proceeds, exactly as on any other limiter error.
+const limiterTimeout = 200 * time.Millisecond
+
 // RateLimitByKey limits each API key (the authenticated principal) to the limiter's rate and answers
 // 429 rate_limited with Retry-After beyond it. A nil limiter disables it. A limiter error fails OPEN:
 // unlike the provider-side limiter, this one only protects the API, and the API stays usable
@@ -33,7 +39,9 @@ func RateLimitByKey(limiter KeyedLimiter, logger *slog.Logger) func(http.Handler
 			if p, ok := PrincipalFrom(r.Context()); ok {
 				key = p.Name
 			}
-			allowed, retryAfter, err := limiter.AllowKey(r.Context(), key)
+			limCtx, cancel := context.WithTimeout(r.Context(), limiterTimeout)
+			allowed, retryAfter, err := limiter.AllowKey(limCtx, key)
+			cancel()
 			if err != nil {
 				observability.LoggerFrom(r.Context(), logger).Warn("API rate limiter unavailable; allowing request",
 					slog.String("error", err.Error()))
