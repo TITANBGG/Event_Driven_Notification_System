@@ -7,6 +7,8 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-22
+
 Changes from a technical audit of 1.1.2 (18 findings) and a follow-up review. API contract: 1.2.0.
 
 ### Added
