@@ -28,7 +28,7 @@ info:
     `payload_too_large`, `validation_failed`, `batch_too_large`, `invalid_uuid`, `invalid_channel`, `invalid_cursor`,
     `not_found`, `invalid_transition`, `idempotency_conflict`, `item_idempotency_key_exists`, `duplicate_idempotency_key`,
     `template_not_found`, `missing_variable`, `not_cancellable`, `not_retryable`, `template_name_exists`,
-    `missing_ws_filter`, `upgrade_required`, `unauthorized`, `forbidden`, `forbidden_origin`, `too_many_ws_clients`, `method_not_allowed`,
+    `missing_ws_filter`, `upgrade_required`, `unauthorized`, `forbidden`, `rate_limited`, `overloaded`, `forbidden_origin`, `too_many_ws_clients`, `method_not_allowed`,
     `request_timeout`, `service_unavailable`, `internal_error`. Field-level problems are listed in `error.details[]`
     with dot/bracket paths such as `notifications[3].recipient`.
   license:
@@ -159,6 +159,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "202":
@@ -257,6 +259,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -327,6 +331,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "202":
@@ -374,6 +380,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -406,6 +414,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -441,6 +451,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -458,6 +470,61 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/NotRetryable"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /api/v1/notifications/retry:
+    post:
+      operationId: bulkRetryFailedNotifications
+      x-required-scope: admin
+      tags: [Notifications]
+      summary: Bulk DLQ replay of failed notifications
+      description: |
+        Moves up to `limit` failed notifications (oldest failure first) back to `pending` in one atomic, fenced
+        `UPDATE` (attempts, deferrals and lastError reset, exactly like the single `/retry`), then re-enqueues them.
+        Intended for recovery after a provider-side fix (for example rotated credentials) once the circuit breaker
+        has stopped the flood into the DLQ. Call it repeatedly until `retried` is `0`. Concurrent calls split the work
+        (`FOR UPDATE SKIP LOCKED`) and never replay the same row twice.
+      parameters:
+        - $ref: "#/components/parameters/CorrelationIDHeader"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BulkRetryRequest"
+            examples:
+              smsAfterCredentialFix:
+                summary: Replay SMS that failed in a time window
+                value:
+                  channel: sms
+                  failedFrom: "2026-11-21T09:00:00Z"
+                  failedTo: "2026-11-21T10:00:00Z"
+                  limit: 500
+      responses:
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "200":
+          description: Notifications reset to pending and re-enqueued (possibly none)
+          headers:
+            X-Correlation-ID:
+              $ref: "#/components/headers/CorrelationIDResponse"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkRetryResponse"
+        "400":
+          $ref: "#/components/responses/MalformedJSON"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/ValidationFailed"
         "500":
           $ref: "#/components/responses/InternalError"
         "503":
@@ -486,6 +553,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -520,6 +589,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -562,6 +633,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "201":
@@ -614,6 +687,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -646,6 +721,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -683,6 +760,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -722,6 +801,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "204":
@@ -757,6 +838,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -818,6 +901,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "101":
           description: |
             Switching Protocols. OpenAPI 3.0 cannot describe WebSocket frames natively, so the content below documents
@@ -889,13 +974,13 @@ paths:
       description: Alias for /health/ready checking PostgreSQL and Redis connectivity (1s timeout each).
       responses:
         "200":
-          description: Dependencies healthy
+          description: PostgreSQL reachable; `status` is `ok`, or `degraded` when Redis is down (the API stays ready because it is DB-first and the reconciler enqueues later)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ReadyStatus"
         "503":
-          description: One or more dependencies unavailable
+          description: PostgreSQL unavailable (`status` is `unavailable`)
           content:
             application/json:
               schema:
@@ -912,10 +997,10 @@ paths:
       security: []
       tags: [System]
       summary: Readiness probe
-      description: Pings PostgreSQL and Redis with a 1s timeout each and returns 503 if any fails.
+      description: Pings PostgreSQL and Redis with a 1s timeout each. Returns 503 only when PostgreSQL fails; Redis down is 200 with status degraded and checks.redis.status down.
       responses:
         "200":
-          description: Dependencies healthy
+          description: PostgreSQL reachable; `status` is `ok`, or `degraded` when Redis is down (the API stays ready because it is DB-first and the reconciler enqueues later)
           content:
             application/json:
               schema:
@@ -926,7 +1011,7 @@ paths:
                   postgres: {status: ok, latencyMs: 2}
                   redis: {status: ok, latencyMs: 1}
         "503":
-          description: One or more dependencies unavailable
+          description: PostgreSQL unavailable (`status` is `unavailable`)
           content:
             application/json:
               schema:
@@ -964,6 +1049,8 @@ paths:
       responses:
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
         "403":
           $ref: "#/components/responses/Forbidden"
         "200":
@@ -1054,7 +1141,7 @@ components:
       properties:
         status:
           type: string
-          enum: [ok, degraded]
+          enum: [ok, degraded, unavailable]
         checks:
           type: object
           required: [postgres, redis]
@@ -1422,6 +1509,39 @@ components:
           type: string
           nullable: true
 
+    BulkRetryRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        channel:
+          type: string
+          enum: [sms, email, push]
+          description: Only replay this channel
+        failedFrom:
+          type: string
+          format: date-time
+          description: Inclusive lower bound on failedAt (RFC3339)
+        failedTo:
+          type: string
+          format: date-time
+          description: Exclusive upper bound on failedAt (RFC3339); must be after failedFrom
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 100
+    BulkRetryResponse:
+      type: object
+      required: [retried, notificationIds]
+      properties:
+        retried:
+          type: integer
+          description: Number of notifications moved from failed to pending
+        notificationIds:
+          type: array
+          items:
+            type: string
+            format: uuid
     BatchCancelResponse:
       type: object
       required: [batchId, cancelled, notCancellable]
@@ -1642,6 +1762,22 @@ components:
               code: unauthorized
               message: "missing API key: send an Authorization: Bearer header"
             correlationId: 01a1faec-0000-7000-8000-000000000020
+    RateLimited:
+      description: The API key exceeded `API_RATE_LIMIT_PER_SEC` (only when that limit is enabled)
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error:
+              code: rate_limited
+              message: API key exceeded API_RATE_LIMIT_PER_SEC; retry after the Retry-After delay
+            correlationId: 01a1faec-0000-7000-8000-000000000023
     Forbidden:
       description: The API key is valid but lacks the scope this operation requires (`x-required-scope`)
       headers:
@@ -1891,13 +2027,28 @@ components:
               message: internal server error
             correlationId: 01a1faec-0000-7000-8000-000000000017
     ServiceUnavailable:
-      description: PostgreSQL is temporarily unavailable
+      description: |
+        PostgreSQL is temporarily unavailable (`service_unavailable`), or, on create and batch create only, the queue
+        backlog is at or above `INGRESS_MAX_QUEUE_DEPTH` (`overloaded`, with `Retry-After`)
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying (sent with `overloaded`)
+          schema:
+            type: integer
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorResponse"
-          example:
-            error:
-              code: service_unavailable
-              message: database temporarily unavailable
-            correlationId: 01a1faec-0000-7000-8000-000000000018
+          examples:
+            databaseDown:
+              value:
+                error:
+                  code: service_unavailable
+                  message: database temporarily unavailable
+                correlationId: 01a1faec-0000-7000-8000-000000000018
+            overloaded:
+              value:
+                error:
+                  code: overloaded
+                  message: queue backlog is above the configured limit; retry later
+                correlationId: 01a1faec-0000-7000-8000-000000000024

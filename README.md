@@ -89,7 +89,7 @@ Step-by-step setup and a verified run for all three channels are in [section 11]
 
 On Windows, if `http://localhost:8080` times out while `http://127.0.0.1:8080` answers, Docker Desktop's IPv6 (`[::1]`) port forwarding has gone stale. This is a Docker Desktop issue, not this project's; use `127.0.0.1` or restart Docker Desktop.
 
-PostgreSQL, Redis and the workers' `:9091` health/metrics port are reachable only inside the Compose network; they are not published on the host. Use `docker compose exec postgres psql -U notif notif` or `docker compose exec redis redis-cli` to inspect them.
+PostgreSQL (`5432`) and Redis (`6379`) are published on `127.0.0.1` only, never on every interface, and Redis requires a password (`REDIS_PASSWORD`, local-dev default `local-dev-redis-change-me`). The workers' `:9091` health/metrics port is reachable only inside the Compose network. Use `docker compose exec postgres psql -U notif notif` or `docker compose exec redis redis-cli` (the container sets `REDISCLI_AUTH`) to inspect them. Every credential in `docker-compose.yml` and `.env.example` is a local-development default; replace them all before exposing the stack. The API and workers get `stop_grace_period: 30s`, so `docker compose stop` lets a worker finish its graceful drain (`SHUTDOWN_TIMEOUT` 15s + 5s cleanup) instead of being killed at Docker's default 10s.
 
 ---
 
@@ -241,14 +241,15 @@ Each consumer goroutine cycles through a fixed 10-slot schedule `[h,h,h,h,h,h,n,
 
 ### Rate limit: distributed GCRA with `Burst = 1`
 
-Workers acquire a token from `{notif}:rl:{channel}` after they claim a row, immediately before the provider call. The limiter spaces token grants, not sends, so anything between the two (a wait for a database connection, a GC pause) would let sends bunch up. That is what a stress test showed when the token was still taken before the claim: with 6 worker replicas exhausting PostgreSQL connections, the busiest second reached 107 sends per channel. The wait for a token is bounded (`VISIBILITY_TIMEOUT − 2 × PROVIDER_TIMEOUT − 5s`), so a claimed row is never held past its lease; if no token comes in time (Redis down), the claim is handed back with the same "not attempted" transition the circuit breaker uses, and no attempt is burned. The limiter is `Rate = 100/s, Burst = 1`, which spaces consecutive sends at least 10ms apart. Any one-second window therefore contains at most 100 sends, or 101 at an exact boundary. Integration test `g` measured a maximum of 97 sends in any one-second window over 1000 SMS across two workers. If Redis is unavailable, the limiter fails closed: no sends rather than unlimited sends. Concurrency is sized with Little's law: 100 msg/s × 0.3s p99 latency ≈ 30 concurrent sends per channel. Each replica runs 25 goroutines per channel × 2 replicas, which leaves headroom.
+Workers acquire a token from `{notif}:rl:{channel}` after they claim a row, immediately before the provider call. The limiter spaces token grants, not sends, so anything between the two (a wait for a database connection, a GC pause) would let sends bunch up. That is what a stress test showed when the token was still taken before the claim: with 6 worker replicas exhausting PostgreSQL connections, the busiest second reached 107 sends per channel. The wait for a token is bounded (`VISIBILITY_TIMEOUT − 2 × PROVIDER_TIMEOUT − 5s`), so a claimed row is never held past its lease; if no token comes in time (Redis down), the claim is handed back with the same "not attempted" transition the circuit breaker uses, and no attempt is burned. A wait longer than 1s also re-arms the lease before the send (fenced `UPDATE processing_started_at = now()`); if that finds the row already reclaimed by the reconciler, the worker does not send at all, so a long wait can no longer turn into a duplicate. The limiter is `Rate = 100/s, Burst = 1`, which spaces consecutive sends at least 10ms apart. Any one-second window therefore contains at most 100 sends, or 101 at an exact boundary. Integration test `g` measured a maximum of 97 sends in any one-second window over 1000 SMS across two workers. If Redis is unavailable, the limiter fails closed: no sends rather than unlimited sends. Concurrency is sized with Little's law: 100 msg/s × 0.3s p99 latency ≈ 30 concurrent sends per channel. Each replica runs 25 goroutines per channel × 2 replicas, which leaves headroom.
 
 ### Retry classification
 
 | Provider result | Outcome |
 |---|---|
 | `202` (also `200`, `201`) | **Sent** (`messageId` stored; a non-202 2xx or a missing body is logged as a warning) |
-| `408`, `425`, `429` | **Transient**; `Retry-After` is honored |
+| `408`, `425` | **Transient**; `Retry-After` is honored |
+| `429` | **Throttled**: deferred like an open circuit (attempt given back, `deferrals + 1`), delay = full-jitter backoff on the deferral count, at least `Retry-After`; bounded by `MAX_CIRCUIT_DEFERRALS`; counts as a breaker success |
 | `500`–`599` | **Transient**; `Retry-After` is honored on `503` |
 | Timeout, connection refused or reset, DNS error, EOF | **Transient** (the provider may have accepted the request, see above) |
 | Other `4xx`, any `3xx` (redirects are not followed) | **Permanent**: the same payload cannot succeed |
@@ -270,15 +271,15 @@ Full jitter spreads out the retries of a burst that failed at the same moment, s
 
 ### Circuit breaker, per channel and per worker replica
 
-`sony/gobreaker/v2` opens after 10 consecutive transient failures, or when more than 50% of at least 20 requests fail. It stays open for 30s and then allows 3 half-open probe requests. Permanent `4xx` responses count as successes, because they mean bad input, not an unhealthy provider. Only the worker's own shutdown aborts are excluded; provider timeouts count as failures.
+`sony/gobreaker/v2` opens after 10 consecutive transient failures, or when more than 50% of at least 20 requests fail. It stays open for 30s and then allows 3 half-open probe requests. Permanent `4xx` responses count as successes, because they mean bad input, not an unhealthy provider, with one exception: `401`, `403` and `407` from the provider mean our credentials or URL are wrong, which fails every message on the channel, so they count as failures. After 10 of them the circuit opens and consumers stop dequeuing: 10 messages reach the DLQ instead of the whole queue, and the bulk replay above recovers them once the credentials are fixed. A `429` counts as a success (the provider is healthy and only enforces its rate). Only the worker's own shutdown aborts are excluded; provider timeouts count as failures.
 
-When the breaker is open, nothing is sent. The row goes back to `retrying` with `attempts - 1` and `deferrals + 1`, and the attempt is recorded as `outcome=circuit_open, counted=false`, so an outage does not use up the retry budget. After 120 deferrals (about an hour) the notification fails.
+When the breaker of a channel is open, that channel's consumers stop dequeuing: the items stay in their Redis queues, so an outage costs no `Claim`, no rate-limit token and no database write per item, and consumers check again after the idle backoff (≤ 1s). Once `CB_OPEN_TIMEOUT` expires the breaker is half-open and consumers resume, sending the probes. If the breaker opens between that check and the send (a race), the claimed row goes back to `retrying` with `attempts - 1` and `deferrals + 1`, and the attempt is recorded as `outcome=circuit_open, counted=false`, so an outage does not use up the retry budget. After 120 deferrals (about an hour) the notification fails.
 
 Breaker state is kept in memory in each replica rather than shared in Redis. Every replica calls the same provider, so they all see the same outage independently. This avoids a Redis round trip per send, and the breaker keeps working when Redis is the component in trouble.
 
 ### Dead-letter queue and manual retry
 
-Failed notifications (permanent error, attempts exhausted, or the circuit open too long) go to `{notif}:dlq`; their full attempt history stays in `delivery_attempts`. `POST /api/v1/notifications/{id}/retry` moves a `failed` notification back to `pending` with `attempts=0`, clears `lastError` and enqueues it again.
+Failed notifications (permanent error, attempts exhausted, or the circuit open too long) go to `{notif}:dlq`; their full attempt history stays in `delivery_attempts`. `POST /api/v1/notifications/{id}/retry` moves a `failed` notification back to `pending` with `attempts=0`, clears `lastError` and enqueues it again. `POST /api/v1/notifications/retry` does the same for up to 1,000 failed notifications at once (optional `channel`, `failedFrom`, `failedTo`, `limit`; oldest failure first; one fenced `UPDATE ... FOR UPDATE SKIP LOCKED`), for recovery after a provider-side fix. Both need the `admin` scope.
 
 ### Reconciler instead of a transactional outbox
 
@@ -289,7 +290,7 @@ Failed notifications (permanent error, attempts exhausted, or the circuit open t
 | Repair delay after a lost enqueue | Near zero | At most `PENDING_STALE_AFTER + RECONCILE_INTERVAL` (45s) |
 | Crashed workers | Still need a visibility-timeout reclaimer | Handled by the same component |
 
-The reconciler runs every 15s in the worker binary, guarded by a Redis lease. Each step handles at most 1000 rows per cycle, and its keyset cursor is kept between cycles. The steps, in execution order:
+The reconciler runs every 15s in the worker binary, guarded by a Redis lease that is renewed (`extend_lock.lua`, owner-checked) before every step, so a slow cycle cannot outlive its lease while a second replica starts the same repairs; if the renewal fails the cycle stops. Each step scans up to 5 pages of 1000 rows per cycle (so up to 5000 repairs, ~333/s, faster than the 300/s the workers can send; it was 1000 per cycle, ~67/s, until 2026-11-22), and its keyset cursor is kept between cycles. The steps, in execution order:
 
 - **(d)** Requeue the inflight lists of workers whose heartbeat has expired.
 - **(a)** Re-enqueue `pending` rows that are untracked and older than 30s.
@@ -325,9 +326,10 @@ Only SHA-256 digests of the secrets are kept in memory, and every lookup compare
 
 | Scenario | System Behavior | Automatic Recovery |
 |---|---|---|
-| **Redis down during `POST /notifications`** | Row commits to PostgreSQL as `pending`; Redis enqueue logs `warn`; API still returns `202 Accepted` (durable). `/health/ready` returns `503`. | Reconciler step `(a)` enqueues untracked stale `pending` rows once Redis recovers. |
+| **Redis down during `POST /notifications`** | Row commits to PostgreSQL as `pending`; Redis enqueue logs `warn`; API still returns `202 Accepted` (durable). The API's `/health/ready` stays `200` with `status: degraded` and `checks.redis: down` (only PostgreSQL decides API readiness), so a Redis blip does not take every API replica out of a load balancer. | Reconciler step `(a)` enqueues untracked stale `pending` rows once Redis recovers. |
 | **Redis down for workers** | Dequeue backs off with context-aware timer; GCRA rate limiter **fails closed** (no sends) to protect the `100/s` provider SLA. | Workers resume automatically as soon as Redis responds. |
 | **Redis full (`maxmemory`, `noeviction`)** | API enqueue fails with `OOM`, the API still answers `202` (the row is committed). Dequeue and ack keep working: `dequeue.lua` starts with `RPOP`, which is not `denyoom`, and Redis lets a script that has already written finish. | Queues drain and free memory; reconciler `(a)` re-enqueues the rows whose enqueue failed. With `LMOVE` (a `denyoom` command) as the first write, a full Redis with nothing in flight could never drain again. |
+| **Sustained intake above send capacity** | The API samples the ready-queue backlog every 5s; at or above `INGRESS_MAX_QUEUE_DEPTH` (default 1,000,000) creates get `503 overloaded` with `Retry-After: 5`. Reads, cancels and retries are never gated. Optionally `API_RATE_LIMIT_PER_SEC` limits each API key (`429 rate_limited`, fails open if Redis is down). | Creates are accepted again once the backlog drains below the limit. |
 | **Redis loses last ~1s (`AOF everysec`)** | Some IDs vanish from ready lists or `{notif}:delayed` ZSET. | Reconciler steps `(a)` (stale `pending`) and `(b)` (untracked `retrying`/`scheduled` due within 5m) restore them from PostgreSQL. |
 | **PostgreSQL down** | API create returns `503 service_unavailable`; `/health/ready` returns `503`; worker `Claim` errors schedule the item `now+1s` out of inflight. | Resumes automatically when PostgreSQL recovers. |
 | **PostgreSQL refuses connections right after the provider accepted a send** | `InsertAttempt` and `MarkSent` are retried for up to 5s with backoff, so a short outage or a full connection pool does not leave the row in `processing`. | If the database is still unavailable after 5s, the row stays `processing`; reconciler step `(c)` resets it after `VISIBILITY_TIMEOUT` and it is sent again (at-least-once, same `Idempotency-Key`). |
@@ -346,7 +348,7 @@ Only SHA-256 digests of the secrets are kept in memory, and every lookup compare
 
 | Drill | What it does | Result |
 |---|---|---|
-| 1. Redis down during create | `docker compose stop redis`, then `POST` a notification | `202` in ~3s (all post-commit Redis work shares one 2s budget), `/health/ready` = `503`; sent 36s after Redis restarted (reconciler step a: `PENDING_STALE_AFTER` 30s + cycle) |
+| 1. Redis down during create | `docker compose stop redis`, then `POST` a notification | `202` in ~3s (all post-commit Redis work shares one 2s budget), `/health/ready` = `200` (`status: degraded`); sent 36s after Redis restarted (reconciler step a: `PENDING_STALE_AFTER` 30s + cycle) |
 | 2. PostgreSQL down | `docker compose stop postgres`, then `POST` | `503 service_unavailable`, `/health/ready` = `503`; after restart a new notification was sent within 1s |
 | 3. Worker SIGKILL mid-batch | 300 SMS with 200ms provider latency, `docker compose kill worker-1` after 1s | 300/300 sent 64s after the kill (orphaned inflight list requeued after the heartbeat expired, abandoned `processing` rows reclaimed after `VISIBILITY_TIMEOUT`); 4 to 11 duplicate provider calls across runs, one per send in flight at the moment of the kill, all with the same `Idempotency-Key`; the invariants check counts the same number of provider calls the system never recorded. `abandoned` attempts can be higher (24 vs 11 in one run): rows that were claimed and still waiting for a rate-limit token when the worker died were never sent, are reset by the reconciler, and lose one attempt |
 | 4. Provider outage | Mock provider returns 500 for everything, 40 SMS | Breaker open (`circuit_breaker_state=2`) 6s into the outage, 0 notifications failed; 40/40 sent 25s after the provider recovered |
@@ -1210,9 +1212,11 @@ OpenTelemetry spans cover the API request, every SQL query (`otelpgx`), the Redi
 ### Health checks
 
 - `GET /health/live`: the process is up.
-- `GET /health/ready` (and its alias `/health`): pings PostgreSQL and Redis with a 1s timeout each and returns `503` if either fails.
+- `GET /health/ready` (and its alias `/health`): pings PostgreSQL and Redis with a 1s timeout each. On the API only PostgreSQL decides readiness: PostgreSQL down is `503` (`status: unavailable`); Redis down is `200` with `status: degraded` and `checks.redis.status: down`, because the API is DB-first and keeps accepting notifications that the reconciler enqueues later. The worker's readiness still needs both (it cannot dequeue without Redis).
 
-Workers expose the same probes on `:9091`. The Compose healthchecks use `cmd/healthcheck`.
+Workers expose the same probes on `:9091`. A worker's `/health/live` is not a constant `200`: every consumer goroutine records when it last started a loop iteration (an idle one ticks at least once a second), and `/health/live` returns `503 {"status":"stalled"}` when any consumer has made no progress for `2 × VISIBILITY_TIMEOUT` (120s by default; one item never takes longer than `VISIBILITY_TIMEOUT`). A deadlocked or wedged worker therefore turns unhealthy, and an orchestrator liveness probe (Kubernetes) restarts it; plain Compose only marks it `unhealthy`. The Compose healthchecks use `cmd/healthcheck`.
+
+Idle consumers poll with a non-blocking dequeue and a `50ms → 1s` backoff instead of a blocking pop: the weighted 6:3:1 priority needs one atomic multi-list `RPOP` in Lua, and Lua scripts cannot block. At most ~75 cheap `EVALSHA` calls per second per idle replica is the price.
 
 ---
 
@@ -1226,6 +1230,7 @@ Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so 
 | `WORKER_METRICS_ADDR` | `:9091` | Worker health & Prometheus `/metrics` listen address |
 | `DATABASE_URL` | `postgres://notif:notif@postgres:5432/notif?sslmode=disable` | PostgreSQL connection string (password masked in logs) |
 | `REDIS_ADDR` | `redis:6379` | Redis `host:port` |
+| `REDIS_PASSWORD` | *(empty: no AUTH)*; Compose: `local-dev-redis-change-me` | Redis `requirepass` password sent with AUTH by API and workers |
 | `REDIS_POOL_SIZE` | `0` (`auto`) | `0` auto-sizes to `3 * WORKER_CONCURRENCY_PER_CHANNEL + 20` |
 | `DB_MAX_CONNS` | `0` (`auto`) | PostgreSQL pool size per process; `0` = API 20, worker 10. Every replica opens its own pool, so keep `replicas × pool + API ≤ max_connections` (100 by default) |
 | `PROVIDER_URL` | `http://mockprovider:8090/` | External `EXT-1` provider endpoint (`http`/`https`) |
@@ -1265,6 +1270,8 @@ Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so 
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:8081` | Comma-separated allowed CORS origins |
 | `API_KEYS` | *(empty: auth off)*; Compose: `local-dev:local-dev-key-change-me:admin,local-dev-read:local-dev-read-key-change-me:read` | Comma-separated `name:secret:scope1\|scope2` API keys; scopes `read`, `write`, `admin` (admin implies all). Names `^[a-z0-9_-]{1,64}$`, unique; secrets 16..256 token characters, unique. Invalid entries stop the API at startup; empty disables auth with a startup warning |
 | `MAX_WS_CLIENTS` | `1000` | Maximum concurrent WebSocket clients per API replica (`>= 1`); more get `503 too_many_ws_clients` |
+| `API_RATE_LIMIT_PER_SEC` | `0` (off) | Requests per second per API key across all API replicas (Redis GCRA, burst = rate); over it `429 rate_limited` + `Retry-After`; fails open when Redis is down |
+| `INGRESS_MAX_QUEUE_DEPTH` | `1000000` | Ready-queue backlog at which creates get `503 overloaded` + `Retry-After`; `0` disables the gate |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4318` | OpenTelemetry OTLP HTTP endpoint |
 | `OTEL_SAMPLER_RATIO` | `1.0` | Trace sampling ratio (`[0, 1]`) |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, or `error` |
@@ -1748,16 +1755,17 @@ webhook.site's free tier limits the number of requests, so use the mock provider
 What is deliberately missing or simplified, and what I would do with more time:
 
 - **API keys, but no tenants.** Every `/api/v1` route requires a key with a `read`, `write` or `admin` scope, but there is no tenant model: any key with `read` sees every notification, and idempotency keys are global. Keys are static (changing them means restarting the API) and are not rate limited per key. Next steps: a `tenant_id` on every table and key, keys stored hashed in PostgreSQL with rotation, OAuth2 client credentials for service clients, and per-key rate limits.
-- **`429` burns attempts.** A `429` is a transient error (it honors `Retry-After`) and counts against `MAX_ATTEMPTS` like a `5xx`. In the chaos test, 37 of 76,000 notifications sent while the provider returned `429` for half of all requests used all 5 attempts and went to the DLQ (recoverable with a manual retry). A `429` means "slow down", not "this message is broken", so treating it like an open circuit (deferral without burning an attempt, capped by `MAX_CIRCUIT_DEFERRALS`) would be the better policy for a long throttling period.
+- **`429` throttling shares the deferral budget with the circuit breaker.** Until 2026-11-22 a `429` counted against `MAX_ATTEMPTS` like a `5xx` (in the chaos test 37 of 76,000 notifications sent during a 50% `429` storm used all 5 attempts and went to the DLQ). A `429` is now deferred without using an attempt; the cost is that a provider throttling for longer than `MAX_CIRCUIT_DEFERRALS` deferrals (~1h with backoff capped at `RETRY_CAP`) still fails the message. The chaos numbers in section 10 predate this change.
 - **Duplicates on provider timeouts.** At-least-once is the honest guarantee. Exactly-once would need a provider that deduplicates on `Idempotency-Key`.
 - **Each replica opens its own PostgreSQL pool.** `DB_MAX_CONNS` (worker default 10) fits 6 worker replicas + the API into PostgreSQL's default 100 connections; beyond that I would put PgBouncer in transaction mode in front of PostgreSQL.
 - **Limiter contention at many replicas.** With 6 replicas and 100ms provider latency, 150 senders per channel contend for each 10ms GCRA slot and the effective rate drops to ~86/s (95/s with 2 replicas). The 100/s ceiling holds; a per-channel token dispatcher (one process hands out slots) would recover the unused slots.
 - **The circuit breaker is per replica.** With N replicas, a provider outage costs up to N × 10 failed calls before every breaker is open. A shared breaker in Redis is possible but adds a round trip per send and fails when Redis does.
 - **No Turkish national language shift table for SMS.** `ç ğ ı İ ş Ş` force UCS-2 (70/67 characters per segment) instead of the 3GPP TS 23.038 Turkish single-shift table that some carriers support.
 - **The Redis DLQ list is capped at 100,000 IDs.** PostgreSQL (`status='failed'` plus `delivery_attempts`) keeps the full history; the list only drives `dlq_depth`. A manual retry removes the ID from the list.
-- **The reconciler repair delay of up to 45s** is fine for this scale; at 100M/day I would switch to an outbox or CDC (section 6).
-- **One Redis instance.** Redis Sentinel or Cluster with per-channel hash tags would be next.
-- **Metrics windows are computed from PostgreSQL** (cached for 2s). At higher volume they should come from Prometheus recording rules instead.
+- **One Redis instance, one hash slot.** Every key shares the `{notif}` hash tag so each Lua script stays atomic on one slot; on Redis Cluster that means one shard holds all queue state, so Cluster would add failover but no capacity. Sentinel (failover) is the next step; for capacity the tag would become per channel (`{notif:sms}`), which needs `move_due.lua` and `requeue.lua` (they touch several channels) to split their work per channel first.
+- **Keyset pagination can skip a row committed late.** `created_at` defaults to the transaction's start time, so a row inserted by a long transaction (a 1,000-item batch) can become visible after a client already paged past its `created_at`. The window is the transaction's duration (milliseconds to about a second); a client that needs every row (an export) should page by `id` or re-read the first page. Measured on 1,005,259 rows, every list filter combination (including multiple statuses plus a channel) uses an existing composite index and returns in under 0.4 ms, so no extra index was added.
+- **The reconciler replaces a transactional outbox.** A notification whose Redis enqueue fails waits up to `PENDING_STALE_AFTER + RECONCILE_INTERVAL` (45s) for repair. An outbox table with a relay (or CDC) would make that near-instant at the cost of a second write per notification and another process (section 6).
+- **Metrics windows are computed from PostgreSQL** (cached for 2s; one request computes a snapshot at a time and others get the previous one meanwhile, so polls cannot stampede the database). At higher volume they should come from Prometheus recording rules instead.
 - **Templates have no versioning or localization.** Rendering at create time keeps that safe for in-flight messages, but a template history table would help auditing.
 
 ---

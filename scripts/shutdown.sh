@@ -2,7 +2,8 @@
 # Graceful shutdown under load. While batches stream in and ~50 sends are in flight (provider latency
 # 300 +- 200ms), SIGTERM is sent to worker-1, then worker-2, then both at once, then the API. Unlike a
 # SIGKILL, a graceful stop must leave nothing for the reconciler to rescue:
-#   - every stop finishes within SHUTDOWN_TIMEOUT (15s) and logs a clean stop
+#   - every stop finishes within SHUTDOWN_TIMEOUT (15s) and logs a clean stop; stops use the
+#     compose stop_grace_period (30s), not a script-chosen -t, so the shipped config is what is tested
 #   - the stopped worker's heartbeat key and inflight list are gone
 #   - no 'abandoned' attempt and no duplicate delivery (invariants without --allow-duplicates)
 #   - every batch the API accepted (202) is complete (all-or-nothing) despite the API restart
@@ -95,7 +96,7 @@ graceful_stop() {
   local name="stop $*" t0 t1 elapsed svc wid since hb inflight clean timeout_hit requeued drained
   since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   t0=$(date +%s%3N)
-  "${COMPOSE[@]}" stop -t 30 "$@" >/dev/null 2>&1
+  "${COMPOSE[@]}" stop "$@" >/dev/null 2>&1
   t1=$(date +%s%3N)
   elapsed=$(((t1 - t0) / 1000))
   local detail="SIGTERM -> stopped in $((t1 - t0))ms" bad=0
@@ -127,7 +128,7 @@ rolling_restarts() {
     svc="worker-$((i % 2 + 1))"
     since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     t0=$(date +%s%3N)
-    "${COMPOSE[@]}" restart -t 30 "$svc" >/dev/null 2>&1
+    "${COMPOSE[@]}" restart "$svc" >/dev/null 2>&1
     t1=$(date +%s%3N)
     clean="$("${COMPOSE[@]}" logs --no-log-prefix --since "$since" "$svc" 2>/dev/null | grep -c 'worker stopped cleanly' || true)"
     timeout_hit="$("${COMPOSE[@]}" logs --no-log-prefix --since "$since" "$svc" 2>/dev/null | grep -c 'shutdown timeout elapsed' || true)"

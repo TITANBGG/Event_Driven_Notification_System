@@ -95,6 +95,15 @@ run_req "GET /api/v1/notifications?limit=5" "200" \
 run_req "POST /api/v1/notifications/${SINGLE_ID}/cancel (200 if queued or 409 if already sent)" "200|409" \
   curl "${AUTH[@]}" -X POST "${API_URL}/api/v1/notifications/${SINGLE_ID}/cancel"
 
+run_req "POST /api/v1/notifications/retry (bulk DLQ replay; 200 even when nothing failed)" "200" \
+  curl "${AUTH[@]}" -X POST "${API_URL}/api/v1/notifications/retry" \
+  -H "Content-Type: application/json" \
+  -d '{"channel":"sms","limit":10}'
+
+run_req "POST /api/v1/notifications/retry with a read-only key (expect 403, admin only)" "403" \
+  curl -X POST "${API_URL}/api/v1/notifications/retry" \
+  -H "Authorization: Bearer ${READ_API_KEY}" -H "Content-Type: application/json" -d '{}'
+
 run_req "POST /api/v1/notifications/${SINGLE_ID}/retry (expect 409)" "409" \
   curl "${AUTH[@]}" -X POST "${API_URL}/api/v1/notifications/${SINGLE_ID}/retry"
 

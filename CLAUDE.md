@@ -125,7 +125,8 @@ A single multi-stage `Dockerfile` builds all binaries (`CGO_ENABLED=0`, `-trimpa
 - **Zero-Config Defaults:** All env vars define defaults inside compose via `${VAR:-default}`, so `.env` is optional. `.env.example` documents all variables.
 - **Services:**
   - `postgres:16-alpine` (healthcheck: `pg_isready`)
-  - `redis:7-alpine` (`--appendonly yes --appendfsync everysec`, healthcheck: `redis-cli ping`)
+  - `redis:7-alpine` (`--appendonly yes --appendfsync everysec --requirepass`, `REDISCLI_AUTH` for in-container `redis-cli`, healthcheck: `redis-cli ping`)
+  - PostgreSQL and Redis ports are published on `127.0.0.1` only; `api` and workers set `stop_grace_period: 30s` (> `SHUTDOWN_TIMEOUT` + 5s cleanup)
   - `migrate` (`migrate/migrate` pinned tag; mounts `./migrations`, runs `up` then exits; `api`, `worker-1`, `worker-2` depend on `service_completed_successfully`)
   - `api` (port `8080`; owns `build:` for `notification-system:local`)
   - `worker-1` and `worker-2` (identical template via YAML anchor `x-worker: &worker` + shared env anchor, distinct `WORKER_ID`; proves the distributed rate limiter across replicas)
@@ -338,6 +339,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 8. `force_enqueue.lua(id, meta, queueKey)`: unconditional `HSET msg id meta` + `LPUSH queueKey id` — reconciler only: step `(a)` for rows already filtered as untracked, step `(c)` after `processing -> pending` (the ID may still be tracked inside a live worker's inflight list).
 9. `requeue_ids.lua(inflightKey, prefix, ids...)`: for each ID, only if `LREM inflightKey 1 id` removed it → `RPUSH` back to its queue (or `HDEL` on bad meta) — used by the live worker's inflight sweeper; an ID acked concurrently is never resurrected.
 10. `unlock.lua(lockKey, ownerToken)`: `DEL` only if `GET lockKey == ownerToken` — releases the reconciler lease at the end of a cycle without deleting another replica's lease.
+11. `extend_lock.lua(lockKey, ownerToken, ttlMs)`: `PEXPIRE` only if `GET lockKey == ownerToken` — renews the reconciler lease between steps; an expired lease is never revived.
 
 ### Weighted Priority with Fall-Through (`FR-2.3`, Anti-Starvation)
 
@@ -355,7 +357,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
 2. `n, ok := repo.Claim(ctx, id)` (atomically increments `attempts`).
    - If `!ok` (cancelled / already terminal / not due yet) → `queue.Ack` → `continue`.
    - On DB error → `queue.Schedule(id, now+1s, inflight)` (moves the item out of the inflight list and retries it via the delayed mover) → `continue`.
-3. `limiter.Wait(drainCtx, channel)` — acquire the GCRA token **AFTER** `Claim`, immediately before the provider call, so the limiter spaces actual sends (decided 2026-11-21 after a stress test: with the token taken before `Claim`, a DB pool stall bunched sends to 107/s per channel with 6 replicas). The wait is bounded by `VISIBILITY_TIMEOUT - 2*PROVIDER_TIMEOUT - 5s` (≥ 10s with valid config, worst observed wait ~1.5s) so a claimed row is never held past its lease; on timeout or limiter outage the claim is handed back with `repo.DeferCircuitOpen` (`attempts-1`, `deferrals+1`, no attempt burned) + `queue.Schedule(now+1s)`.
+3. `limiter.Wait(drainCtx, channel)` — acquire the GCRA token **AFTER** `Claim`, immediately before the provider call, so the limiter spaces actual sends (decided 2026-11-21 after a stress test: with the token taken before `Claim`, a DB pool stall bunched sends to 107/s per channel with 6 replicas). The wait is bounded by `VISIBILITY_TIMEOUT - 2*PROVIDER_TIMEOUT - 5s` (≥ 10s with valid config, worst observed wait ~1.5s) so a claimed row is never held past its lease; on timeout or limiter outage the claim is handed back with `repo.DeferCircuitOpen` (`attempts-1`, `deferrals+1`, no attempt burned) + `queue.Schedule(now+1s)`. If the wait took longer than `1s`, `repo.ExtendLease` (fenced `processing_started_at = now()`) re-arms the visibility timeout first; `ErrLeaseLost` there means the reconciler already reclaimed the row → **do not send**, ack and stop (decided 2026-11-22). Status-event publishes are bounded to `1s` so a slow Redis cannot eat the lease.
 4. `outcome := breaker[channel].Execute(provider.Send(sendCtx, n))` (`sendCtx` timeout = `PROVIDER_TIMEOUT`).
 5. `repo.InsertAttempt(...)` — every attempt is recorded in `delivery_attempts`. `InsertAttempt` and `MarkSent` retry non-lease DB errors for up to `5s` (backoff `100ms → 1s`): after the provider accepted a message, a short DB blip must not leave the row in `processing` for the reconciler to re-send.
 6. Outcome dispatch (all DB updates **fenced** on `WHERE id=$1 AND status='processing' AND attempts=$claimedAttempts`):
@@ -363,6 +365,7 @@ All keys share the hash tag `{notif}` so every Lua script touches a **single has
    - `Transient && attempts < max_attempts` → `repo.ScheduleRetry` (`status='retrying'`, `next_attempt_at`, `last_error`) → `queue.Schedule(id, due, inflight)`
    - `Transient && attempts >= max_attempts` → `repo.MarkFailed` → `queue.DeadLetter`
    - `Permanent` → `repo.MarkFailed` → `queue.DeadLetter`
+   - Before step 1, a consumer whose channel breaker is **open** (`ChannelBreaker.Open`) skips `Dequeue` and waits the idle backoff (decided 2026-11-22: claiming only to defer cost a Claim, a token and two writes per item per open period). The deferral below then only covers the race where the breaker opens between that check and `Execute`.
    - `CircuitOpen` (`ErrOpenState` / `ErrTooManyRequests`) → `repo.DeferCircuitOpen` (`status='retrying'`, `attempts=attempts-1`, `deferrals=deferrals+1`, `next_attempt_at=now + CB_OPEN_TIMEOUT + jitter(up to 5s)`) → `queue.Schedule`; `delivery_attempts` row has `outcome='circuit_open'`, `counted=false`. If `deferrals > MAX_CIRCUIT_DEFERRALS` (`120 ≈ 1h`) → `MarkFailed("circuit open too long")` + `DeadLetter`.
 7. Publish status event (Phase 10) and update Prometheus metrics (Phase 6).
 
@@ -374,13 +377,14 @@ Each loop iteration is wrapped in `recover()` so any panic logs stack + `correla
 |---|---|---|
 | `202` (expected), `200`, `201` | **Sent** | Store `messageId`; non-202 `2xx` or missing/invalid body → log `warn`, still `Sent` |
 | `3xx` (redirects are **NOT** followed) | **Permanent** | Misconfigured provider URL |
-| `408` Request Timeout, `425` Too Early, `429` Too Many Requests | **Transient** | Honor `Retry-After` header (seconds or HTTP-date) |
+| `408` Request Timeout, `425` Too Early | **Transient** | Honor `Retry-After` header (seconds or HTTP-date) |
+| `429` Too Many Requests | **Throttled** | Provider healthy, rate rejected (decided 2026-11-22): `repo.DeferCircuitOpen` (attempt given back, `deferrals+1`), `delivery_attempts.counted=false`, delay = backoff(`deferrals`) ≥ `Retry-After`, failed after `MAX_CIRCUIT_DEFERRALS`; breaker **success** |
 | Other `4xx` (`400`, `401`, `403`, `404`, `405`, `409`, `410`, `413`, `415`, `422`, …) | **Permanent** | Retrying the exact same payload cannot succeed |
 | `500`, `502`, `503`, `504`, and any other `5xx` | **Transient** | Honor `Retry-After` on `503` |
 | Timeout, connection refused/reset, DNS error, `EOF` | **Transient** | Note: timeout may hide a successful send → possible duplicate, mitigated by `Idempotency-Key` |
 | Request build failure (bad URL) / invalid TLS cert | **Permanent** | Configuration error |
 
-- **Breaker Success/Failure Rule:** Only **Transient** outcomes count as circuit-breaker failures. **Permanent** outcomes (`4xx`) count as breaker successes (`IsSuccessful` = true), because a `400` indicates bad client input while the provider itself is healthy.
+- **Breaker Success/Failure Rule:** **Transient** outcomes count as circuit-breaker failures. **Permanent** outcomes (`4xx`) and **Throttled** (`429`) count as breaker successes (`IsSuccessful` = true), because a `400` indicates bad client input while the provider itself is healthy. Exception (decided 2026-11-22 after a review): a permanent `401`/`403`/`407` (our provider credentials or URL are wrong, so every message fails) counts as a breaker **failure**, so the circuit opens after `CB_CONSECUTIVE_FAILURES` and the queue waits instead of draining into the DLQ; the message outcome stays Permanent.
 - **Breaker Exclusion Rule:** Only the worker's own drain/shutdown cancellation (`Send` returning a non-nil error) is excluded via `IsExcluded`. Provider HTTP timeouts are **Transient failures** even though they wrap `context.DeadlineExceeded` — excluding them would stop the breaker from ever opening on a slow provider (regression test: `TestChannelBreakerProviderTimeoutsTripButDrainAbortsDoNot`).
 
 ### Exponential Backoff with Full Jitter
@@ -404,12 +408,12 @@ Each loop iteration is wrapped in `recover()` so any panic logs stack + `correla
 
 ### Reconciler (Worker Binary, Every `RECONCILE_INTERVAL = 15s`)
 
-Guarded by distributed lock `{notif}:reconciler:lock` (`SET NX PX 30000`). Each step processes at most `1000` rows per cycle (keyset scan, up to 5 pages) to bound DB/Redis load; tracked checks use pipelined `HEXISTS`. Keyset cursors **persist across cycles** (in memory, per replica) and wrap to the start after the last page, so a large tracked backlog cannot hide untracked rows beyond one cycle's budget. Execution order is `(d)` first (so requeued orphans are tracked again before `(a)` runs), then `(a)`, `(b)`, `(c)`, `(e)`; the lease is released with `unlock.lua` at the end of the cycle:
+Guarded by distributed lock `{notif}:reconciler:lock` (`SET NX PX 30000`). Each step scans at most 5 pages of `1000` rows per cycle and may repair every row it scans (≤ 5000/cycle ≈ 333/s, above the 300/s send capacity; decided 2026-11-22, the former cap of 1000 *repairs* per cycle rebuilt a mass Redis loss at only ~67/s); tracked checks use pipelined `HEXISTS`. Keyset cursors **persist across cycles** (in memory, per replica) and wrap to the start after the last page, so a large tracked backlog cannot hide untracked rows beyond one cycle's budget. Execution order is `(d)` first (so requeued orphans are tracked again before `(a)` runs), then `(a)`, `(b)`, `(c)`, `(e)`; the lease is renewed with `extend_lock.lua` before every step after the first (the cycle stops if the renewal fails) and released with `unlock.lua` at the end of the cycle:
 
 - `(a)` `pending` rows with `updated_at < now - PENDING_STALE_AFTER` (`30s`) and **NOT tracked** in Redis → `force_enqueue.lua` (repairs DB-commit-ok / Redis-enqueue-failed or API crash).
 - `(b)` `retrying` / `scheduled` rows due before `now + 5m`, `updated_at < now - 30s`, and **NOT tracked** → `schedule.lua` at their due timestamp (repairs Redis data loss).
 - `(c)` `processing` rows with `processing_started_at < now - VISIBILITY_TIMEOUT` (`60s`):
-  - If `attempts >= max_attempts` → `failed` (`"visibility timeout; worker presumed dead"`) + `DeadLetter`.
+  - If `attempts >= max_attempts` → `failed` (`"delivery outcome unknown: worker died during the final attempt (visibility timeout)"`; the provider may have accepted it) + `DeadLetter`.
   - Else → transition `processing -> pending` + `force_enqueue.lua`.
   - Always insert `delivery_attempts` row with `outcome='abandoned'` and log `warn "worker likely crashed"`.
 - `(d)` Orphan inflight lists: `SCAN {notif}:inflight:*`; if matching `{notif}:hb:{workerId}` key is missing → `requeue.lua` then `DEL`.
@@ -422,13 +426,13 @@ Covers the gap the reconciler cannot see: a DB transition succeeded but the foll
 
 ### Graceful Shutdown (Worker)
 
-On `SIGINT` / `SIGTERM`: stop dequeuing immediately → allow in-flight provider sends to finish within `SHUTDOWN_TIMEOUT` (`15s`) → run `requeue.lua` for remaining items in this worker's inflight list → delete `{notif}:hb:{workerId}` → close DB and Redis pools cleanly.
+On `SIGINT` / `SIGTERM`: stop dequeuing immediately → allow in-flight provider sends to finish within `SHUTDOWN_TIMEOUT` (`15s`; a send still running then is cancelled, recorded as a counted `transient` attempt "provider outcome unknown" and rescheduled via `ScheduleRetry`) → run `requeue.lua` for remaining items in this worker's inflight list → delete `{notif}:hb:{workerId}` → close DB and Redis pools cleanly.
 
 ### Failure Scenarios Matrix (Document in `README.md`)
 
 | Scenario | What Happens | Recovery |
 |---|---|---|
-| Redis down during create | Row committed as `pending`, enqueue fails → still returns `202` (durable), logs `warn` | Reconciler `(a)` when Redis recovers; `/health/ready` returns `503` |
+| Redis down during create | Row committed as `pending`, enqueue fails → still returns `202` (durable), logs `warn` | Reconciler `(a)` when Redis recovers; API `/health/ready` stays `200` `degraded` (decided 2026-11-22: only PostgreSQL decides API readiness) |
 | Redis down for workers | Dequeue errors → idle backoff; limiter unavailable → **FAIL CLOSED** (no sends) to honor `100/s` cap | Resumes automatically on Redis recovery |
 | Redis full (`maxmemory`, `noeviction`) | API enqueue fails with `OOM` → still `202` (row committed); dequeue and ack keep working (memory-neutral / freeing) | Queues drain and free memory; reconciler `(a)` re-enqueues the untracked rows |
 | Redis loses last ~1s (`AOF everysec`) | Some IDs missing from queues / `delayed` ZSET | Reconciler `(a)` and `(b)` |
@@ -488,7 +492,7 @@ Exposed on a **custom** `prometheus.Registry` (never global default) at `api :80
 
 ### Real-Time JSON Snapshot (`GET /api/v1/metrics`)
 
-Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_cont` over the last `15m`, protected by a `2s` in-memory cache) + live Redis queue lengths. Explain this design in `README.md`.
+Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_cont` over the last `15m`, protected by a `2s` in-memory cache with single-flight refresh: one request recomputes, concurrent ones get the previous snapshot) + live Redis queue lengths. Explain this design in `README.md`.
 
 ```json
 {
@@ -516,8 +520,8 @@ Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_c
 ### Health Checks (`FR-4.3`)
 
 - `GET /health` — alias of `/health/ready`
-- `GET /health/live` — process alive → `200 {"status":"ok"}`
-- `GET /health/ready` — PostgreSQL ping (`1s` timeout) + Redis `PING` (`1s` timeout); `503` if any dependency fails:
+- `GET /health/live` — process alive → `200 {"status":"ok"}`; the **worker** returns `503 {"status":"stalled"}` when any consumer goroutine has not started a loop iteration for `2 × VISIBILITY_TIMEOUT`
+- `GET /health/ready` — PostgreSQL ping (`1s` timeout) + Redis `PING` (`1s` timeout). API: `503` (`unavailable`) only when PostgreSQL fails; Redis down → `200` `degraded` (DB-first API stays in rotation). Worker: `503` if either fails:
   ```json
   {
     "status": "ok",
@@ -553,6 +557,7 @@ Computed from PostgreSQL (`sent_at` / `failed_at` partial indexes, `percentile_c
 | `GET /api/v1/notifications` | Filters: `?status=pending,failed&channel=sms&priority=high&from=&to=&cursor=&limit=` → `200 {"data":[...],"nextCursor":"..." \| null}` |
 | `POST /api/v1/notifications/{id}/cancel` | `200` updated resource \| `409 {"error":{...,"details":[{"field":"status","code":"current_status","message":"sent"}]}}` \| `404` |
 | `POST /api/v1/notifications/{id}/retry` | `failed → pending` (manual DLQ replay; resets `attempts=0`, `deferrals=0`, clears `last_error`) → `200` \| `409` otherwise \| `404` |
+| `POST /api/v1/notifications/retry` | Bulk DLQ replay: `{channel?, failedFrom?, failedTo?, limit≤1000 (default 100)}` → one fenced `UPDATE … FOR UPDATE SKIP LOCKED` (oldest `failed_at` first) → `200 {"retried","notificationIds"}`; admin scope |
 | `GET /api/v1/batches/{id}` | `200 {"batchId","total","countsByStatus":{"pending":10,"sent":990,...},"createdAt","items":[...],"nextCursor"}` |
 | `POST /api/v1/batches/{id}/cancel` | Cancels every cancellable item in one atomic `UPDATE` → `200 {"batchId","cancelled":N,"notCancellable":M}` |
 | `GET /metrics` | Prometheus text exposition format |
@@ -627,6 +632,7 @@ X-Correlation-ID: 7d3c...
 | `WORKER_METRICS_ADDR` | `:9091` | Worker health & `/metrics` HTTP bind address |
 | `DATABASE_URL` | `postgres://notif:notif@postgres:5432/notif?sslmode=disable` | Mask password in all logs |
 | `REDIS_ADDR` | `redis:6379` | Redis `host:port` |
+| `REDIS_PASSWORD` | *(empty: no AUTH)*; Compose: `local-dev-redis-change-me` | Redis `requirepass` password sent with AUTH by API and workers |
 | `REDIS_POOL_SIZE` | `0` (`auto`) | `0` resolves to `3 * WORKER_CONCURRENCY_PER_CHANNEL + 20` |
 | `DB_MAX_CONNS` | `0` (`auto`) | PostgreSQL pool per process; `0` = API `20`, worker `10`; `0..500`. Keep `replicas × pool + API ≤ max_connections` |
 | `PROVIDER_URL` | `http://mockprovider:8090/` | Switch to `https://webhook.site/<uuid>` for live `EXT-1` proof |
@@ -669,7 +675,7 @@ X-Correlation-ID: 7d3c...
 | `OTEL_SAMPLER_RATIO` | `1.0` | ParentBased trace sampling ratio |
 | `LOG_LEVEL` | `info` | `debug \| info \| warn \| error` |
 
-*(Note: Bonus Phase 10 adds `MAX_WS_CLIENTS=1000` for WebSocket connection capping.)*
+*(Note: Bonus Phase 10 adds `MAX_WS_CLIENTS=1000` for WebSocket connection capping. Added 2026-11-22: `REDIS_PASSWORD`, `API_KEYS`, `API_RATE_LIMIT_PER_SEC=0` (per-key GCRA `{notif}:rl:api:{name}`, fails open), `INGRESS_MAX_QUEUE_DEPTH=1000000` (creates → `503 overloaded` + `Retry-After` while the sampled ready backlog is at/above it).)*
 
 ---
 

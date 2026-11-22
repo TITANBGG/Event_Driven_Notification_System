@@ -111,15 +111,17 @@ drill_1_redis_down_during_create() {
   "${COMPOSE[@]}" stop redis >/dev/null 2>&1
   t0=$(now)
   read -r code id rest < <(create_sms "1$((RUN_TAG % 1000000))")
-  local ready
-  ready="$(http_code "${API_URL}/health/ready")"
-  log "POST -> ${code} in $(($(now) - t0))s, /health/ready -> ${ready}"
+  local ready_out ready ready_status
+  ready_out="$(curl -s --max-time 10 -w '\n%{http_code}' "${API_URL}/health/ready" || true)"
+  ready="$(printf '%s' "$ready_out" | tail -n1)"
+  ready_status="$(printf '%s' "$ready_out" | sed '$d' | json_get status || true)"
+  log "POST -> ${code} in $(($(now) - t0))s, /health/ready -> ${ready} (${ready_status})"
   "${COMPOSE[@]}" start redis >/dev/null 2>&1
   t0=$(now)
-  if [[ "$code" == "202" && "$ready" == "503" ]] && wait_until 120 is_status "$id" sent; then
-    record "$name" PASS "202 accepted while Redis was down, /health/ready=503; sent $(($(now) - t0))s after Redis restart (reconciler step a)"
+  if [[ "$code" == "202" && "$ready" == "200" && "$ready_status" == "degraded" ]] && wait_until 120 is_status "$id" sent; then
+    record "$name" PASS "202 accepted while Redis was down, /health/ready=200 (${ready_status}); sent $(($(now) - t0))s after Redis restart (reconciler step a)"
   else
-    record "$name" FAIL "POST=${code} ready=${ready} final status=$(notification_status "$id")"
+    record "$name" FAIL "POST=${code} ready=${ready}(${ready_status}) final status=$(notification_status "$id")"
   fi
 }
 
