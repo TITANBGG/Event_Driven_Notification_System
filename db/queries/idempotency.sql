@@ -16,6 +16,30 @@ SET request_hash    = EXCLUDED.request_hash,
 WHERE idempotency_keys.expires_at <= now()
 RETURNING *;
 
+-- Batch item keys in one statement (was one INSERT round trip per item). All rows share one
+-- resource_type/response_status/expires_at; a key that is still active is skipped, so the returned
+-- keys are exactly the ones claimed and the caller treats any missing key as a conflict.
+-- name: InsertIdempotencyKeys :many
+INSERT INTO idempotency_keys (
+  key, request_hash, resource_type, resource_id, response_status, created_at, expires_at
+)
+SELECT k.key, k.request_hash, sqlc.arg(resource_type)::text, k.resource_id, sqlc.arg(response_status)::int, now(), sqlc.arg(expires_at)::timestamptz
+FROM (
+  -- Set-returning functions in one select list advance in lockstep (zip), PostgreSQL >= 10.
+  SELECT unnest(sqlc.arg(keys)::text[]) AS key,
+         unnest(sqlc.arg(request_hashes)::text[]) AS request_hash,
+         unnest(sqlc.arg(resource_ids)::uuid[]) AS resource_id
+) AS k
+ON CONFLICT (key) DO UPDATE
+SET request_hash    = EXCLUDED.request_hash,
+    resource_type   = EXCLUDED.resource_type,
+    resource_id     = EXCLUDED.resource_id,
+    response_status = EXCLUDED.response_status,
+    created_at      = now(),
+    expires_at      = EXCLUDED.expires_at
+WHERE idempotency_keys.expires_at <= now()
+RETURNING key;
+
 -- name: GetIdempotencyKey :one
 SELECT *
 FROM idempotency_keys

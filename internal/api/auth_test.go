@@ -48,6 +48,7 @@ var routeScopes = map[string]string{
 	"GET /api/v1/notifications/{id}":         config.ScopeRead,
 	"POST /api/v1/notifications/{id}/cancel": config.ScopeWrite,
 	"POST /api/v1/notifications/{id}/retry":  config.ScopeAdmin,
+	"POST /api/v1/notifications/retry":       config.ScopeAdmin,
 	"GET /api/v1/batches/{id}":               config.ScopeRead,
 	"POST /api/v1/batches/{id}/cancel":       config.ScopeWrite,
 	"POST /api/v1/templates":                 config.ScopeWrite,

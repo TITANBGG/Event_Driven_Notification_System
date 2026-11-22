@@ -35,7 +35,9 @@ func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *f
 		fn(&cfg)
 	}
 
+	nowFn := func() time.Time { return time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC) }
 	store := newFakeStore()
+	store.now = nowFn
 	enq := api.NewMemoryEnqueuer()
 	logger := observability.NewLogger("info", &bytes.Buffer{})
 	r := api.NewRouter(api.Deps{
@@ -43,7 +45,7 @@ func newTestRouter(t *testing.T, opts ...func(*config.Config)) (http.Handler, *f
 		Logger:   logger,
 		Store:    store,
 		Enqueuer: enq,
-		Now:      func() time.Time { return time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC) },
+		Now:      nowFn,
 	})
 	return r, store, enq
 }
@@ -907,7 +909,9 @@ func TestWebSocketConnectSnapshotReceiveEventsAndValidation(t *testing.T) {
 	cfg, err := config.LoadFrom(func(string) (string, bool) { return "", false })
 	require.NoError(t, err)
 
+	nowFn := func() time.Time { return time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC) }
 	store := newFakeStore()
+	store.now = nowFn
 	enq := api.NewMemoryEnqueuer()
 	hub := realtime.NewHub(realtime.HubConfig{MaxClients: 10})
 	hubCtx, cancelHub := context.WithCancel(t.Context())
@@ -926,7 +930,7 @@ func TestWebSocketConnectSnapshotReceiveEventsAndValidation(t *testing.T) {
 		Enqueuer:  enq,
 		Hub:       hub,
 		Publisher: hubPublisher{hub: hub},
-		Now:       func() time.Time { return time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC) },
+		Now:       nowFn,
 	})
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)

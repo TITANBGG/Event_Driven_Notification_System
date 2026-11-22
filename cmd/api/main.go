@@ -17,10 +17,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/TITANBGG/notification-system/internal/api"
+	"github.com/TITANBGG/notification-system/internal/api/middleware"
 	"github.com/TITANBGG/notification-system/internal/config"
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/queue"
+	"github.com/TITANBGG/notification-system/internal/ratelimit"
 	"github.com/TITANBGG/notification-system/internal/realtime"
 	"github.com/TITANBGG/notification-system/internal/repository"
 )
@@ -144,7 +146,7 @@ func run() error {
 		return pingErr
 	}
 
-	rdb := queue.NewClient(cfg.RedisAddr, cfg.RedisPoolSize)
+	rdb := queue.NewClient(cfg.RedisAddr, cfg.RedisPoolSize, queue.WithPassword(cfg.RedisPassword))
 	defer func() {
 		if closeErr := rdb.Close(); closeErr != nil {
 			logger.Warn("failed closing redis client", slog.String("error", closeErr.Error()))
@@ -179,6 +181,11 @@ func run() error {
 	})
 	publisher := realtime.NewRedisPublisher(rdb)
 
+	gate := api.NewIngressGate(cfg.IngressMaxDepth)
+	var apiLimiter middleware.KeyedLimiter
+	if kl := ratelimit.NewKeyed(rdb, cfg.APIRateLimitPerSec); kl != nil {
+		apiLimiter = kl
+	}
 	router := api.NewRouter(api.Deps{
 		Config:         cfg,
 		Logger:         logger,
@@ -188,6 +195,8 @@ func run() error {
 		Hub:            hub,
 		Publisher:      publisher,
 		Metrics:        metrics,
+		IngressGate:    gate,
+		APIRateLimiter: apiLimiter,
 	})
 
 	samplerCtx, stopSampler := context.WithCancel(context.Background())
@@ -196,7 +205,7 @@ func run() error {
 	samplerWg.Add(2)
 	go func() {
 		defer samplerWg.Done()
-		runQueueDepthSampler(samplerCtx, logger, q, metrics)
+		runQueueDepthSampler(samplerCtx, logger, q, metrics, gate)
 	}()
 	go func() {
 		defer samplerWg.Done()
@@ -253,12 +262,15 @@ func run() error {
 	return nil
 }
 
-func runQueueDepthSampler(ctx context.Context, logger *slog.Logger, q *queue.Queue, metrics *observability.Metrics) {
+func runQueueDepthSampler(ctx context.Context, logger *slog.Logger, q *queue.Queue, metrics *observability.Metrics, gate *api.IngressGate) {
 	sample := func() {
 		sCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		depths, err := q.Depths(sCtx)
 		cancel()
 		if err != nil {
+			// Clear stale overload state if Redis becomes unreachable: the DB-first API keeps
+			// accepting notifications while Redis cannot queue them (and reconciler recovers later).
+			gate.Observe(0)
 			if ctx.Err() == nil {
 				logger.Warn("failed sampling redis queue depths", slog.String("error", err.Error()))
 			}
@@ -266,11 +278,14 @@ func runQueueDepthSampler(ctx context.Context, logger *slog.Logger, q *queue.Que
 		}
 		channels := []domain.Channel{domain.ChannelSMS, domain.ChannelEmail, domain.ChannelPush}
 		priorities := []domain.Priority{domain.PriorityHigh, domain.PriorityNormal, domain.PriorityLow}
+		var ready int64
 		for _, ch := range channels {
 			for _, pr := range priorities {
 				metrics.SetQueueDepth(ch.String(), pr.String(), depths.ByChannel[ch][pr])
+				ready += depths.ByChannel[ch][pr]
 			}
 		}
+		gate.Observe(ready)
 		metrics.SetDelayedDepth(depths.Delayed)
 		metrics.SetDLQDepth(depths.DLQ)
 		metrics.SetInflightDepth(depths.Inflight)

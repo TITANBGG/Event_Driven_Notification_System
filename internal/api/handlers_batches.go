@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 
+	"github.com/google/uuid"
+
 	"github.com/TITANBGG/notification-system/internal/domain"
 	"github.com/TITANBGG/notification-system/internal/observability"
 	"github.com/TITANBGG/notification-system/internal/realtime"
@@ -89,13 +91,17 @@ func (h *handler) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cancelledIDs, err := h.store.CancelBatch(r.Context(), id)
+	cancelledRows, err := h.store.CancelBatch(r.Context(), id)
 	if err != nil {
 		writeError(w, r, h.logger, err)
 		return
 	}
 
-	if len(cancelledIDs) > 0 {
+	if len(cancelledRows) > 0 {
+		cancelledIDs := make([]uuid.UUID, len(cancelledRows))
+		for i, row := range cancelledRows {
+			cancelledIDs[i] = row.ID
+		}
 		cleanupCtx, cancelCleanup := redisFollowUpCtx(r.Context())
 		defer cancelCleanup()
 		if cancelErr := h.enqueuer.CancelDelayed(cleanupCtx, cancelledIDs...); cancelErr != nil {
@@ -107,32 +113,24 @@ func (h *handler) handleCancelBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		cid := observability.CorrelationID(r.Context())
 		now := h.nowFn().UTC()
-		cancelledItems, listErr := h.listAllBatchItemsOrdered(r.Context(), id, batch.Total)
-		if listErr == nil {
-			cancelSet := make(map[string]struct{}, len(cancelledIDs))
-			for _, cidUUID := range cancelledIDs {
-				cancelSet[cidUUID.String()] = struct{}{}
-			}
-			var events []realtime.Event
-			for _, item := range cancelledItems {
-				if _, ok := cancelSet[item.ID.String()]; ok {
-					events = append(events, realtime.NewEvent(item, now, cid))
-					// Cancellation is a terminal outcome decided by the API, so the API (not a worker) counts it.
-					h.metrics.IncNotificationProcessed(item.Channel.String(), domain.StatusCancelled.String())
-				}
-			}
-			if len(events) > 0 && h.publisher != nil {
-				if pubErr := h.publisher.Publish(cleanupCtx, events...); pubErr != nil {
-					observability.LoggerFrom(r.Context(), h.logger).Warn("failed publishing batch cancel events",
-						slog.String("batch_id", id.String()),
-						slog.String("error", pubErr.Error()),
-					)
-				}
+		// CancelBatch returns the cancelled rows (RETURNING *), so the events need no second read.
+		events := make([]realtime.Event, 0, len(cancelledRows))
+		for _, item := range cancelledRows {
+			events = append(events, realtime.NewEvent(item, now, cid))
+			// Cancellation is a terminal outcome decided by the API, so the API (not a worker) counts it.
+			h.metrics.IncNotificationProcessed(item.Channel.String(), domain.StatusCancelled.String())
+		}
+		if h.publisher != nil {
+			if pubErr := h.publisher.Publish(cleanupCtx, events...); pubErr != nil {
+				observability.LoggerFrom(r.Context(), h.logger).Warn("failed publishing batch cancel events",
+					slog.String("batch_id", id.String()),
+					slog.String("error", pubErr.Error()),
+				)
 			}
 		}
 	}
 
-	cancelled := len(cancelledIDs)
+	cancelled := len(cancelledRows)
 	notCancellable := batch.Total - cancelled
 	if notCancellable < 0 {
 		notCancellable = 0

@@ -30,6 +30,13 @@ func TestMapError(t *testing.T) {
 	otherErr := errors.New("connection refused")
 	assert.Equal(t, otherErr, MapError(otherErr))
 
+	// Text PostgreSQL cannot store is client input: a validation error (422), not a 500.
+	for _, code := range []string{"22021", "22P05"} {
+		var ve *domain.ValidationError
+		require.ErrorAs(t, MapError(&pgconn.PgError{Code: code}), &ve, code)
+		assert.Equal(t, "invalid_character", ve.Fields[0].Code)
+	}
+
 	assert.ErrorIs(t, mapFencedError(pgx.ErrNoRows), domain.ErrLeaseLost)
 }
 

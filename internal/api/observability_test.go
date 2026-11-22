@@ -80,18 +80,18 @@ func TestHealthReadyAndAlias(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, recPG.Code)
 	var pgBody api.ReadyStatusResponse
 	require.NoError(t, json.Unmarshal(recPG.Body.Bytes(), &pgBody))
-	assert.Equal(t, "degraded", pgBody.Status)
+	assert.Equal(t, "unavailable", pgBody.Status)
 	assert.Equal(t, "down", pgBody.Checks.Postgres.Status)
 	assert.Equal(t, "ok", pgBody.Checks.Redis.Status)
 	store.SetPingError(nil)
 
-	// Redis down -> 503 with redis="down"
+	// Redis down -> still ready (200): the DB-first API keeps accepting notifications; the body reports it.
 	qi.mu.Lock()
 	qi.pingErr = errors.New("redis down")
 	qi.mu.Unlock()
 	recRD := httptest.NewRecorder()
 	router.ServeHTTP(recRD, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health/ready", nil))
-	require.Equal(t, http.StatusServiceUnavailable, recRD.Code)
+	require.Equal(t, http.StatusOK, recRD.Code)
 	var rdBody api.ReadyStatusResponse
 	require.NoError(t, json.Unmarshal(recRD.Body.Bytes(), &rdBody))
 	assert.Equal(t, "degraded", rdBody.Status)

@@ -140,3 +140,64 @@ func (q *Queries) InsertIdempotencyKey(ctx context.Context, arg InsertIdempotenc
 	)
 	return i, err
 }
+
+const insertIdempotencyKeys = `-- name: InsertIdempotencyKeys :many
+INSERT INTO idempotency_keys (
+  key, request_hash, resource_type, resource_id, response_status, created_at, expires_at
+)
+SELECT k.key, k.request_hash, $1::text, k.resource_id, $2::int, now(), $3::timestamptz
+FROM (
+  -- Set-returning functions in one select list advance in lockstep (zip), PostgreSQL >= 10.
+  SELECT unnest($4::text[]) AS key,
+         unnest($5::text[]) AS request_hash,
+         unnest($6::uuid[]) AS resource_id
+) AS k
+ON CONFLICT (key) DO UPDATE
+SET request_hash    = EXCLUDED.request_hash,
+    resource_type   = EXCLUDED.resource_type,
+    resource_id     = EXCLUDED.resource_id,
+    response_status = EXCLUDED.response_status,
+    created_at      = now(),
+    expires_at      = EXCLUDED.expires_at
+WHERE idempotency_keys.expires_at <= now()
+RETURNING key
+`
+
+type InsertIdempotencyKeysParams struct {
+	ResourceType   string      `json:"resource_type"`
+	ResponseStatus int32       `json:"response_status"`
+	ExpiresAt      time.Time   `json:"expires_at"`
+	Keys           []string    `json:"keys"`
+	RequestHashes  []string    `json:"request_hashes"`
+	ResourceIds    []uuid.UUID `json:"resource_ids"`
+}
+
+// Batch item keys in one statement (was one INSERT round trip per item). All rows share one
+// resource_type/response_status/expires_at; a key that is still active is skipped, so the returned
+// keys are exactly the ones claimed and the caller treats any missing key as a conflict.
+func (q *Queries) InsertIdempotencyKeys(ctx context.Context, arg InsertIdempotencyKeysParams) ([]string, error) {
+	rows, err := q.db.Query(ctx, insertIdempotencyKeys,
+		arg.ResourceType,
+		arg.ResponseStatus,
+		arg.ExpiresAt,
+		arg.Keys,
+		arg.RequestHashes,
+		arg.ResourceIds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		items = append(items, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}

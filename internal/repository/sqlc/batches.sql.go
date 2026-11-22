@@ -19,23 +19,51 @@ SET status = 'cancelled',
     updated_at = now()
 WHERE batch_id = $1
   AND status IN ('scheduled', 'pending', 'retrying')
-RETURNING id
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
 `
 
 // Returning cancelled IDs lets callers clean up optional Redis delayed entries without extra queries.
-func (q *Queries) CancelBatch(ctx context.Context, batchID *uuid.UUID) ([]uuid.UUID, error) {
+func (q *Queries) CancelBatch(ctx context.Context, batchID *uuid.UUID) ([]Notification, error) {
 	rows, err := q.db.Query(ctx, cancelBatch, batchID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []uuid.UUID{}
+	items := []Notification{}
 	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
+		var i Notification
+		if err := rows.Scan(
+			&i.ID,
+			&i.BatchID,
+			&i.Channel,
+			&i.Priority,
+			&i.Status,
+			&i.Recipient,
+			&i.Subject,
+			&i.Title,
+			&i.Content,
+			&i.IdempotencyKey,
+			&i.Attempts,
+			&i.MaxAttempts,
+			&i.Deferrals,
+			&i.ScheduledAt,
+			&i.NextAttemptAt,
+			&i.ProcessingStartedAt,
+			&i.LastError,
+			&i.ProviderMessageID,
+			&i.CorrelationID,
+			&i.Traceparent,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.SentAt,
+			&i.FailedAt,
+			&i.CancelledAt,
+			&i.TemplateID,
+			&i.TemplateVars,
+		); err != nil {
 			return nil, err
 		}
-		items = append(items, id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

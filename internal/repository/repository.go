@@ -125,6 +125,13 @@ func MapError(err error) error {
 	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 		return fmt.Errorf("%w: %s", domain.ErrDuplicateKey, pgErr.ConstraintName)
 	}
+	// Second line of defence behind domain validation: text PostgreSQL cannot store (NUL, invalid
+	// encoding) is the client's input, so it maps to a 422, never a 500.
+	if errors.As(err, &pgErr) && (pgErr.Code == "22021" || pgErr.Code == "22P05") {
+		ve := &domain.ValidationError{}
+		ve.Add("body", "invalid_character", "request contains characters that cannot be stored (for example NUL)")
+		return ve
+	}
 	return err
 }
 
@@ -200,15 +207,17 @@ func (s *Store) ListBatchItems(ctx context.Context, batchID uuid.UUID, cursor *C
 }
 
 // CancelBatch atomically cancels every cancellable notification in a batch and returns their IDs.
-func (s *Store) CancelBatch(ctx context.Context, batchID uuid.UUID) ([]uuid.UUID, error) {
+func (s *Store) CancelBatch(ctx context.Context, batchID uuid.UUID) ([]domain.Notification, error) {
 	if s.q == nil {
 		return nil, errors.New("repository store is not initialized")
 	}
-	ids, err := s.q.CancelBatch(ctx, &batchID)
+	// RETURNING * hands back the cancelled rows themselves, so the caller can publish their
+	// status events without reading the whole batch again.
+	rows, err := s.q.CancelBatch(ctx, &batchID)
 	if err != nil {
 		return nil, MapError(err)
 	}
-	return ids, nil
+	return toDomainNotifications(rows), nil
 }
 
 // InsertNotification persists a single notification row and returns the persisted aggregate.
@@ -470,6 +479,56 @@ func (s *Store) ManualRetry(ctx context.Context, id uuid.UUID) (*domain.Notifica
 	return nil, domain.ErrInvalidTransition
 }
 
+// RetryFailedFilter selects failed notifications for a bulk DLQ replay.
+type RetryFailedFilter struct {
+	Channel    *domain.Channel
+	FailedFrom *time.Time
+	FailedTo   *time.Time
+	Limit      int
+}
+
+// ManualRetryFailedBulk resets up to f.Limit failed notifications (oldest failure first) to pending in
+// one statement and returns them.
+func (s *Store) ManualRetryFailedBulk(ctx context.Context, f RetryFailedFilter) ([]domain.Notification, error) {
+	if s.q == nil {
+		return nil, errors.New("repository store is not initialized")
+	}
+	params := sqlc.ManualRetryFailedBulkParams{PageLimit: clampInt32(f.Limit)}
+	if f.Channel != nil {
+		ch := f.Channel.String()
+		params.Channel = &ch
+	}
+	if f.FailedFrom != nil {
+		t := f.FailedFrom.UTC()
+		params.FailedFrom = &t
+	}
+	if f.FailedTo != nil {
+		t := f.FailedTo.UTC()
+		params.FailedTo = &t
+	}
+	rows, err := s.q.ManualRetryFailedBulk(ctx, params)
+	if err != nil {
+		return nil, MapError(err)
+	}
+	return toDomainNotifications(rows), nil
+}
+
+// ExtendLease restarts the visibility timeout of a claimed row, fenced on the claimed attempt.
+// domain.ErrLeaseLost means the reconciler already reclaimed it.
+func (s *Store) ExtendLease(ctx context.Context, id uuid.UUID, claimedAttempts int) error {
+	if s.q == nil {
+		return errors.New("repository store is not initialized")
+	}
+	n, err := s.q.ExtendProcessingLease(ctx, sqlc.ExtendProcessingLeaseParams{ID: id, ClaimedAttempts: clampInt32(claimedAttempts)})
+	if err != nil {
+		return MapError(err)
+	}
+	if n == 0 {
+		return domain.ErrLeaseLost
+	}
+	return nil
+}
+
 // FindStalePending scans pending rows older than staleAfter for reconciler step (a).
 func (s *Store) FindStalePending(ctx context.Context, staleAfter time.Duration, afterID *uuid.UUID, limit int) ([]domain.Notification, error) {
 	if s.q == nil {
@@ -619,6 +678,37 @@ func (s *Store) InsertIdempotencyKey(ctx context.Context, k domain.IdempotencyKe
 	}
 	out := toDomainIdempotencyKey(row)
 	return &out, true, nil
+}
+
+// InsertIdempotencyKeys claims every key in one statement and returns the keys it claimed; a key that
+// is missing from the result is still active for another resource (a conflict). All records must
+// share ResourceType, ResponseStatus and ExpiresAt (true for the items of one batch).
+func (s *Store) InsertIdempotencyKeys(ctx context.Context, keys []domain.IdempotencyKey) ([]string, error) {
+	if s.q == nil {
+		return nil, errors.New("repository store is not initialized")
+	}
+	if len(keys) == 0 {
+		return nil, nil
+	}
+	params := sqlc.InsertIdempotencyKeysParams{
+		ResourceType:   string(keys[0].ResourceType),
+		ResponseStatus: clampInt32(keys[0].ResponseStatus),
+		ExpiresAt:      keys[0].ExpiresAt.UTC(),
+		Keys:           make([]string, len(keys)),
+		RequestHashes:  make([]string, len(keys)),
+		ResourceIds:    make([]uuid.UUID, len(keys)),
+	}
+	for i, k := range keys {
+		if k.ResourceType != keys[0].ResourceType || k.ResponseStatus != keys[0].ResponseStatus || !k.ExpiresAt.Equal(keys[0].ExpiresAt) {
+			return nil, errors.New("InsertIdempotencyKeys: records must share resource type, response status and expiry")
+		}
+		params.Keys[i], params.RequestHashes[i], params.ResourceIds[i] = k.Key, k.RequestHash, k.ResourceID
+	}
+	claimed, err := s.q.InsertIdempotencyKeys(ctx, params)
+	if err != nil {
+		return nil, MapError(err)
+	}
+	return claimed, nil
 }
 
 // GetIdempotencyKey returns an unexpired idempotency key record by key.

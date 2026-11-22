@@ -56,9 +56,11 @@ func FuzzAPINeverReturns5xxForClientInput(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, route uint8, body, key, query string) {
 		// A fresh store per input keeps memory flat over millions of executions.
+		store := newFakeStore()
+		store.now = now
 		h := api.NewRouter(api.Deps{
 			Config: cfg, Logger: observability.NewLogger("error", &bytes.Buffer{}),
-			Store: newFakeStore(), Enqueuer: api.NewMemoryEnqueuer(), Hub: hub, Now: now,
+			Store: store, Enqueuer: api.NewMemoryEnqueuer(), Hub: hub, Now: now,
 		})
 		const someID = "01936f7e-0000-7000-8000-000000000001"
 		var method, path string

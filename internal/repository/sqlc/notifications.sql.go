@@ -194,6 +194,30 @@ func (q *Queries) DeferCircuitOpen(ctx context.Context, arg DeferCircuitOpenPara
 	return i, err
 }
 
+const extendProcessingLease = `-- name: ExtendProcessingLease :execrows
+UPDATE notifications
+SET processing_started_at = now(),
+    updated_at = now()
+WHERE id = $1
+  AND status = 'processing'
+  AND attempts = $2
+`
+
+type ExtendProcessingLeaseParams struct {
+	ID              uuid.UUID `json:"id"`
+	ClaimedAttempts int32     `json:"claimed_attempts"`
+}
+
+// Lease extension after a long rate-limit wait, fenced like every post-claim update: zero rows means
+// the reconciler already reclaimed the row and the worker must not send.
+func (q *Queries) ExtendProcessingLease(ctx context.Context, arg ExtendProcessingLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, extendProcessingLease, arg.ID, arg.ClaimedAttempts)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const failAbandoned = `-- name: FailAbandoned :one
 UPDATE notifications
 SET status = 'failed',
@@ -702,6 +726,93 @@ func (q *Queries) ManualRetry(ctx context.Context, id uuid.UUID) (Notification, 
 		&i.TemplateVars,
 	)
 	return i, err
+}
+
+const manualRetryFailedBulk = `-- name: ManualRetryFailedBulk :many
+UPDATE notifications
+SET status = 'pending',
+    attempts = 0,
+    deferrals = 0,
+    last_error = NULL,
+    failed_at = NULL,
+    next_attempt_at = NULL,
+    updated_at = now()
+WHERE id IN (
+    SELECT n.id
+    FROM notifications n
+    WHERE n.status = 'failed'
+      AND ($1::text IS NULL OR n.channel = $1::text)
+      AND ($2::timestamptz IS NULL OR n.failed_at >= $2::timestamptz)
+      AND ($3::timestamptz IS NULL OR n.failed_at < $3::timestamptz)
+    ORDER BY n.failed_at ASC, n.id ASC
+    LIMIT $4::int
+    FOR UPDATE SKIP LOCKED
+  )
+  AND status = 'failed'
+RETURNING id, batch_id, channel, priority, status, recipient, subject, title, content, idempotency_key, attempts, max_attempts, deferrals, scheduled_at, next_attempt_at, processing_started_at, last_error, provider_message_id, correlation_id, traceparent, created_at, updated_at, sent_at, failed_at, cancelled_at, template_id, template_vars
+`
+
+type ManualRetryFailedBulkParams struct {
+	Channel    *string    `json:"channel"`
+	FailedFrom *time.Time `json:"failed_from"`
+	FailedTo   *time.Time `json:"failed_to"`
+	PageLimit  int32      `json:"page_limit"`
+}
+
+// Bulk DLQ replay: resets at most page_limit failed rows (oldest failure first) in one statement.
+// SKIP LOCKED lets two concurrent replays split the work instead of blocking; the outer
+// status = 'failed' guard mirrors ManualRetry's allowed_from set.
+func (q *Queries) ManualRetryFailedBulk(ctx context.Context, arg ManualRetryFailedBulkParams) ([]Notification, error) {
+	rows, err := q.db.Query(ctx, manualRetryFailedBulk,
+		arg.Channel,
+		arg.FailedFrom,
+		arg.FailedTo,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Notification{}
+	for rows.Next() {
+		var i Notification
+		if err := rows.Scan(
+			&i.ID,
+			&i.BatchID,
+			&i.Channel,
+			&i.Priority,
+			&i.Status,
+			&i.Recipient,
+			&i.Subject,
+			&i.Title,
+			&i.Content,
+			&i.IdempotencyKey,
+			&i.Attempts,
+			&i.MaxAttempts,
+			&i.Deferrals,
+			&i.ScheduledAt,
+			&i.NextAttemptAt,
+			&i.ProcessingStartedAt,
+			&i.LastError,
+			&i.ProviderMessageID,
+			&i.CorrelationID,
+			&i.Traceparent,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.SentAt,
+			&i.FailedAt,
+			&i.CancelledAt,
+			&i.TemplateID,
+			&i.TemplateVars,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const markFailed = `-- name: MarkFailed :one

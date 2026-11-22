@@ -18,7 +18,7 @@ type Store interface {
 	GetBatch(ctx context.Context, id uuid.UUID) (*domain.Batch, error)
 	GetBatchSummary(ctx context.Context, batchID uuid.UUID) (map[domain.Status]int64, error)
 	ListBatchItems(ctx context.Context, batchID uuid.UUID, cursor *repository.Cursor, limit int) ([]domain.Notification, error)
-	CancelBatch(ctx context.Context, batchID uuid.UUID) ([]uuid.UUID, error)
+	CancelBatch(ctx context.Context, batchID uuid.UUID) ([]domain.Notification, error)
 
 	InsertNotification(ctx context.Context, n domain.Notification) (*domain.Notification, error)
 	CopyNotifications(ctx context.Context, items []domain.Notification) (int64, error)
@@ -26,10 +26,12 @@ type Store interface {
 	ListNotifications(ctx context.Context, f repository.ListFilter) ([]domain.Notification, error)
 	Cancel(ctx context.Context, id uuid.UUID) (*domain.Notification, error)
 	ManualRetry(ctx context.Context, id uuid.UUID) (*domain.Notification, error)
+	ManualRetryFailedBulk(ctx context.Context, f repository.RetryFailedFilter) ([]domain.Notification, error)
 
 	ListAttempts(ctx context.Context, notificationID uuid.UUID) ([]domain.DeliveryAttempt, error)
 
 	InsertIdempotencyKey(ctx context.Context, k domain.IdempotencyKey) (*domain.IdempotencyKey, bool, error)
+	InsertIdempotencyKeys(ctx context.Context, keys []domain.IdempotencyKey) ([]string, error)
 	GetIdempotencyKey(ctx context.Context, key string) (*domain.IdempotencyKey, error)
 	GetIdempotencyKeysByKeys(ctx context.Context, keys []string) ([]domain.IdempotencyKey, error)
 

@@ -58,6 +58,24 @@ func ValidateNotificationWithPrefix(prefix string, in CreateNotificationInput, n
 		ve.Add(joinField(prefix, "content"), "required", "content is required")
 	}
 
+	// PostgreSQL text cannot store NUL (it was a 500); other control characters have no place in a
+	// message either and break log lines and provider payloads. Tab, newline, carriage return and
+	// form feed (a GSM 03.38 extension character) stay allowed in bodies.
+	checkText := func(field, value, allowed string) {
+		if hasForbiddenControl(value, allowed) {
+			ve.Add(joinField(prefix, field), "invalid_character", "must not contain NUL or other control characters")
+		}
+	}
+	checkText("recipient", in.Recipient, "")
+	checkText("content", in.Content, "\t\n\r\f")
+	if in.Subject != nil {
+		// CR/LF in a subject is reported by its own header-injection rule (invalid_subject).
+		checkText("subject", *in.Subject, "\r\n")
+	}
+	if in.Title != nil {
+		checkText("title", *in.Title, "")
+	}
+
 	if chErr == nil {
 		switch channel {
 		case ChannelSMS:
@@ -116,6 +134,10 @@ func validateEmail(prefix string, in CreateNotificationInput, recipientBlank boo
 			// Require exact equality so display names ("Alice <a@b.com>"), angle brackets, or extra spaces fail.
 			if err != nil || parsed.Address != in.Recipient {
 				ve.Add(joinField(prefix, "recipient"), "invalid_email", "must be a valid email address without a display name")
+			} else if domain := in.Recipient[strings.LastIndex(in.Recipient, "@")+1:]; !strings.Contains(strings.Trim(domain, "."), ".") {
+				// net/mail accepts RFC 5322 dot-atoms such as "user@localhost"; no public mailbox lives
+				// on a single-label domain, so require a dot to catch typos like "user@gmailcom".
+				ve.Add(joinField(prefix, "recipient"), "invalid_email", "email domain must contain a dot (e.g. example.com)")
 			}
 		}
 	}
@@ -223,4 +245,15 @@ func joinField(prefix, field string) string {
 		return field
 	}
 	return prefix + field
+}
+
+// hasForbiddenControl reports NUL, C0/C1 control characters and DEL, except the characters in
+// allowed (message bodies may contain tab, newline, carriage return and form feed).
+func hasForbiddenControl(s, allowed string) bool {
+	for _, r := range s {
+		if unicode.IsControl(r) && !strings.ContainsRune(allowed, r) {
+			return true
+		}
+	}
+	return false
 }

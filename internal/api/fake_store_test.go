@@ -65,7 +65,9 @@ type fakeStore struct {
 	forcedErr    error
 	pingErr      error
 	metricsCalls int
-	st           *fakeDBState
+	// bulkKeyInserts counts InsertIdempotencyKeys calls (one per batch, not one per item).
+	bulkKeyInserts int
+	st             *fakeDBState
 }
 
 func (f *fakeStore) SetForcedError(err error) {
@@ -78,6 +80,14 @@ func (f *fakeStore) SetPingError(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pingErr = err
+}
+
+func (f *fakeStore) BulkKeyInserts() int {
+	f.txMu.Lock()
+	defer f.txMu.Unlock()
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.bulkKeyInserts
 }
 
 func (f *fakeStore) MetricsCalls() int {
@@ -159,7 +169,7 @@ func (f *fakeStore) ListBatchItems(_ context.Context, batchID uuid.UUID, cursor 
 	return (&fakeTxStore{root: f, st: f.st}).listBatchItemsLocked(batchID, cursor, limit)
 }
 
-func (f *fakeStore) CancelBatch(_ context.Context, batchID uuid.UUID) ([]uuid.UUID, error) {
+func (f *fakeStore) CancelBatch(_ context.Context, batchID uuid.UUID) ([]domain.Notification, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return (&fakeTxStore{root: f, st: f.st}).cancelBatchLocked(batchID)
@@ -202,6 +212,19 @@ func (f *fakeStore) ManualRetry(_ context.Context, id uuid.UUID) (*domain.Notifi
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return (&fakeTxStore{root: f, st: f.st}).manualRetryLocked(id)
+}
+
+func (f *fakeStore) ManualRetryFailedBulk(_ context.Context, filter repository.RetryFailedFilter) ([]domain.Notification, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return (&fakeTxStore{root: f, st: f.st}).manualRetryFailedBulkLocked(filter)
+}
+
+func (f *fakeStore) InsertIdempotencyKeys(_ context.Context, keys []domain.IdempotencyKey) ([]string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bulkKeyInserts++
+	return (&fakeTxStore{root: f, st: f.st}).insertIdempotencyKeysLocked(keys)
 }
 
 func (f *fakeStore) ListAttempts(_ context.Context, notificationID uuid.UUID) ([]domain.DeliveryAttempt, error) {
@@ -336,7 +359,7 @@ func (t *fakeTxStore) GetBatchSummary(_ context.Context, batchID uuid.UUID) (map
 func (t *fakeTxStore) ListBatchItems(_ context.Context, batchID uuid.UUID, cursor *repository.Cursor, limit int) ([]domain.Notification, error) {
 	return t.listBatchItemsLocked(batchID, cursor, limit)
 }
-func (t *fakeTxStore) CancelBatch(_ context.Context, batchID uuid.UUID) ([]uuid.UUID, error) {
+func (t *fakeTxStore) CancelBatch(_ context.Context, batchID uuid.UUID) ([]domain.Notification, error) {
 	return t.cancelBatchLocked(batchID)
 }
 func (t *fakeTxStore) InsertNotification(_ context.Context, n domain.Notification) (*domain.Notification, error) {
@@ -356,6 +379,13 @@ func (t *fakeTxStore) Cancel(_ context.Context, id uuid.UUID) (*domain.Notificat
 }
 func (t *fakeTxStore) ManualRetry(_ context.Context, id uuid.UUID) (*domain.Notification, error) {
 	return t.manualRetryLocked(id)
+}
+func (t *fakeTxStore) ManualRetryFailedBulk(_ context.Context, filter repository.RetryFailedFilter) ([]domain.Notification, error) {
+	return t.manualRetryFailedBulkLocked(filter)
+}
+func (t *fakeTxStore) InsertIdempotencyKeys(_ context.Context, keys []domain.IdempotencyKey) ([]string, error) {
+	t.root.bulkKeyInserts++
+	return t.insertIdempotencyKeysLocked(keys)
 }
 func (t *fakeTxStore) ListAttempts(_ context.Context, notificationID uuid.UUID) ([]domain.DeliveryAttempt, error) {
 	return t.listAttemptsLocked(notificationID)
@@ -443,19 +473,57 @@ func (t *fakeTxStore) listBatchItemsLocked(batchID uuid.UUID, cursor *repository
 	return items, nil
 }
 
-func (t *fakeTxStore) cancelBatchLocked(batchID uuid.UUID) ([]uuid.UUID, error) {
+func (t *fakeTxStore) cancelBatchLocked(batchID uuid.UUID) ([]domain.Notification, error) {
 	now := t.root.nextStamp()
-	var ids []uuid.UUID
+	var out []domain.Notification
 	for id, n := range t.st.notifications {
 		if n.BatchID != nil && *n.BatchID == batchID && domain.IsCancellable(n.Status) {
 			n.Status = domain.StatusCancelled
 			n.CancelledAt = &now
 			n.UpdatedAt = now
 			t.st.notifications[id] = n
-			ids = append(ids, id)
+			out = append(out, n)
 		}
 	}
-	return ids, nil
+	return out, nil
+}
+
+func (t *fakeTxStore) manualRetryFailedBulkLocked(f repository.RetryFailedFilter) ([]domain.Notification, error) {
+	var candidates []domain.Notification
+	for _, n := range t.st.notifications {
+		if n.Status != domain.StatusFailed || (f.Channel != nil && n.Channel != *f.Channel) {
+			continue
+		}
+		if n.FailedAt != nil && ((f.FailedFrom != nil && n.FailedAt.Before(*f.FailedFrom)) || (f.FailedTo != nil && !n.FailedAt.Before(*f.FailedTo))) {
+			continue
+		}
+		candidates = append(candidates, n)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return bytes.Compare(candidates[i].ID[:], candidates[j].ID[:]) < 0 })
+	if len(candidates) > f.Limit {
+		candidates = candidates[:f.Limit]
+	}
+	out := make([]domain.Notification, 0, len(candidates))
+	for _, n := range candidates {
+		updated, err := t.manualRetryLocked(n.ID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *updated)
+	}
+	return out, nil
+}
+
+func (t *fakeTxStore) insertIdempotencyKeysLocked(keys []domain.IdempotencyKey) ([]string, error) {
+	claimed := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if _, ok, err := t.insertIdempotencyKeyLocked(k); err != nil {
+			return nil, err
+		} else if ok {
+			claimed = append(claimed, k.Key)
+		}
+	}
+	return claimed, nil
 }
 
 func (t *fakeTxStore) insertNotificationLocked(n domain.Notification) (*domain.Notification, error) {

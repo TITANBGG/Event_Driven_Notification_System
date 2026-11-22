@@ -33,4 +33,4 @@ SET status = 'cancelled',
     updated_at = now()
 WHERE batch_id = $1
   AND status IN ('scheduled', 'pending', 'retrying')
-RETURNING id;
+RETURNING *;

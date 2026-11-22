@@ -11,38 +11,78 @@ import (
 
 const metricsCacheTTL = 2 * time.Second
 
+// handleMetricsSnapshot serves the JSON snapshot from a 2s cache. At most one request computes it at a
+// time (single flight): while a refresh runs, other requests get the previous snapshot if there is one,
+// or wait for the refresh, so a burst of dashboard polls after expiry costs one set of PostgreSQL
+// percentile queries instead of one per request.
 func (h *handler) handleMetricsSnapshot(w http.ResponseWriter, r *http.Request) {
-	now := h.nowFn().UTC()
-
-	h.metricsMu.Lock()
-	if now.Before(h.metricsExp) {
-		cached := h.metricsCache
+	for {
+		h.metricsMu.Lock()
+		now := h.nowFn().UTC()
+		if h.metricsHasCache && now.Before(h.metricsExp) {
+			cached := h.metricsCache
+			h.metricsMu.Unlock()
+			writeJSON(w, h.logger, http.StatusOK, cached)
+			return
+		}
+		inflight := h.metricsRefresh
+		if inflight == nil {
+			done := make(chan struct{})
+			h.metricsRefresh = done
+			h.metricsMu.Unlock()
+			snapshot, err := h.computeMetricsSnapshot(r)
+			h.metricsMu.Lock()
+			if err == nil {
+				h.metricsCache, h.metricsHasCache = snapshot, true
+				h.metricsExp = h.nowFn().UTC().Add(metricsCacheTTL)
+			}
+			h.metricsRefresh = nil
+			close(done)
+			h.metricsMu.Unlock()
+			if err != nil {
+				writeError(w, r, h.logger, err)
+				return
+			}
+			writeJSON(w, h.logger, http.StatusOK, snapshot)
+			return
+		}
+		if h.metricsHasCache {
+			stale := h.metricsCache
+			h.metricsMu.Unlock()
+			writeJSON(w, h.logger, http.StatusOK, stale)
+			return
+		}
 		h.metricsMu.Unlock()
-		writeJSON(w, h.logger, http.StatusOK, cached)
-		return
+		// First snapshot ever is being computed: wait for it, then loop to serve it (or, if it
+		// failed, compute it ourselves).
+		select {
+		case <-inflight:
+		case <-r.Context().Done():
+			writeError(w, r, h.logger, r.Context().Err())
+			return
+		}
 	}
-	h.metricsMu.Unlock()
+}
 
+func (h *handler) computeMetricsSnapshot(r *http.Request) (MetricsSnapshotResponse, error) {
+	now := h.nowFn().UTC()
 	var depths queue.MetricsDepths
 	if h.queueInspector != nil {
 		sampled, err := h.queueInspector.Depths(r.Context())
 		if err != nil {
-			writeError(w, r, h.logger, err)
-			return
+			return MetricsSnapshotResponse{}, err
 		}
 		depths = sampled
 	}
 
 	windowRows, err := h.store.MetricsWindowCounts(r.Context())
 	if err != nil {
-		writeError(w, r, h.logger, err)
-		return
+		return MetricsSnapshotResponse{}, err
 	}
 
 	latencyStats, err := h.store.LatencyPercentiles(r.Context())
 	if err != nil {
-		writeError(w, r, h.logger, err)
-		return
+		return MetricsSnapshotResponse{}, err
 	}
 
 	var windows WindowsResponse
@@ -84,12 +124,7 @@ func (h *handler) handleMetricsSnapshot(w http.ResponseWriter, r *http.Request) 
 		},
 	}
 
-	h.metricsMu.Lock()
-	h.metricsCache = snapshot
-	h.metricsExp = h.nowFn().UTC().Add(metricsCacheTTL)
-	h.metricsMu.Unlock()
-
-	writeJSON(w, h.logger, http.StatusOK, snapshot)
+	return snapshot, nil
 }
 
 // slot returns the stats cell for a window and channel, or nil for one the response does not have.

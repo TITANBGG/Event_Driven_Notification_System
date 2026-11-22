@@ -23,6 +23,7 @@ type Config struct {
 	WorkerMetricsAddr  string
 	DatabaseURL        string
 	RedisAddr          string
+	RedisPassword      string
 	RedisPoolSize      int
 	DBMaxConns         int
 	ProviderURL        string
@@ -62,6 +63,8 @@ type Config struct {
 	ScheduleMaxAhead   time.Duration
 	CORSAllowedOrigins []string
 	APIKeys            []APIKey
+	APIRateLimitPerSec int
+	IngressMaxDepth    int64
 	OTELEndpoint       string
 	OTELSamplerRatio   float64
 	LogLevel           string
@@ -180,6 +183,7 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		WorkerMetricsAddr:  getStr("WORKER_METRICS_ADDR", ":9091"),
 		DatabaseURL:        getStr("DATABASE_URL", "postgres://notif:notif@postgres:5432/notif?sslmode=disable"),
 		RedisAddr:          getStr("REDIS_ADDR", "redis:6379"),
+		RedisPassword:      getStrAllowEmpty("REDIS_PASSWORD", ""),
 		RedisPoolSize:      getInt("REDIS_POOL_SIZE", 0),
 		DBMaxConns:         getInt("DB_MAX_CONNS", 0),
 		ProviderURL:        getStr("PROVIDER_URL", "http://mockprovider:8090/"),
@@ -219,6 +223,8 @@ func LoadFrom(lookup func(string) (string, bool)) (Config, error) {
 		ScheduleMaxAhead:   getDuration("SCHEDULE_MAX_AHEAD", 720*time.Hour),
 		CORSAllowedOrigins: parseCSV(getStrAllowEmpty("CORS_ALLOWED_ORIGINS", "http://localhost:8081")),
 		APIKeys:            apiKeys,
+		APIRateLimitPerSec: getInt("API_RATE_LIMIT_PER_SEC", 0),
+		IngressMaxDepth:    getInt64("INGRESS_MAX_QUEUE_DEPTH", 1000000),
 		OTELEndpoint:       getStrAllowEmpty("OTEL_EXPORTER_OTLP_ENDPOINT", "http://jaeger:4318"),
 		OTELSamplerRatio:   getFloat("OTEL_SAMPLER_RATIO", 1.0),
 		LogLevel:           strings.ToLower(getStr("LOG_LEVEL", "info")),
@@ -376,6 +382,12 @@ func (c Config) Validate() error {
 		errs = append(errs, fmt.Errorf("MAX_CIRCUIT_DEFERRALS (%d) must be >= 1", c.MaxCircuitDeferral))
 	}
 
+	if c.APIRateLimitPerSec < 0 {
+		errs = append(errs, fmt.Errorf("API_RATE_LIMIT_PER_SEC (%d) must be >= 0 (0 disables it)", c.APIRateLimitPerSec))
+	}
+	if c.IngressMaxDepth < 0 {
+		errs = append(errs, fmt.Errorf("INGRESS_MAX_QUEUE_DEPTH (%d) must be >= 0 (0 disables it)", c.IngressMaxDepth))
+	}
 	if err := validateAPIKeys(c.APIKeys); err != nil {
 		errs = append(errs, err)
 	}
@@ -415,6 +427,7 @@ func (c Config) LogValue() slog.Value {
 		slog.String("worker_metrics_addr", c.WorkerMetricsAddr),
 		slog.String("database_url", observability.MaskDatabaseURL(c.DatabaseURL)),
 		slog.String("redis_addr", c.RedisAddr),
+		slog.Bool("redis_auth", c.RedisPassword != ""),
 		slog.Int("redis_pool_size", c.RedisPoolSize),
 		slog.Int("db_max_conns", c.DBMaxConns),
 		slog.String("provider_url", c.ProviderURL),

@@ -30,6 +30,10 @@ type Deps struct {
 	Publisher      realtime.Publisher
 	Metrics        *observability.Metrics
 	Now            func() time.Time
+	// IngressGate closes creates while the sampled queue backlog is too deep (nil: never).
+	IngressGate *IngressGate
+	// APIRateLimiter limits requests per API key (nil: no per-key limit).
+	APIRateLimiter middleware.KeyedLimiter
 }
 
 type handler struct {
@@ -43,9 +47,14 @@ type handler struct {
 	metrics        *observability.Metrics
 	nowFn          func() time.Time
 
-	metricsMu    sync.Mutex
-	metricsExp   time.Time
-	metricsCache MetricsSnapshotResponse
+	metricsMu       sync.Mutex
+	metricsExp      time.Time
+	metricsCache    MetricsSnapshotResponse
+	metricsHasCache bool
+	// metricsRefresh is non-nil while one request recomputes the snapshot; it is closed when done.
+	metricsRefresh chan struct{}
+
+	gate *IngressGate
 }
 
 // NewRouter constructs the HTTP API router with the exact middleware chain and routes
@@ -82,6 +91,7 @@ func NewRouter(deps Deps) chi.Router {
 		publisher:      pub,
 		metrics:        metrics,
 		nowFn:          nowFn,
+		gate:           deps.IngressGate,
 	}
 
 	r := chi.NewRouter()
@@ -116,14 +126,17 @@ func NewRouter(deps Deps) chi.Router {
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Use(middleware.Authenticate(auth))
+		r.Use(middleware.RateLimitByKey(deps.APIRateLimiter, h.logger))
 
-		r.With(write).Post("/notifications", h.handleCreateNotification)
-		r.With(write).Post("/notifications/batch", h.handleCreateBatch)
+		r.With(write, h.requireCapacity).Post("/notifications", h.handleCreateNotification)
+		r.With(write, h.requireCapacity).Post("/notifications/batch", h.handleCreateBatch)
 		r.With(read).Get("/notifications", h.handleListNotifications)
 		r.With(read).Get("/notifications/{id}", h.handleGetNotification)
 		r.With(write).Post("/notifications/{id}/cancel", h.handleCancelNotification)
 		// Manual DLQ replay re-sends a message that already failed, so it is an operator action.
 		r.With(admin).Post("/notifications/{id}/retry", h.handleRetryNotification)
+		// Bulk DLQ replay (e.g. after fixing provider credentials): admin as well.
+		r.With(admin).Post("/notifications/retry", h.handleBulkRetry)
 
 		r.With(read).Get("/batches/{id}", h.handleGetBatch)
 		r.With(write).Post("/batches/{id}/cancel", h.handleCancelBatch)

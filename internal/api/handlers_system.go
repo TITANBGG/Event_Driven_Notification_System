@@ -60,10 +60,17 @@ func (h *handler) handleHealthReady(w http.ResponseWriter, r *http.Request) {
 
 	wg.Wait()
 
+	// The API is DB-first: with PostgreSQL up it accepts and stores every notification even while
+	// Redis is down (the reconciler enqueues them later), so only PostgreSQL decides readiness. Taking
+	// every replica out of a load balancer because Redis blipped would turn a delay into an outage.
+	// Redis trouble is still visible as status "degraded" with checks.redis = "down".
 	code := http.StatusOK
 	overall := "ok"
-	if pgCheck.Status != "ok" || rdCheck.Status != "ok" {
+	switch {
+	case pgCheck.Status != "ok":
 		code = http.StatusServiceUnavailable
+		overall = "unavailable"
+	case rdCheck.Status != "ok":
 		overall = "degraded"
 	}
 

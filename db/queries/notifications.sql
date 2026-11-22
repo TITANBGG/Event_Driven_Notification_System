@@ -127,6 +127,42 @@ WHERE id = $1
   AND status = 'failed'
 RETURNING *;
 
+-- Bulk DLQ replay: resets at most page_limit failed rows (oldest failure first) in one statement.
+-- SKIP LOCKED lets two concurrent replays split the work instead of blocking; the outer
+-- status = 'failed' guard mirrors ManualRetry's allowed_from set.
+-- name: ManualRetryFailedBulk :many
+UPDATE notifications
+SET status = 'pending',
+    attempts = 0,
+    deferrals = 0,
+    last_error = NULL,
+    failed_at = NULL,
+    next_attempt_at = NULL,
+    updated_at = now()
+WHERE id IN (
+    SELECT n.id
+    FROM notifications n
+    WHERE n.status = 'failed'
+      AND (sqlc.narg(channel)::text IS NULL OR n.channel = sqlc.narg(channel)::text)
+      AND (sqlc.narg(failed_from)::timestamptz IS NULL OR n.failed_at >= sqlc.narg(failed_from)::timestamptz)
+      AND (sqlc.narg(failed_to)::timestamptz IS NULL OR n.failed_at < sqlc.narg(failed_to)::timestamptz)
+    ORDER BY n.failed_at ASC, n.id ASC
+    LIMIT sqlc.arg(page_limit)::int
+    FOR UPDATE SKIP LOCKED
+  )
+  AND status = 'failed'
+RETURNING *;
+
+-- Lease extension after a long rate-limit wait, fenced like every post-claim update: zero rows means
+-- the reconciler already reclaimed the row and the worker must not send.
+-- name: ExtendProcessingLease :execrows
+UPDATE notifications
+SET processing_started_at = now(),
+    updated_at = now()
+WHERE id = sqlc.arg(id)
+  AND status = 'processing'
+  AND attempts = sqlc.arg(claimed_attempts);
+
 -- name: FindStalePending :many
 SELECT *
 FROM notifications

@@ -448,22 +448,34 @@ func (h *handler) persistBatch(
 				if len(existing) > 0 {
 					return newItemIdempotencyConflictError(existing, indexByItemKey)
 				}
-				for _, rec := range itemKeyRecords {
-					_, ok, err := tx.InsertIdempotencyKey(txCtx, rec)
-					if err != nil {
-						return err
+				// One statement for every item key (was one round trip per item). A key missing from
+				// the result was claimed by a concurrent request after the read above: reject the batch.
+				claimed, err := tx.InsertIdempotencyKeys(txCtx, itemKeyRecords)
+				if err != nil {
+					return err
+				}
+				if len(claimed) != len(itemKeyRecords) {
+					got := make(map[string]struct{}, len(claimed))
+					for _, k := range claimed {
+						got[k] = struct{}{}
 					}
-					if !ok {
-						conflictRow, getErr := tx.GetIdempotencyKey(txCtx, rec.Key)
-						if getErr != nil {
-							return &apiError{
-								status:  http.StatusConflict,
-								code:    "item_idempotency_key_exists",
-								message: "one or more item idempotency keys already exist",
-							}
+					var conflicts []domain.IdempotencyKey
+					for _, rec := range itemKeyRecords {
+						if _, ok := got[rec.Key]; ok {
+							continue
 						}
-						return newItemIdempotencyConflictError([]domain.IdempotencyKey{*conflictRow}, indexByItemKey)
+						if row, getErr := tx.GetIdempotencyKey(txCtx, rec.Key); getErr == nil {
+							conflicts = append(conflicts, *row)
+						}
 					}
+					if len(conflicts) == 0 {
+						return &apiError{
+							status:  http.StatusConflict,
+							code:    "item_idempotency_key_exists",
+							message: "one or more item idempotency keys already exist",
+						}
+					}
+					return newItemIdempotencyConflictError(conflicts, indexByItemKey)
 				}
 			}
 
