@@ -62,7 +62,7 @@ func TestRunWSHold(t *testing.T) {
 			t.Parallel()
 			srv := holdServer(t, tc.mode)
 			var out bytes.Buffer
-			err := runWSHold(t.Context(), srv.URL, 3, 3, 300*time.Millisecond, &out)
+			err := runWSHold(t.Context(), srv.URL, "", 3, 3, 300*time.Millisecond, &out)
 			if tc.wantErr == "" {
 				require.NoError(t, err, out.String())
 				assert.Contains(t, out.String(), "ws-hold: PASS")

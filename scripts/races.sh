@@ -16,6 +16,9 @@
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
+# API key for /api/v1 (docker-compose.yml enables this local-dev admin key by default).
+API_KEY="${API_KEY:-local-dev-key-change-me}"
+AUTH=(-H "Authorization: Bearer ${API_KEY}")
 MOCK_URL="${MOCK_URL:-http://localhost:8090}"
 read -r -a COMPOSE <<<"${COMPOSE:-docker compose}"
 RUN_TAG="$(date +%s)"
@@ -54,7 +57,7 @@ create_batch() {
     items+="${items:+,}{\"recipient\":\"+90555$((base + i))\",\"channel\":\"sms\",\"content\":\"race ${RUN_TAG} ${i}\"}"
   done
   out="$(printf '{"notifications":[%s]}' "$items" |
-    curl -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
+    curl "${AUTH[@]}" -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
   printf '%s' "$out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n +2 > "$WORK/ids"
   printf '%s' "$out" | grep -oE '"batchId":"[^"]+"' | cut -d'"' -f4
 }
@@ -81,6 +84,7 @@ race_1_cancel_vs_worker() {
   {
     echo 'silent'
     echo 'request = "POST"'
+    echo "header = \"Authorization: Bearer ${API_KEY}\""
     echo 'write-out = "%{url} %{http_code}\n"'
     while read -r id; do printf 'url = "%s/api/v1/notifications/%s/cancel"\noutput = "c_%s"\n' "$API_URL" "$id" "$id"; done < "$WORK/ids"
   } > "$WORK/cancel.cfg"
@@ -117,6 +121,7 @@ race_2_batch_cancel_storm() {
   {
     echo 'silent'
     echo 'request = "POST"'
+    echo "header = \"Authorization: Bearer ${API_KEY}\""
     for i in $(seq 1 20); do printf 'url = "%s/api/v1/batches/%s/cancel"\noutput = "b_%s"\n' "$API_URL" "$batch" "$i"; done
   } > "$WORK/bcancel.cfg"
   par_requests bcancel.cfg
@@ -145,6 +150,7 @@ race_3_idempotency_storm() {
   {
     echo 'silent'
     echo 'request = "POST"'
+    echo "header = \"Authorization: Bearer ${API_KEY}\""
     echo 'header = "Content-Type: application/json"'
     echo "header = \"Idempotency-Key: ${key}\""
     echo 'data-binary = "@body.json"'
@@ -165,6 +171,7 @@ race_3_idempotency_storm() {
   for i in $(seq 1 200); do
     ((i > 1)) && echo 'next'
     printf 'url = "%s/api/v1/notifications"\nsilent\nrequest = "POST"\n' "$API_URL"
+    printf 'header = "Authorization: Bearer %s"\n' "$API_KEY"
     printf 'header = "Content-Type: application/json"\nheader = "Idempotency-Key: %s"\n' "$key"
     printf 'data-binary = "{\\"recipient\\":\\"+905551112233\\",\\"channel\\":\\"sms\\",\\"content\\":\\"body %s\\"}"\n' "$i"
     printf 'output = "d_%s.json"\nwrite-out = "%%{http_code}\\n"\n' "$i"
@@ -190,6 +197,7 @@ race_4_manual_retry_storm() {
   {
     echo 'silent'
     echo 'request = "POST"'
+    echo "header = \"Authorization: Bearer ${API_KEY}\""
     echo 'write-out = "%{url} %{http_code}\n"'
     while read -r id; do
       for k in $(seq 1 50); do printf 'url = "%s/api/v1/notifications/%s/retry"\noutput = "t_%s_%s"\n' "$API_URL" "$id" "$id" "$k"; done
@@ -230,7 +238,7 @@ race_5_scheduled_vs_cancel() {
   : > "$WORK/sched_ids"
   : > "$WORK/sched_batches"
   for b in 0 1 2 3 4; do
-    out="$(scheduled_body "$b" "$due" | curl -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
+    out="$(scheduled_body "$b" "$due" | curl "${AUTH[@]}" -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
     printf '%s' "$out" | grep -oE '"batchId":"[^"]+"' | cut -d'"' -f4 >> "$WORK/sched_batches"
     printf '%s' "$out" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | tail -n +2 >> "$WORK/sched_ids"
   done
@@ -243,6 +251,7 @@ race_5_scheduled_vs_cancel() {
   {
     echo 'silent'
     echo 'request = "POST"'
+    echo "header = \"Authorization: Bearer ${API_KEY}\""
     echo 'write-out = "%{url} %{http_code}\n"'
     while read -r id; do printf 'url = "%s/api/v1/notifications/%s/cancel"\noutput = "s_%s"\n' "$API_URL" "$id" "$id"; done < "$WORK/cancel_ids"
   } > "$WORK/sched_cancel.cfg"
@@ -275,20 +284,20 @@ race_6_template_delete_vs_batch() {
   log "== ${name}"
   mock_env MOCK_LATENCY_MS=300
   tpl="$(printf '{"name":"race_tpl_%s","channel":"sms","body":"Hello {{name}}, your code is {{code}}","variables":["name","code"]}' "$RUN_TAG" |
-    curl -s --max-time 30 -X POST "${API_URL}/api/v1/templates" -H 'Content-Type: application/json' --data-binary @- |
+    curl "${AUTH[@]}" -s --max-time 30 -X POST "${API_URL}/api/v1/templates" -H 'Content-Type: application/json' --data-binary @- |
     grep -oE '"id":"[^"]+"' | head -n1 | cut -d'"' -f4)"
   out="$(awk -v t="$tpl" 'BEGIN {
     printf "{\"notifications\":["
     for (i = 0; i < 1000; i++)
       printf "%s{\"recipient\":\"+90558%07d\",\"channel\":\"sms\",\"templateId\":\"%s\",\"templateVariables\":{\"name\":\"N%d\",\"code\":\"%d\"}}", (i ? "," : ""), i, t, i, i
     printf "]}"
-  }' | curl -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
+  }' | curl "${AUTH[@]}" -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
   batch="$(printf '%s' "$out" | grep -oE '"batchId":"[^"]+"' | cut -d'"' -f4)"
   sleep 1
   pending_at_delete="$(psql_q "SELECT COUNT(*) FROM notifications WHERE batch_id = '${batch}' AND status NOT IN ('sent','failed','cancelled');")"
-  del_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "${API_URL}/api/v1/templates/${tpl}")"
+  del_code="$(curl "${AUTH[@]}" -s -o /dev/null -w '%{http_code}' --max-time 30 -X DELETE "${API_URL}/api/v1/templates/${tpl}")"
   code2="$(printf '{"notifications":[{"recipient":"+905589999999","channel":"sms","templateId":"%s","templateVariables":{"name":"late","code":"0"}}]}' "$tpl" |
-    curl -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
+    curl "${AUTH[@]}" -s -o /dev/null -w '%{http_code}' --max-time 30 -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @-)"
   wait_terminal "$batch" 120 || true
 
   rows_tpl="$(psql_q "SELECT COUNT(*) FROM notifications WHERE template_id = '${tpl}';")"

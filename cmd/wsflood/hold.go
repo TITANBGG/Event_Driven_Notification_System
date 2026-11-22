@@ -22,7 +22,7 @@ type holdResult struct {
 // runWSHold keeps n readers subscribed (round-robin over the three channels) for the whole duration,
 // as a soak test's background WebSocket load. It fails if any reader is disconnected early or receives
 // no event at all, so a hub that leaks, stalls or drops healthy clients under hours of traffic shows up.
-func runWSHold(ctx context.Context, baseURL string, n, dialWorkers int, d time.Duration, out io.Writer) error {
+func runWSHold(ctx context.Context, baseURL, apiKey string, n, dialWorkers int, d time.Duration, out io.Writer) error {
 	channels := []string{"sms", "email", "push"}
 	conns := make([]*websocket.Conn, 0, n)
 	chans := make([]string, 0, n)
@@ -31,7 +31,7 @@ func runWSHold(ctx context.Context, baseURL string, n, dialWorkers int, d time.D
 		if i < n%len(channels) {
 			k++
 		}
-		cs, err := dialWSBatch(ctx, toWSURL(baseURL, "/api/v1/ws?channel="+ch), k, dialWorkers, 0)
+		cs, err := dialWSBatch(ctx, toWSURL(baseURL, "/api/v1/ws?channel="+ch), apiKey, k, dialWorkers, 0)
 		if err != nil {
 			closeAllWS(conns)
 			return fmt.Errorf("dialing %s readers: %w", ch, err)

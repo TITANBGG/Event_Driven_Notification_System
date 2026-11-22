@@ -37,6 +37,7 @@ type floodConfig struct {
 	drainTimeout   time.Duration
 	skipBoundaries bool
 	skipWS         bool
+	apiKey         string
 }
 
 type apiMetricsSample struct {
@@ -79,6 +80,7 @@ func main() {
 	flag.DurationVar(&cfg.drainTimeout, "drain-timeout", 180*time.Second, "Timeout waiting for flood batches to complete")
 	flag.BoolVar(&cfg.skipBoundaries, "skip-boundaries", false, "Skip HTTP/SMS/Email/Push/WS boundary checks")
 	flag.BoolVar(&cfg.skipWS, "skip-ws", false, "Skip WebSocket flood scenarios")
+	flag.StringVar(&cfg.apiKey, "api-key", envOr("API_KEY", defaultAPIKey), "API key sent as Authorization: Bearer (empty: none)")
 	holdFor := flag.Duration("hold", 0, "Instead of the suite: keep -hold-clients readers subscribed this long (soak load)")
 	holdClients := flag.Int("hold-clients", 50, "Readers for -hold, spread over sms/email/push")
 	flag.Parse()
@@ -87,7 +89,7 @@ func main() {
 	defer stop()
 
 	if *holdFor > 0 {
-		if err := runWSHold(ctx, cfg.baseURL, *holdClients, cfg.dialWorkers, *holdFor, os.Stdout); err != nil {
+		if err := runWSHold(ctx, cfg.baseURL, cfg.apiKey, *holdClients, cfg.dialWorkers, *holdFor, os.Stdout); err != nil {
 			fmt.Fprintf(os.Stderr, "wsflood -hold failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -103,12 +105,12 @@ func main() {
 func runSuite(ctx context.Context, cfg floodConfig, out io.Writer) error {
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
+		Transport: newBearerTransport(&http.Transport{
 			MaxIdleConns:          200,
 			MaxIdleConnsPerHost:   200,
 			IdleConnTimeout:       60 * time.Second,
 			ExpectContinueTimeout: 2 * time.Second,
-		},
+		}, cfg.apiKey),
 	}
 
 	if err := waitReady(ctx, httpClient, cfg.baseURL); err != nil {
@@ -117,7 +119,7 @@ func runSuite(ctx context.Context, cfg floodConfig, out io.Writer) error {
 
 	var failures int
 	if !cfg.skipBoundaries {
-		bFail, err := runBoundarySuite(ctx, httpClient, cfg.baseURL, out)
+		bFail, err := runBoundarySuite(ctx, httpClient, cfg.baseURL, cfg.apiKey, out)
 		if err != nil {
 			return err
 		}
@@ -133,7 +135,7 @@ func runSuite(ctx context.Context, cfg floodConfig, out io.Writer) error {
 			_, _ = fmt.Fprintf(out, "FAIL [WS Slow-Consumer Isolation]: %v\n", err)
 			failures++
 		}
-		if err := runWSBatchSnapshotAndLiveStream(ctx, httpClient, cfg.baseURL, out); err != nil {
+		if err := runWSBatchSnapshotAndLiveStream(ctx, httpClient, cfg.baseURL, cfg.apiKey, out); err != nil {
 			_, _ = fmt.Fprintf(out, "FAIL [WS Batch Snapshot & Live Stream]: %v\n", err)
 			failures++
 		}
@@ -286,7 +288,7 @@ func buildBoundaryCases(now time.Time) []boundaryCase {
 	}
 }
 
-func runBoundarySuite(ctx context.Context, hc *http.Client, baseURL string, out io.Writer) (int, error) {
+func runBoundarySuite(ctx context.Context, hc *http.Client, baseURL, apiKey string, out io.Writer) (int, error) {
 	_, _ = fmt.Fprintln(out, "=== Stage 1: API & WebSocket Boundary Matrix ===")
 	cases := buildBoundaryCases(time.Now().UTC())
 	failures := 0
@@ -327,12 +329,19 @@ func runBoundarySuite(ctx context.Context, hc *http.Client, baseURL string, out 
 		_, _ = fmt.Fprintf(out, "PASS  %-50s HTTP %d\n", tc.name, code)
 	}
 
-	// Disallowed Origin WebSocket handshake check.
+	if apiKey != "" {
+		failures += checkUnknownAPIKeyRejected(ctx, hc, baseURL, out)
+	}
+
+	// Disallowed Origin WebSocket handshake check (authenticated, so the Origin check is what rejects it).
 	wsURL := toWSURL(baseURL, "/api/v1/ws?channel=sms")
 	dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	conn, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Origin": []string{"https://evil.example"}},
-	})
+	originHeader := authHeader(apiKey)
+	if originHeader == nil {
+		originHeader = http.Header{}
+	}
+	originHeader.Set("Origin", "https://evil.example")
+	conn, resp, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{HTTPHeader: originHeader})
 	cancel()
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
@@ -365,7 +374,7 @@ func runWSCapacityAndReuse(ctx context.Context, hc *http.Client, cfg floodConfig
 		baseSample.Goroutines, baseSample.OpenFDs, baseSample.HeapBytes/(1024*1024))
 
 	wsURL := toWSURL(cfg.baseURL, "/api/v1/ws?channel=sms")
-	conns, err := dialWSBatch(ctx, wsURL, cfg.maxClients, cfg.dialWorkers, 0)
+	conns, err := dialWSBatch(ctx, wsURL, cfg.apiKey, cfg.maxClients, cfg.dialWorkers, 0)
 	if err != nil {
 		closeAllWS(conns)
 		return fmt.Errorf("dialing %d WS clients: %w", cfg.maxClients, err)
@@ -399,7 +408,7 @@ func runWSCapacityAndReuse(ctx context.Context, hc *http.Client, cfg floodConfig
 	// Attempt 10 overflow connections -> all must fail with 503 too_many_ws_clients.
 	for i := 0; i < 10; i++ {
 		dCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		extraConn, resp, dErr := websocket.Dial(dCtx, wsURL, nil)
+		extraConn, resp, dErr := websocket.Dial(dCtx, wsURL, &websocket.DialOptions{HTTPHeader: authHeader(cfg.apiKey)})
 		cancel()
 		var body []byte
 		status := 0
@@ -431,7 +440,7 @@ func runWSCapacityAndReuse(ctx context.Context, hc *http.Client, cfg floodConfig
 	deadline := time.Now().Add(5 * time.Second)
 	for len(replacement) < reuseCount && time.Now().Before(deadline) {
 		need := reuseCount - len(replacement)
-		batch, bErr := dialWSBatch(ctx, wsURL, need, cfg.dialWorkers, 0)
+		batch, bErr := dialWSBatch(ctx, wsURL, cfg.apiKey, need, cfg.dialWorkers, 0)
 		replacement = append(replacement, batch...)
 		if bErr != nil {
 			time.Sleep(100 * time.Millisecond)
@@ -471,7 +480,7 @@ func runWSSlowConsumerIsolation(ctx context.Context, hc *http.Client, cfg floodC
 		cfg.fastClients, cfg.slowClients, totalEvents)
 
 	wsURL := toWSURL(cfg.baseURL, "/api/v1/ws?channel=sms")
-	fastConns, err := dialWSBatch(ctx, wsURL, cfg.fastClients, cfg.dialWorkers, 0)
+	fastConns, err := dialWSBatch(ctx, wsURL, cfg.apiKey, cfg.fastClients, cfg.dialWorkers, 0)
 	if err != nil {
 		closeAllWS(fastConns)
 		return fmt.Errorf("dialing fast clients: %w", err)
@@ -480,7 +489,7 @@ func runWSSlowConsumerIsolation(ctx context.Context, hc *http.Client, cfg floodC
 
 	// Shrink slow clients' TCP receive buffer (1024 B) and never call Read(), forcing server-side
 	// write backpressure -> the Hub queue grows past its soft limit with no progress -> server drops slow clients without blocking the Hub.
-	slowConns, err := dialWSBatch(ctx, wsURL, cfg.slowClients, cfg.dialWorkers, 1024)
+	slowConns, err := dialWSBatch(ctx, wsURL, cfg.apiKey, cfg.slowClients, cfg.dialWorkers, 1024)
 	if err != nil {
 		closeAllWS(slowConns)
 		return fmt.Errorf("dialing slow clients: %w", err)
@@ -621,7 +630,7 @@ func runWSSlowConsumerIsolation(ctx context.Context, hc *http.Client, cfg floodC
 	return nil
 }
 
-func runWSBatchSnapshotAndLiveStream(ctx context.Context, hc *http.Client, baseURL string, out io.Writer) error {
+func runWSBatchSnapshotAndLiveStream(ctx context.Context, hc *http.Client, baseURL, apiKey string, out io.Writer) error {
 	const count = 1000
 	const watchers = 20
 	_, _ = fmt.Fprintf(out, "\n=== Stage 4: Batch Snapshot + Live Stream (%d watchers, %d SMS) ===\n", watchers, count)
@@ -631,7 +640,7 @@ func runWSBatchSnapshotAndLiveStream(ctx context.Context, hc *http.Client, baseU
 		return err
 	}
 	wsURL := toWSURL(baseURL, "/api/v1/ws?batchId="+url.QueryEscape(batchID))
-	conns, err := dialWSBatch(ctx, wsURL, watchers, watchers, 0)
+	conns, err := dialWSBatch(ctx, wsURL, apiKey, watchers, watchers, 0)
 	if err != nil {
 		closeAllWS(conns)
 		return err
@@ -701,7 +710,7 @@ func runWSBatchSnapshotAndLiveStream(ctx context.Context, hc *http.Client, baseU
 	return nil
 }
 
-func dialWSBatch(ctx context.Context, wsURL string, n, workers, recvBuf int) ([]*websocket.Conn, error) {
+func dialWSBatch(ctx context.Context, wsURL, apiKey string, n, workers, recvBuf int) ([]*websocket.Conn, error) {
 	if n <= 0 {
 		return nil, nil
 	}
@@ -740,7 +749,7 @@ func dialWSBatch(ctx context.Context, wsURL string, n, workers, recvBuf int) ([]
 					return
 				}
 				dCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-				conn, resp, err := websocket.Dial(dCtx, wsURL, &websocket.DialOptions{HTTPClient: dialClient})
+				conn, resp, err := websocket.Dial(dCtx, wsURL, &websocket.DialOptions{HTTPClient: dialClient, HTTPHeader: authHeader(apiKey)})
 				cancel()
 				if resp != nil && resp.Body != nil {
 					_ = resp.Body.Close()

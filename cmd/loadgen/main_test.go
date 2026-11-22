@@ -54,7 +54,12 @@ func TestRunLoadgenEndToEnd(t *testing.T) {
 	)
 	seq := 0
 
+	const apiKey = "loadgen-test-key-0123456789"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+apiKey {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		switch {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/notifications/batch":
 			var req struct {
@@ -104,6 +109,7 @@ func TestRunLoadgenEndToEnd(t *testing.T) {
 		priorityMix: "20:60:20",
 		pollTimeout: 5 * time.Second,
 		pollEvery:   10 * time.Millisecond,
+		apiKey:      apiKey,
 	}, &out)
 	require.NoError(t, err)
 	assert.Equal(t, 25, res.Submitted)

@@ -36,6 +36,8 @@ type loadConfig struct {
 	channelStats bool
 	pollTimeout  time.Duration
 	pollEvery    time.Duration
+	// apiKey is sent as Authorization: Bearer on every request (empty: no header).
+	apiKey string
 }
 
 type priorityWeights struct {
@@ -88,6 +90,7 @@ func main() {
 	flag.StringVar(&cfg.priorityMix, "priority-mix", "20:60:20", "Priority weights high:normal:low summing to 100")
 	flag.BoolVar(&cfg.channelStats, "channel-stats", true, "After completion, page through batch items to report per-channel effective send rate")
 	flag.DurationVar(&cfg.pollTimeout, "poll-timeout", 5*time.Minute, "Maximum time to wait for all batches to complete")
+	flag.StringVar(&cfg.apiKey, "api-key", envOr("API_KEY", defaultAPIKey), "API key sent as Authorization: Bearer (needs write + read; empty: none)")
 	cfg.pollEvery = 500 * time.Millisecond
 	flag.Parse()
 
@@ -243,11 +246,11 @@ func runLoadgen(ctx context.Context, cfg loadConfig, out io.Writer) (loadResult,
 	baseURL := strings.TrimRight(cfg.baseURL, "/")
 	client := &http.Client{
 		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
+		Transport: newBearerTransport(&http.Transport{
 			MaxIdleConns:        max(cfg.concurrency*2, 16),
 			MaxIdleConnsPerHost: max(cfg.concurrency*2, 16),
 			IdleConnTimeout:     60 * time.Second,
-		},
+		}, cfg.apiKey),
 	}
 
 	type batchJob struct {

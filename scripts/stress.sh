@@ -50,7 +50,7 @@ submit_phase() {
     ch="${chans[i % 3]}"
     # One file per request: parallel jobs appending to one file interleave their partial writes.
     {
-      batch_body "$ch" normal 1000 "$i" | curl -s --max-time 60 -o "$WORK/$name.$i.body" -w '%{http_code} %{time_total}' \
+      batch_body "$ch" normal 1000 "$i" | curl "${AUTH[@]}" -s --max-time 60 -o "$WORK/$name.$i.body" -w '%{http_code} %{time_total}' \
         -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @- || true
       printf ' %s\n' "$(grep -oE '"batchId":"[^"]+"' "$WORK/$name.$i.body" 2>/dev/null | cut -d'"' -f4)"
     } >"$WORK/$name.$i.line" &

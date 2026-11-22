@@ -9,6 +9,9 @@
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
+# API key for /api/v1 (docker-compose.yml enables this local-dev admin key by default).
+API_KEY="${API_KEY:-local-dev-key-change-me}"
+AUTH=(-H "Authorization: Bearer ${API_KEY}")
 MOCK_URL="${MOCK_URL:-http://localhost:8090}"
 PROM_URL="${PROM_URL:-http://localhost:9090}"
 read -r -a COMPOSE <<<"${COMPOSE:-docker compose}"
@@ -41,7 +44,7 @@ http_code() { curl -s -o /dev/null -w '%{http_code}' --max-time "${2:-10}" "$1" 
 
 # count_status <batchId> <status> -> number of notifications of the batch in that status
 count_status() {
-  curl -s --max-time 10 "${API_URL}/api/v1/batches/$1?limit=1" |
+  curl "${AUTH[@]}" -s --max-time 10 "${API_URL}/api/v1/batches/$1?limit=1" |
     { grep -o '"countsByStatus":{[^}]*}' || true; } | { grep -o "\"$2\":[0-9]*" || true; } |
     cut -d: -f2 | awk '{s+=$1} END {print s+0}'
 }
@@ -53,7 +56,7 @@ all_terminal() { # all_terminal <batchId> <total>
 
 create_sms() { # create_sms <recipient-suffix> -> prints "<http-code> <id>"
   local out code id
-  out="$(curl -s --max-time 30 -w '\n%{http_code}' -X POST "${API_URL}/api/v1/notifications" \
+  out="$(curl "${AUTH[@]}" -s --max-time 30 -w '\n%{http_code}' -X POST "${API_URL}/api/v1/notifications" \
     -H "Content-Type: application/json" \
     -d "{\"recipient\":\"+90555${1}\",\"channel\":\"sms\",\"content\":\"drill ${RUN_TAG}\"}" || true)"
   code="$(printf '%s' "$out" | tail -n1)"
@@ -68,12 +71,12 @@ create_sms_batch() { # create_sms_batch <count> <recipient-base-7-digits> -> pri
   done
   # Body via stdin: a 500-item batch exceeds the Windows command-line length limit as an argument.
   printf '{"notifications":[%s]}' "$items" |
-    curl -s --max-time 30 -X POST "${API_URL}/api/v1/notifications/batch" \
+    curl "${AUTH[@]}" -s --max-time 30 -X POST "${API_URL}/api/v1/notifications/batch" \
       -H "Content-Type: application/json" --data-binary @- | json_get batchId
 }
 
 api_ready() { [[ "$(http_code "${API_URL}/health/ready")" == "200" ]]; }
-notification_status() { curl -s --max-time 10 "${API_URL}/api/v1/notifications/$1" | json_get status; }
+notification_status() { curl "${AUTH[@]}" -s --max-time 10 "${API_URL}/api/v1/notifications/$1" | json_get status; }
 is_status() { [[ "$(notification_status "$1")" == "$2" ]]; }
 
 mock_env() { # mock_env [VAR=value ...]: recreate the mock provider with the given settings

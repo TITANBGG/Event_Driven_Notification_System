@@ -4,6 +4,9 @@
 # shellcheck disable=SC2034 # variables are used by the sourcing scripts
 
 API_URL="${API_URL:-http://localhost:8080}"
+# API key for /api/v1 (docker-compose.yml enables this local-dev admin key by default).
+API_KEY="${API_KEY:-local-dev-key-change-me}"
+AUTH=(-H "Authorization: Bearer ${API_KEY}")
 MOCK_URL="${MOCK_URL:-http://localhost:8090}"
 PROM_URL="${PROM_URL:-http://localhost:9090}"
 read -r -a COMPOSE <<<"${COMPOSE:-docker compose}"
@@ -73,7 +76,7 @@ batch_body() {
 
 # submit_batch <channel> <priority> <count> <seq>: prints the batchId ("" if the API rejected it).
 submit_batch() {
-  batch_body "$@" | curl -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" \
+  batch_body "$@" | curl "${AUTH[@]}" -s --max-time 60 -X POST "${API_URL}/api/v1/notifications/batch" \
     -H 'Content-Type: application/json' --data-binary @- | { grep -oE '"batchId":"[^"]+"' || true; } | cut -d'"' -f4
 }
 

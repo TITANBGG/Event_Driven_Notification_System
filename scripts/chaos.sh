@@ -10,6 +10,9 @@
 set -euo pipefail
 
 API_URL="${API_URL:-http://localhost:8080}"
+# API key for /api/v1 (docker-compose.yml enables this local-dev admin key by default).
+API_KEY="${API_KEY:-local-dev-key-change-me}"
+AUTH=(-H "Authorization: Bearer ${API_KEY}")
 MOCK_URL="${MOCK_URL:-http://localhost:8090}"
 read -r -a COMPOSE <<<"${COMPOSE:-docker compose}"
 LOAD_SECONDS="${LOAD_SECONDS:-480}"
@@ -70,7 +73,7 @@ load_loop() {
   start=$(date +%s)
   while (($(date +%s) - start < LOAD_SECONDS)); do
     next=$((start + (s + 1) * BATCH_EVERY))
-    out="$(batch_body "$s" | curl -s --max-time 30 -w '\n%{http_code}' -X POST "${API_URL}/api/v1/notifications/batch" \
+    out="$(batch_body "$s" | curl "${AUTH[@]}" -s --max-time 30 -w '\n%{http_code}' -X POST "${API_URL}/api/v1/notifications/batch" \
       -H 'Content-Type: application/json' -H "Idempotency-Key: chaos-${RUN_TAG}-${s}" --data-binary @- || true)"
     code="$(printf '%s' "$out" | tail -n1)"
     echo "$s ${code:-000} $(printf '%s' "$out" | grep -oE '"batchId":"[^"]+"' | cut -d'"' -f4)" >> "$WORK/submissions.txt"

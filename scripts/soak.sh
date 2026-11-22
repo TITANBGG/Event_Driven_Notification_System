@@ -118,7 +118,7 @@ run_probes() {
 
   # 1. Scheduled notification due in 5s
   due="$(utc_plus_seconds 5)"
-  code1="$(curl -s --max-time 10 -o "$body_file" -w '%{http_code}' \
+  code1="$(curl "${AUTH[@]}" -s --max-time 10 -o "$body_file" -w '%{http_code}' \
     -X POST "${API_URL}/api/v1/notifications" -H 'Content-Type: application/json' \
     -d "{\"recipient\":\"+90558999$(printf '%04d' $((seq % 10000)))\",\"channel\":\"sms\",\"priority\":\"high\",\"content\":\"soak-sched ${RUN_TAG} ${seq}\",\"scheduledAt\":\"${due}\"}" || echo "000")"
   if [[ "$code1" == "202" ]]; then
@@ -131,12 +131,12 @@ run_probes() {
   # 2. Idempotent create + replay
   idem_key="soak-idem-${RUN_TAG}-${seq}"
   local idem_payload="{\"recipient\":\"soak-idem-${seq}@example.com\",\"channel\":\"email\",\"priority\":\"normal\",\"content\":\"soak-idem ${RUN_TAG} ${seq}\"}"
-  code1="$(curl -s --max-time 10 -o "$body_file" -w '%{http_code}' \
+  code1="$(curl "${AUTH[@]}" -s --max-time 10 -o "$body_file" -w '%{http_code}' \
     -X POST "${API_URL}/api/v1/notifications" -H 'Content-Type: application/json' \
     -H "Idempotency-Key: ${idem_key}" -d "$idem_payload" || echo "000")"
   id1="$(grep -oE '"id":"[^"]+"' "$body_file" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)"
 
-  code2="$(curl -s --max-time 10 -o "$body_file" -w '%{http_code}' \
+  code2="$(curl "${AUTH[@]}" -s --max-time 10 -o "$body_file" -w '%{http_code}' \
     -X POST "${API_URL}/api/v1/notifications" -H 'Content-Type: application/json' \
     -H "Idempotency-Key: ${idem_key}" -d "$idem_payload" || echo "000")"
   id2="$(grep -oE '"id":"[^"]+"' "$body_file" 2>/dev/null | head -n1 | cut -d'"' -f4 || true)"
@@ -150,8 +150,8 @@ run_probes() {
 
   # 3. API read/health endpoints
   hcode="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "${API_URL}/health/ready" || echo "000")"
-  mcode="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "${API_URL}/api/v1/metrics" || echo "000")"
-  lcode="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' "${API_URL}/api/v1/notifications?limit=50" || echo "000")"
+  mcode="$(curl "${AUTH[@]}" -s --max-time 10 -o /dev/null -w '%{http_code}' "${API_URL}/api/v1/metrics" || echo "000")"
+  lcode="$(curl "${AUTH[@]}" -s --max-time 10 -o /dev/null -w '%{http_code}' "${API_URL}/api/v1/notifications?limit=50" || echo "000")"
   if [[ "$hcode" != "200" || "$mcode" != "200" || "$lcode" != "200" ]]; then
     PROBE_ERRORS=$((PROBE_ERRORS + 1))
     log "probe read seq=${seq} failed health=${hcode} metrics=${mcode} list=${lcode}"
@@ -209,7 +209,7 @@ PROBE_RUNS=0
 
 while (($(date +%s) - t_start < SOAK_SECONDS)); do
   tick=$(($(date +%s) + BATCH_EVERY))
-  out="$(soak_batch_body "$seq" | curl -s --max-time 30 -o "$WORK/batch.body" -w '%{http_code} %{time_total}' \
+  out="$(soak_batch_body "$seq" | curl "${AUTH[@]}" -s --max-time 30 -o "$WORK/batch.body" -w '%{http_code} %{time_total}' \
     -X POST "${API_URL}/api/v1/notifications/batch" -H 'Content-Type: application/json' --data-binary @- || echo "000 30.0")"
   code="${out%% *}"
   lat="${out#* }"
