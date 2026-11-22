@@ -9,6 +9,9 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ### Fixed
 
+- Seven scripts, including `verify.sh` and `test-docker.sh`, were committed from Windows without the
+  executable bit, so `./scripts/verify.sh` failed with "Permission denied" on Linux and macOS. CI now
+  fails when a runnable script is not executable in git.
 - The README's notification sequence diagram did not render on GitHub: a `;` inside a Mermaid
   `sequenceDiagram` message is a statement separator. It also showed the rate-limit token taken before
   `Claim`; it is taken after `Claim`, right before the provider call.

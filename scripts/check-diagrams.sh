@@ -6,7 +6,7 @@
 #   ./scripts/check-diagrams.sh            needs only Docker
 set -euo pipefail
 
-MERMAID_CLI_IMAGE="minlag/mermaid-cli:11.17.1" # keep in sync with .github/workflows/ci.yml
+MERMAID_CLI_IMAGE="minlag/mermaid-cli:11.17.1" # pinned; CI runs this script, so this is the only place to bump
 cd "$(dirname "$0")/.."
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

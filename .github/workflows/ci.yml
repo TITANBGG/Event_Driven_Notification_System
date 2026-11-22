@@ -56,6 +56,15 @@ jobs:
       # The scenario scripts are deliverables too (make races, chaos, soak, verify, ...).
       - name: shellcheck scripts
         run: docker run --rm -v "$PWD:/mnt" -w /mnt "koalaman/shellcheck:${SHELLCHECK_VERSION}" -x scripts/*.sh
+      # The README tells readers to run ./scripts/*.sh directly, and a script committed from Windows
+      # loses its executable bit silently. lib.sh is only sourced; coverage-by-package.sh runs via `sh`.
+      - name: scripts are executable
+        run: |
+          missing="$(git ls-files -s 'scripts/*.sh' | awk '$1 != "100755" {print $4}' \
+            | grep -v -x -e scripts/lib.sh -e scripts/coverage-by-package.sh || true)"
+          if [ -n "$missing" ]; then
+            echo "::error::not executable in git (run: git update-index --chmod=+x <file>):"; echo "$missing"; exit 1
+          fi
 
   test:
     name: Unit tests (-race, coverage)
