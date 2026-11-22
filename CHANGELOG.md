@@ -7,6 +7,10 @@ the pushed tag as the GitHub Release notes, so every `vX.Y.Z` tag needs a `## [X
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-22
+
+Repository fixes found while preparing the submission; the service code is unchanged from 1.1.1.
+
 ### Fixed
 
 - Seven scripts, including `verify.sh` and `test-docker.sh`, were committed from Windows without the

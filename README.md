@@ -1644,8 +1644,8 @@ How to read the resource table:
 To run the released image instead of building locally, retag it to the name Compose expects:
 
 ```bash
-docker pull ghcr.io/titanbgg/notification-system:1.1.1
-docker tag ghcr.io/titanbgg/notification-system:1.1.1 notification-system:local
+docker pull ghcr.io/titanbgg/notification-system:1.1.2
+docker tag ghcr.io/titanbgg/notification-system:1.1.2 notification-system:local
 docker compose up --no-build
 ```
 
