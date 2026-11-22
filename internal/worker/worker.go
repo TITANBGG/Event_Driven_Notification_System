@@ -39,8 +39,8 @@ const (
 	postSendWriteBackoffInitial = 100 * time.Millisecond
 	postSendWriteBackoffMax     = time.Second
 
-	// leaseExtendAfterWait: a rate-limit wait longer than this re-arms the row's visibility timeout
-	// before the send, so wait + provider call + post-send writes never add up past the lease.
+	// leaseExtendAfterWait is the length of one rate-limit wait round; each round that ends without a
+	// token re-arms the row's visibility timeout, so a long wait never eats the lease.
 	leaseExtendAfterWait = time.Second
 	// publishTimeout bounds a status-event publish so a slow Redis cannot eat into the row's lease.
 	publishTimeout = time.Second
@@ -417,24 +417,16 @@ func (w *Worker) processDequeuedItem(drainCtx context.Context, ch domain.Channel
 	// GC, CPU) let sends bunch up and break the 100/s window (measured 107 in one second with 6 worker
 	// replicas while PostgreSQL refused connections). The wait is bounded so a claimed row is never
 	// held past its lease; on timeout or limiter outage the claim is handed back without burning an attempt.
-	waitStart := w.nowFn()
-	if !w.waitForSendToken(itemDrainCtx, attemptLogger, tracer, baseAttrs, ch) {
+	switch w.waitForSendToken(itemDrainCtx, attemptLogger, tracer, baseAttrs, ch, n) {
+	case tokenGranted:
+	case tokenLeaseLost:
+		// The reconciler reclaimed the row during a long wait: another worker owns it now, and a
+		// send here would be exactly the duplicate the fence exists to prevent.
+		w.handleFencedError(itemDrainCtx, attemptLogger, n.ID, "ExtendLease", domain.ErrLeaseLost)
+		return
+	default:
 		w.releaseUnsentClaim(itemDrainCtx, attemptLogger, n, meta, "rate limiter unavailable before send")
 		return
-	}
-	// A long token wait used part of the lease. Re-arm it (fenced on the claimed attempt) before the
-	// send; if the reconciler already reclaimed the row, do not send at all: another worker owns it,
-	// and sending here would be exactly the duplicate the fence exists to prevent.
-	if w.nowFn().Sub(waitStart) > leaseExtendAfterWait {
-		if extErr := w.store.ExtendLease(itemDrainCtx, n.ID, n.Attempts); extErr != nil {
-			if errors.Is(extErr, domain.ErrLeaseLost) {
-				w.handleFencedError(itemDrainCtx, attemptLogger, n.ID, "ExtendLease", extErr)
-				return
-			}
-			// A DB error here is not fatal: the token budget alone still keeps the send inside the lease.
-			attemptLogger.Warn("failed extending lease after rate-limit wait; sending within the original lease",
-				slog.String("error", extErr.Error()))
-		}
 	}
 
 	startedAt := w.nowFn()
@@ -808,31 +800,62 @@ func (w *Worker) sendTokenBudget() time.Duration {
 // waitForSendToken blocks for a GCRA token of channel ch. It uses the drain context so a claimed row
 // still gets sent during graceful shutdown, and fails closed (returns false) when the limiter is
 // unavailable for the whole budget.
+type tokenResult int
+
+const (
+	tokenGranted tokenResult = iota
+	tokenUnavailable
+	tokenLeaseLost
+)
+
+// waitForSendToken blocks for a GCRA token in rounds of leaseExtendAfterWait. After a round ends
+// without a token, the row's lease is re-armed (fenced) while NO token is held, and the wait goes on.
+// Nothing may run between a granted token and the send: an earlier version extended the lease after
+// the token, and its DB round trip bunched sends to 103 in one second for a channel (chaos test,
+// 2026-11-22). A denied Allow consumes no token, so splitting the wait into rounds does not change
+// the rate.
 func (w *Worker) waitForSendToken(
 	ctx context.Context,
 	logger *slog.Logger,
 	tracer trace.Tracer,
 	attrs []attribute.KeyValue,
 	ch domain.Channel,
-) bool {
+	n *domain.Notification,
+) tokenResult {
 	waitCtx, cancel := context.WithTimeout(ctx, w.sendTokenBudget())
 	defer cancel()
 	waitCtx, span := tracer.Start(waitCtx, "ratelimit.wait", trace.WithAttributes(attrs...))
 	defer span.End()
 	for {
-		err := w.limiter.Wait(waitCtx, ch)
+		roundCtx, cancelRound := context.WithTimeout(waitCtx, leaseExtendAfterWait)
+		err := w.limiter.Wait(roundCtx, ch)
+		roundOver := roundCtx.Err() != nil
+		cancelRound()
 		if err == nil {
-			return true
+			return tokenGranted
 		}
-		if waitCtx.Err() == nil {
-			logger.Warn("rate limiter error; failing closed and backing off before send", slog.String("error", err.Error()))
-			if waitWithContext(waitCtx, limiterErrorBackoff) {
-				continue
+		if waitCtx.Err() != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "no rate-limit token within budget")
+			return tokenUnavailable
+		}
+		if roundOver {
+			if extErr := w.store.ExtendLease(waitCtx, n.ID, n.Attempts); extErr != nil {
+				if errors.Is(extErr, domain.ErrLeaseLost) {
+					span.SetStatus(codes.Error, "lease lost while waiting for a token")
+					return tokenLeaseLost
+				}
+				// Not fatal: the token budget alone still keeps the send inside the original lease.
+				logger.Warn("failed extending lease during rate-limit wait", slog.String("error", extErr.Error()))
 			}
+			continue
 		}
-		span.RecordError(err)
-		span.SetStatus(codes.Error, "no rate-limit token within budget")
-		return false
+		logger.Warn("rate limiter error; failing closed and backing off before send", slog.String("error", err.Error()))
+		if !waitWithContext(waitCtx, limiterErrorBackoff) {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "no rate-limit token within budget")
+			return tokenUnavailable
+		}
 	}
 }
 

@@ -3,6 +3,7 @@ package worker_test
 import (
 	"bytes"
 	"context"
+	"math"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,40 +19,57 @@ import (
 	"github.com/TITANBGG/notification-system/internal/worker"
 )
 
-// slowTokenWorker returns a worker whose rate-limit wait advances the injected clock by wait, as a
-// long GCRA wait under contention would.
-func slowTokenWorker(t *testing.T, store *memWorkerStore, wait time.Duration) (*worker.Worker, *queue.Queue, *fakeSender) {
+// tokenWorker returns a worker whose limiter withholds the token for the first `blockedRounds`
+// wait rounds (each round ends at its context deadline, as a contended GCRA wait would) and then
+// grants it. It records how many lease extensions had happened when the token was granted and when
+// the provider was called, which proves nothing runs between the token and the send.
+func tokenWorker(t *testing.T, store *memWorkerStore, blockedRounds int32) (w *worker.Worker, q *queue.Queue, sender *fakeSender, extAtGrant, extAtSend *atomic.Int32) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := queue.NewClient(mr.Addr(), 4)
 	t.Cleanup(func() { _ = rdb.Close() })
-	q := queue.New(rdb)
+	q = queue.New(rdb)
 
-	var clock atomic.Int64
-	clock.Store(time.Now().UTC().UnixNano())
-	now := func() time.Time { return time.Unix(0, clock.Load()).UTC() }
-	limiter := funcLimiter(func(context.Context, domain.Channel) error {
-		clock.Add(int64(wait))
+	extAtGrant, extAtSend = &atomic.Int32{}, &atomic.Int32{}
+	extensions := func() int32 {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return int32(min(store.leaseExtensions, math.MaxInt32)) // #nosec G115 -- clamped
+	}
+	var calls atomic.Int32
+	limiter := funcLimiter(func(ctx context.Context, _ domain.Channel) error {
+		if calls.Add(1) <= blockedRounds {
+			<-ctx.Done() // still no token when the round ends
+			return ctx.Err()
+		}
+		extAtGrant.Store(extensions())
 		return nil
 	})
-	sender := sentSender()
+	status, msgID := 202, "prov-msg"
+	sender = &fakeSender{fn: func(context.Context, domain.Notification) (provider.Result, error) {
+		extAtSend.Store(extensions())
+		return provider.Result{Outcome: provider.OutcomeSent, HTTPStatus: &status, ProviderMessageID: &msgID}, nil
+	}}
 	w, err := worker.New(worker.Deps{
 		Config: testWorkerConfig(), Logger: observability.NewLogger("error", &bytes.Buffer{}),
-		Store: store, Queue: q, RateLimiter: limiter, Sender: sender, Now: now,
+		Store: store, Queue: q, RateLimiter: limiter, Sender: sender,
 	})
 	require.NoError(t, err)
-	return w, q, sender
+	return w, q, sender, extAtGrant, extAtSend
 }
 
-func TestLongTokenWaitExtendsTheLeaseBeforeSending(t *testing.T) {
+// A wait that outlasts one round re-arms the lease while no token is held; once the token is
+// granted the send follows at once, with no database call in between (that call bunched sends).
+func TestLongTokenWaitExtendsTheLeaseBeforeTheTokenIsGranted(t *testing.T) {
 	t.Parallel()
 	store := newMemWorkerStore()
 	id := pendingSMS(store)
-	w, q, sender := slowTokenWorker(t, store, 3*time.Second)
+	w, q, sender, extAtGrant, extAtSend := tokenWorker(t, store, 1)
 
 	require.NoError(t, q.Enqueue(t.Context(), queue.Meta{ID: id, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh}))
 	runWorkerUntil(t, w, func() bool { return store.get(id).Status == domain.StatusSent })
-	assert.Equal(t, 1, store.leaseExtensions)
+	assert.Equal(t, int32(1), extAtGrant.Load(), "the lease was re-armed before the token was granted")
+	assert.Equal(t, extAtGrant.Load(), extAtSend.Load(), "no lease extension between the token and the send")
 	assert.Equal(t, int32(1), sender.calls.Load())
 }
 
@@ -62,7 +80,7 @@ func TestReclaimedDuringTokenWaitIsNotSent(t *testing.T) {
 	store := newMemWorkerStore()
 	id := pendingSMS(store)
 	store.reclaimBeforeExtend = true
-	w, q, sender := slowTokenWorker(t, store, 3*time.Second)
+	w, q, sender, _, _ := tokenWorker(t, store, 1)
 
 	require.NoError(t, q.Enqueue(t.Context(), queue.Meta{ID: id, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh}))
 	runWorkerUntil(t, w, func() bool {
@@ -78,7 +96,7 @@ func TestShortTokenWaitSkipsTheLeaseExtension(t *testing.T) {
 	t.Parallel()
 	store := newMemWorkerStore()
 	id := pendingSMS(store)
-	w, q, _ := slowTokenWorker(t, store, 10*time.Millisecond)
+	w, q, _, _, _ := tokenWorker(t, store, 0)
 
 	require.NoError(t, q.Enqueue(t.Context(), queue.Meta{ID: id, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh}))
 	runWorkerUntil(t, w, func() bool { return store.get(id).Status == domain.StatusSent })
