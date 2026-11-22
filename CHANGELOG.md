@@ -40,6 +40,8 @@ Changes from a technical audit of 1.1.2 (18 findings) and a follow-up review. AP
   reconciler; a final attempt abandoned by a dead worker is reported as "delivery outcome unknown".
 - Batch item idempotency keys are claimed in one statement; batch cancel no longer re-reads the batch.
 - `/api/v1/metrics` computes one snapshot at a time (single flight) and survives a panic in it.
+- The per-key API rate limiter's Redis call is bounded to 200 ms, so with Redis down a create still answers
+  `202` instead of timing out (Redis-down drill).
 
 ## [1.1.2] - 2026-11-22
 

@@ -1,0 +1,29 @@
+# 04-races
+# command: ./scripts/races.sh
+# started: 2026-11-22T13:04:43Z
+# git: 4d62df4 (docs: OpenAPI 1.2.0, changelog, chaos rerun, key rotation and metrics token)
+
+[16:04:43] == 1 cancel vs worker
+[16:04:57] 1 cancel vs worker: PASS - 1000 cancels: 634 won (all cancelled, 0 provider calls: 634/634), 366 lost to the worker (sent exactly once); violations=0, unexpected codes=0
+[16:05:05] == 2 batch cancel storm
+[16:05:18] 2 batch cancel storm: PASS - 20/20 responses; sum of reported cancelled=764, cancelled in DB=764, sent=236; cancelled rows that reached the provider=0
+[16:05:25] == 3 idempotency storm
+[16:05:26] 3 idempotency storm (same body): PASS - 200 concurrent POSTs: 202 x200 ; 1 created + 199 replayed (Idempotent-Replayed: true), 1 distinct id(s) returned, 1 row(s) in DB
+[16:05:27] 3 idempotency storm (different bodies): PASS - 200 concurrent POSTs, 200 different bodies: 202 x1, 409 idempotency_conflict x199; 1 row(s) in DB
+[16:05:27] == 4 manual retry storm
+[16:05:56] 4 manual retry storm: PASS - 20 failed x 50 concurrent retries: 20/20 accepted exactly once (rest 409); 0 not sent exactly once afterwards; 0 still in the DLQ list
+[16:05:56] == 5 scheduled send vs cancel
+[16:06:46] 5 scheduled send vs cancel: PASS - 5,000 due at 2026-11-22T13:06:18Z; 2,500 cancels finished 1s before due: 2500 x 200, 0 other; cancelled rows not 'cancelled'=0, reaching the provider=0, left in the delayed set=0; kept rows sent exactly once: 2500/2500
+[16:06:46] == 6 template delete vs batch
+[16:07:06] 6 template delete vs batch: PASS - template deleted (204) with 890 items still undelivered: 1000/1000 sent, 1000/1000 carry the text rendered at create time, 0 with raw placeholders; a new batch on the deleted template -> 422, rows on the template=1000
+
+=== race summary ===
+1 cancel vs worker                 PASS  1000 cancels: 634 won (all cancelled, 0 provider calls: 634/634), 366 lost to the worker (sent exactly once); violations=0, unexpected codes=0
+2 batch cancel storm               PASS  20/20 responses; sum of reported cancelled=764, cancelled in DB=764, sent=236; cancelled rows that reached the provider=0
+3 idempotency storm (same body)    PASS  200 concurrent POSTs: 202 x200 ; 1 created + 199 replayed (Idempotent-Replayed: true), 1 distinct id(s) returned, 1 row(s) in DB
+3 idempotency storm (different bodies) PASS  200 concurrent POSTs, 200 different bodies: 202 x1, 409 idempotency_conflict x199; 1 row(s) in DB
+4 manual retry storm               PASS  20 failed x 50 concurrent retries: 20/20 accepted exactly once (rest 409); 0 not sent exactly once afterwards; 0 still in the DLQ list
+5 scheduled send vs cancel         PASS  5,000 due at 2026-11-22T13:06:18Z; 2,500 cancels finished 1s before due: 2500 x 200, 0 other; cancelled rows not 'cancelled'=0, reaching the provider=0, left in the delayed set=0; kept rows sent exactly once: 2500/2500
+6 template delete vs batch         PASS  template deleted (204) with 890 items still undelivered: 1000/1000 sent, 1000/1000 carry the text rendered at create time, 0 with raw placeholders; a new batch on the deleted template -> 422, rows on the template=1000
+
+# exit code: 0

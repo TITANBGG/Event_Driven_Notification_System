@@ -1,0 +1,44 @@
+# 12-chaos
+# command: API_URL=http://127.0.0.1:8080 MOCK_URL=http://127.0.0.1:8090 ./scripts/chaos.sh
+# run: 2026-11-22 12:39 UTC, on the code of commit e2ea056 (lease extension between wait rounds) plus the later test/doc-only commits
+
+[15:39:04] chaos run 1795351144: 480s of load (1000 every 5s), since=2026-11-22T12:39:04Z
+[15:39:34] t=30s SIGKILL worker-1
+[15:39:49] t=45s start worker-1
+[15:40:04] t=60s SIGKILL worker-2
+[15:40:19] t=75s start worker-2
+[15:40:34] t=90s restart Redis
+[15:41:04] t=120s Redis FLUSHALL
+[15:41:34] t=150s stop PostgreSQL
+[15:41:54] t=170s start PostgreSQL
+[15:42:24] t=200s provider slow (2s +- 0.5s)
+[15:43:04] t=240s provider 30% 500s
+[15:43:44] t=280s provider 50% 429s
+[15:44:04] t=300s SIGKILL worker-1 during the 429 storm
+[15:44:19] t=315s start worker-1
+[15:45:04] t=360s provider healthy
+[15:47:05] load finished; waiting for every accepted notification to become terminal (timeout 1200s)
+
+=== chaos summary (since 2026-11-22T12:39:04Z) ===
+submissions: 82 batches, 2 rejected (e.g. 503 while PostgreSQL was down), 80000 notifications accepted
+in PostgreSQL: rows=80000 sent=79998 failed=2 open=0; drained 7s after the load ended
+failed reasons: max attempts reached: provider returned server error HTTP 500 x2
+peaks: queue_ready=4667 redis_bytes=7404976 pg_conns=24
+
+=== System Invariants Report ===
+1. Stuck notifications       PASS  pending/processing/retrying=0, scheduled=0
+2. Attempts bounds           PASS  0 rows with attempts > max_attempts or attempts < 0
+3. Sent metadata complete    PASS  1165323 sent rows all have provider_message_id and sent_at
+4. Cancelled never sent      PASS  0/14 cancelled rows have a 'sent' attempt; provider cross-check over 80000 IDs: 0 unrecorded calls to cancelled IDs
+5. Redis-PG consistency      PASS  0 mismatches (ready=0, inflight=0, stale_msg=0, delayed_diff=0, dlq_bad=0)
+6. Duplicate deliveries      PASS  notifications created since 2026-11-22T12:39:04Z: pg double-sent=3, abandoned attempts=106; unrecorded provider calls=31 across 31 ID(s) in a 80000-ID mock window (allowed: at-least-once after worker crash)
+ALL INVARIANTS PASSED
+
+=== Rate check since 2026-11-22T12:39:04Z (limit 100/s per channel) ===
+side      channel     sends    span_s  avg_per_s max_1s_window  verdict
+system    email       31673     479.1       66.1           97  PASS
+system    push        31627     479.1       66.0           97  PASS
+system    sms         31647     479.1       66.1           97  PASS
+provider  all         94978     479.1      198.2          291  PASS (limit 300 = 100 x 3 channel(s))
+RATE CHECK PASSED
+exit=0

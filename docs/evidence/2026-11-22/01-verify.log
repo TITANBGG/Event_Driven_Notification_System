@@ -1,0 +1,24 @@
+# 01-verify
+# command: ./scripts/verify.sh
+# started: 2026-11-22T13:02:30Z
+# git: 4d62df4 (docs: OpenAPI 1.2.0, changelog, chaos rerun, key rotation and metrics token)
+
+[16:02:30] lint (Go + shellcheck)       ... PASS (25s)
+[16:02:56] README diagrams render       ... PASS (7s)
+[16:03:03] unit tests (-race)           ... PASS (5s)
+[16:03:08] integration tests            ... PASS (2s)
+[16:03:10] compose stack up (healthy)   ... PASS (35s)
+[16:03:45] smoke test (every endpoint)  ... PASS (6s)
+[16:03:52] invariants                   ... PASS (12s)
+
+=== verify summary ===
+lint (Go + shellcheck)         PASS  25s
+README diagrams render         PASS  7s
+unit tests (-race)             PASS  5s
+integration tests              PASS  2s
+compose stack up (healthy)     PASS  35s
+smoke test (every endpoint)    PASS  6s
+invariants                     PASS  12s
+all steps passed
+
+# exit code: 0

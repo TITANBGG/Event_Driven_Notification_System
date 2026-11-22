@@ -1,0 +1,39 @@
+# 05-drills
+# command: ./scripts/drills.sh
+# started: 2026-11-22T13:54:02Z (fresh stack)
+# git: 4d62df4 + bounded API rate-limiter call
+
+[16:54:02] == 1 Redis down during create
+[16:54:07] POST -> 202 in 4s, /health/ready -> 200 (degraded)
+[16:54:43] 1 Redis down during create: PASS - 202 accepted while Redis was down, /health/ready=200 (degraded); sent 36s after Redis restart (reconciler step a)
+[16:54:55] 1 invariants: PASS - notifications created since 2026-11-22T13:54:02Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 1-ID mock window
+[16:54:57] == 2 PostgreSQL down
+[16:55:03] POST -> 503, /health/ready -> 503
+[16:55:04] 2 PostgreSQL down: PASS - POST=503 and /health/ready=503 while down; after restart a new notification was sent in 1s
+[16:55:15] 2 invariants: PASS - notifications created since 2026-11-22T13:54:57Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 1-ID mock window
+[16:55:17] == 3 Worker SIGKILL mid-batch
+[16:55:26] killed worker-1 with SIGKILL; batch 01a2038a-4b31-7d13-b401-07906980debf
+[16:56:29] 3 Worker SIGKILL mid-batch: PASS - 300/300 sent 62s after the kill; orphan-requeue log lines=1, abandoned-recovery log lines=25; duplicate provider calls=11 (at-least-once)
+[16:56:42] 3 invariants: PASS - notifications created since 2026-11-22T13:55:17Z: pg double-sent=0, abandoned attempts=25; unrecorded provider calls=11 across 11 ID(s) in a 300-ID mock window (allowed: at-least-once after worker crash)
+[16:56:50] == 4 Provider outage (all 500s)
+[16:57:00] breaker open after 3s, failed so far=0
+[16:57:33] 4 Provider outage (all 500s): PASS - breaker open (circuit_breaker_state=2) 3s into the outage, 0 failed; 40/40 sent 26s after recovery
+[16:57:44] 4 invariants: PASS - notifications created since 2026-11-22T13:56:49Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 40-ID mock window
+[16:57:46] == 5 Redis FLUSHALL mid-batch
+[16:57:50] flushed Redis; batch 01a2038c-7f10-7df7-94ed-695eee612847 sent so far=143
+[16:58:31] 5 Redis FLUSHALL mid-batch: PASS - 500/500 sent 41s after FLUSHALL (reconciler rebuilt queues from PostgreSQL); duplicate provider calls=0
+[16:58:42] 5 invariants: PASS - notifications created since 2026-11-22T13:57:46Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 500-ID mock window
+
+=== drill summary ===
+1 Redis down during create       PASS  202 accepted while Redis was down, /health/ready=200 (degraded); sent 36s after Redis restart (reconciler step a)
+1 invariants                     PASS  notifications created since 2026-11-22T13:54:02Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 1-ID mock window
+2 PostgreSQL down                PASS  POST=503 and /health/ready=503 while down; after restart a new notification was sent in 1s
+2 invariants                     PASS  notifications created since 2026-11-22T13:54:57Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 1-ID mock window
+3 Worker SIGKILL mid-batch       PASS  300/300 sent 62s after the kill; orphan-requeue log lines=1, abandoned-recovery log lines=25; duplicate provider calls=11 (at-least-once)
+3 invariants                     PASS  notifications created since 2026-11-22T13:55:17Z: pg double-sent=0, abandoned attempts=25; unrecorded provider calls=11 across 11 ID(s) in a 300-ID mock window (allowed: at-least-once after worker crash)
+4 Provider outage (all 500s)     PASS  breaker open (circuit_breaker_state=2) 3s into the outage, 0 failed; 40/40 sent 26s after recovery
+4 invariants                     PASS  notifications created since 2026-11-22T13:56:49Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 40-ID mock window
+5 Redis FLUSHALL mid-batch       PASS  500/500 sent 41s after FLUSHALL (reconciler rebuilt queues from PostgreSQL); duplicate provider calls=0
+5 invariants                     PASS  notifications created since 2026-11-22T13:57:46Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 500-ID mock window
+
+# exit code: 0

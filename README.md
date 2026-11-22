@@ -1285,6 +1285,26 @@ Every setting has a default inside `docker-compose.yml` (`${VAR:-default}`), so 
 
 ## 10. Testing
 
+### Evidence: raw logs and reports
+
+The results below are backed by raw output in the repository. Every log starts with the command, the start time and the git commit it ran on; the PDF reports summarise them.
+
+| What | Where |
+|---|---|
+| Test evidence report (PDF) | [`docs/reports/test-evidence-report.pdf`](docs/reports/test-evidence-report.pdf) |
+| Audit and remediation report (PDF): every review finding, its fix, commit and verification | [`docs/reports/audit-and-remediation-report.pdf`](docs/reports/audit-and-remediation-report.pdf) |
+| Raw logs of the 2026-11-22 runs, with an index | [`docs/evidence/2026-11-22/`](docs/evidence/2026-11-22/README.md) |
+
+| Run (2026-11-22) | Result | Log |
+|---|---|---|
+| `./scripts/verify.sh` (lint, race, integration, live smoke, invariants) | PASS, 7/7 steps | [`01-verify.log`](docs/evidence/2026-11-22/01-verify.log) |
+| 1,000 concurrent requests, one `Idempotency-Key` | 1 created, 999 replayed, 1 row | [`02-idempotency-1000-concurrent.log`](docs/evidence/2026-11-22/02-idempotency-1000-concurrent.log) |
+| Rate limit across two workers, 3,000 SMS | busiest second 96 (limit 100) | [`03-ratecheck-two-workers.log`](docs/evidence/2026-11-22/03-ratecheck-two-workers.log) |
+| `./scripts/races.sh` | PASS, 6/6 | [`04-races.log`](docs/evidence/2026-11-22/04-races.log) |
+| `./scripts/drills.sh` | PASS, 5/5 | [`05-drills.log`](docs/evidence/2026-11-22/05-drills.log) |
+| `./scripts/isolation.sh` | PASS, 8/8 | [`06-isolation.log`](docs/evidence/2026-11-22/06-isolation.log) |
+| `./scripts/chaos.sh` (80,000 notifications under failures) | 0 lost, 0 stuck, 97 per second | [`12-chaos.log`](docs/evidence/2026-11-22/12-chaos.log) |
+
 **Fastest way to check everything, with only Docker installed** (no Go, `make` or GCC on the host):
 
 ```bash

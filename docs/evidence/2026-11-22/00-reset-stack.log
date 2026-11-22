@@ -1,0 +1,215 @@
+# 00-reset-stack
+# command: reset_stack
+# started: 2026-11-22T13:01:27Z
+# git: 4d62df4 (docs: OpenAPI 1.2.0, changelog, chaos rerun, key rotation and metrics token)
+
+ Container eventdrivennotificationsystem-swagger-ui-1 Stopping 
+ Container eventdrivennotificationsystem-prometheus-1 Stopping 
+ Container eventdrivennotificationsystem-jaeger-1 Stopping 
+ Container eventdrivennotificationsystem-worker-1-1 Stopping 
+ Container eventdrivennotificationsystem-worker-2-1 Stopping 
+ Container eventdrivennotificationsystem-worker-2-1 Stopped 
+ Container eventdrivennotificationsystem-worker-2-1 Removing 
+ Container eventdrivennotificationsystem-worker-2-1 Removed 
+ Container eventdrivennotificationsystem-prometheus-1 Stopped 
+ Container eventdrivennotificationsystem-prometheus-1 Removing 
+ Container eventdrivennotificationsystem-swagger-ui-1 Stopped 
+ Container eventdrivennotificationsystem-swagger-ui-1 Removing 
+ Container eventdrivennotificationsystem-worker-1-1 Stopped 
+ Container eventdrivennotificationsystem-worker-1-1 Removing 
+ Container eventdrivennotificationsystem-prometheus-1 Removed 
+ Container eventdrivennotificationsystem-swagger-ui-1 Removed 
+ Container eventdrivennotificationsystem-worker-1-1 Removed 
+ Container eventdrivennotificationsystem-mockprovider-1 Stopping 
+ Container eventdrivennotificationsystem-jaeger-1 Stopped 
+ Container eventdrivennotificationsystem-jaeger-1 Removing 
+ Container eventdrivennotificationsystem-jaeger-1 Removed 
+ Container eventdrivennotificationsystem-mockprovider-1 Stopped 
+ Container eventdrivennotificationsystem-mockprovider-1 Removing 
+ Container eventdrivennotificationsystem-mockprovider-1 Removed 
+ Container eventdrivennotificationsystem-api-1 Stopping 
+ Container eventdrivennotificationsystem-api-1 Stopped 
+ Container eventdrivennotificationsystem-api-1 Removing 
+ Container eventdrivennotificationsystem-api-1 Removed 
+ Container eventdrivennotificationsystem-migrate-1 Stopping 
+ Container eventdrivennotificationsystem-redis-1 Stopping 
+ Container eventdrivennotificationsystem-migrate-1 Stopped 
+ Container eventdrivennotificationsystem-migrate-1 Removing 
+ Container eventdrivennotificationsystem-migrate-1 Removed 
+ Container eventdrivennotificationsystem-postgres-1 Stopping 
+ Container eventdrivennotificationsystem-redis-1 Stopped 
+ Container eventdrivennotificationsystem-redis-1 Removing 
+ Container eventdrivennotificationsystem-redis-1 Removed 
+ Container eventdrivennotificationsystem-postgres-1 Stopped 
+ Container eventdrivennotificationsystem-postgres-1 Removing 
+ Container eventdrivennotificationsystem-postgres-1 Removed 
+ Network eventdrivennotificationsystem_default Removing 
+ Volume eventdrivennotificationsystem_redis_data Removing 
+ Volume eventdrivennotificationsystem_postgres_data Removing 
+ Volume eventdrivennotificationsystem_redis_data Removed 
+ Volume eventdrivennotificationsystem_postgres_data Removed 
+ Network eventdrivennotificationsystem_default Removed 
+ Image notification-system:local Building 
+#1 [internal] load local bake definitions
+#1 reading from stdin 603B 0.0s done
+#1 DONE 0.0s
+
+#2 [internal] load build definition from Dockerfile
+#2 transferring dockerfile: 998B done
+#2 DONE 0.0s
+
+#3 [internal] load metadata for gcr.io/distroless/static-debian12:nonroot
+#3 DONE 0.7s
+
+#4 [internal] load metadata for docker.io/library/golang:1.27.4-alpine
+#4 ...
+
+#5 [auth] library/golang:pull token for registry-1.docker.io
+#5 DONE 0.0s
+
+#4 [internal] load metadata for docker.io/library/golang:1.27.4-alpine
+#4 DONE 1.5s
+
+#6 [internal] load .dockerignore
+#6 transferring context: 2B done
+#6 DONE 0.0s
+
+#7 [builder 1/6] FROM docker.io/library/golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280
+#7 resolve docker.io/library/golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 0.1s done
+#7 DONE 0.1s
+
+#8 [stage-1 1/3] FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+#8 resolve gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab 0.1s done
+#8 DONE 0.1s
+
+#9 [internal] load build context
+#9 transferring context: 1.09MB 0.2s done
+#9 DONE 0.2s
+
+#10 [builder 2/6] WORKDIR /src
+#10 CACHED
+
+#11 [builder 3/6] COPY go.mod go.sum ./
+#11 CACHED
+
+#12 [builder 4/6] RUN go mod download
+#12 CACHED
+
+#13 [builder 5/6] COPY . .
+#13 DONE 0.3s
+
+#14 [builder 6/6] RUN mkdir -p /out &&     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/api ./cmd/api &&     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/worker ./cmd/worker &&     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/mockprovider ./cmd/mockprovider &&     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/healthcheck ./cmd/healthcheck
+#14 DONE 27.7s
+
+#15 [stage-1 2/3] WORKDIR /app
+#15 CACHED
+
+#16 [stage-1 3/3] COPY --from=builder /out/ /app/
+#16 CACHED
+
+#17 exporting to image
+#17 exporting layers done
+#17 exporting manifest sha256:338a49d2cf68a70cd538e0df018b1e12cc45e09200198e41d98a7b0b2eb0e241 done
+#17 exporting config sha256:aca5ab5d4577e2c4cb9f7db1aa04f488de2396e6b3b99ae34b8d6aec33ed294f done
+#17 exporting attestation manifest sha256:7b35d4fb84f189fb587563857ca89ba2969e76c86412ef6ea3462cc851eecfc2 0.0s done
+#17 exporting manifest list sha256:85a5360394a3e9e7c97f12bd7dc841eaa49277714552555b549b51c24ef0a300 0.0s done
+#17 naming to docker.io/library/notification-system:local
+#17 naming to docker.io/library/notification-system:local done
+#17 unpacking to docker.io/library/notification-system:local 0.0s done
+#17 DONE 0.2s
+
+#18 resolving provenance for metadata file
+#18 DONE 0.0s
+ Image notification-system:local Built 
+ Network eventdrivennotificationsystem_default Creating 
+ Volume eventdrivennotificationsystem_postgres_data Creating 
+ Volume eventdrivennotificationsystem_redis_data Creating 
+ Volume eventdrivennotificationsystem_redis_data Creating 
+ Network eventdrivennotificationsystem_default Creating 
+ Volume eventdrivennotificationsystem_postgres_data Creating 
+ Volume eventdrivennotificationsystem_redis_data Created 
+ Volume eventdrivennotificationsystem_redis_data Created 
+ Volume eventdrivennotificationsystem_postgres_data Created 
+ Volume eventdrivennotificationsystem_postgres_data Created 
+ Network eventdrivennotificationsystem_default Created 
+ Network eventdrivennotificationsystem_default Created 
+ Container eventdrivennotificationsystem-swagger-ui-1 Creating 
+ Container eventdrivennotificationsystem-postgres-1 Creating 
+ Container eventdrivennotificationsystem-jaeger-1 Creating 
+ Container eventdrivennotificationsystem-prometheus-1 Creating 
+ Container eventdrivennotificationsystem-redis-1 Creating 
+ Container eventdrivennotificationsystem-prometheus-1 Created 
+ Container eventdrivennotificationsystem-swagger-ui-1 Created 
+ Container eventdrivennotificationsystem-postgres-1 Created 
+ Container eventdrivennotificationsystem-migrate-1 Creating 
+ Container eventdrivennotificationsystem-redis-1 Created 
+ Container eventdrivennotificationsystem-jaeger-1 Created 
+ Container eventdrivennotificationsystem-migrate-1 Created 
+ Container eventdrivennotificationsystem-api-1 Creating 
+ Container eventdrivennotificationsystem-api-1 Created 
+ Container eventdrivennotificationsystem-mockprovider-1 Creating 
+ Container eventdrivennotificationsystem-mockprovider-1 Created 
+ Container eventdrivennotificationsystem-worker-2-1 Creating 
+ Container eventdrivennotificationsystem-worker-1-1 Creating 
+ Container eventdrivennotificationsystem-worker-1-1 Created 
+ Container eventdrivennotificationsystem-worker-2-1 Created 
+ Container eventdrivennotificationsystem-redis-1 Starting 
+ Container eventdrivennotificationsystem-swagger-ui-1 Starting 
+ Container eventdrivennotificationsystem-jaeger-1 Starting 
+ Container eventdrivennotificationsystem-postgres-1 Starting 
+ Container eventdrivennotificationsystem-prometheus-1 Starting 
+ Container eventdrivennotificationsystem-redis-1 Started 
+ Container eventdrivennotificationsystem-redis-1 Waiting 
+ Container eventdrivennotificationsystem-swagger-ui-1 Started 
+ Container eventdrivennotificationsystem-jaeger-1 Started 
+ Container eventdrivennotificationsystem-postgres-1 Started 
+ Container eventdrivennotificationsystem-postgres-1 Waiting 
+ Container eventdrivennotificationsystem-prometheus-1 Started 
+ Container eventdrivennotificationsystem-redis-1 Healthy 
+ Container eventdrivennotificationsystem-postgres-1 Healthy 
+ Container eventdrivennotificationsystem-migrate-1 Starting 
+ Container eventdrivennotificationsystem-migrate-1 Started 
+ Container eventdrivennotificationsystem-migrate-1 Waiting 
+ Container eventdrivennotificationsystem-migrate-1 Exited 
+ Container eventdrivennotificationsystem-api-1 Starting 
+ Container eventdrivennotificationsystem-api-1 Started 
+ Container eventdrivennotificationsystem-mockprovider-1 Starting 
+ Container eventdrivennotificationsystem-mockprovider-1 Started 
+ Container eventdrivennotificationsystem-mockprovider-1 Waiting 
+ Container eventdrivennotificationsystem-mockprovider-1 Healthy 
+ Container eventdrivennotificationsystem-worker-2-1 Starting 
+ Container eventdrivennotificationsystem-worker-1-1 Starting 
+ Container eventdrivennotificationsystem-worker-2-1 Started 
+ Container eventdrivennotificationsystem-worker-1-1 Started 
+ Container eventdrivennotificationsystem-worker-2-1 Waiting 
+ Container eventdrivennotificationsystem-swagger-ui-1 Waiting 
+ Container eventdrivennotificationsystem-worker-1-1 Waiting 
+ Container eventdrivennotificationsystem-jaeger-1 Waiting 
+ Container eventdrivennotificationsystem-postgres-1 Waiting 
+ Container eventdrivennotificationsystem-api-1 Waiting 
+ Container eventdrivennotificationsystem-mockprovider-1 Waiting 
+ Container eventdrivennotificationsystem-migrate-1 Waiting 
+ Container eventdrivennotificationsystem-redis-1 Waiting 
+ Container eventdrivennotificationsystem-prometheus-1 Waiting 
+ Container eventdrivennotificationsystem-migrate-1 Exited 
+ Container eventdrivennotificationsystem-swagger-ui-1 Healthy 
+ Container eventdrivennotificationsystem-jaeger-1 Healthy 
+ Container eventdrivennotificationsystem-mockprovider-1 Healthy 
+ Container eventdrivennotificationsystem-api-1 Healthy 
+ Container eventdrivennotificationsystem-redis-1 Healthy 
+ Container eventdrivennotificationsystem-postgres-1 Healthy 
+ Container eventdrivennotificationsystem-prometheus-1 Healthy 
+ Container eventdrivennotificationsystem-worker-1-1 Healthy 
+ Container eventdrivennotificationsystem-worker-2-1 Healthy 
+NAME                                           IMAGE                             COMMAND                  SERVICE        CREATED          STATUS                    PORTS
+eventdrivennotificationsystem-api-1            notification-system:local         "/app/api"               api            18 seconds ago   Up 11 seconds (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+eventdrivennotificationsystem-jaeger-1         jaegertracing/all-in-one:1.63.0   "/go/bin/all-in-one-…"   jaeger         19 seconds ago   Up 18 seconds             0.0.0.0:4318->4318/tcp, [::]:4318->4318/tcp, 0.0.0.0:16686->16686/tcp, [::]:16686->16686/tcp
+eventdrivennotificationsystem-mockprovider-1   notification-system:local         "/app/mockprovider"      mockprovider   18 seconds ago   Up 11 seconds (healthy)   0.0.0.0:8090->8090/tcp, [::]:8090->8090/tcp
+eventdrivennotificationsystem-postgres-1       postgres:16-alpine                "docker-entrypoint.s…"   postgres       19 seconds ago   Up 17 seconds (healthy)   127.0.0.1:5432->5432/tcp
+eventdrivennotificationsystem-prometheus-1     prom/prometheus:v3.0.1            "/bin/prometheus --c…"   prometheus     19 seconds ago   Up 17 seconds             0.0.0.0:9090->9090/tcp, [::]:9090->9090/tcp
+eventdrivennotificationsystem-redis-1          redis:7-alpine                    "docker-entrypoint.s…"   redis          19 seconds ago   Up 18 seconds (healthy)   127.0.0.1:6379->6379/tcp
+eventdrivennotificationsystem-swagger-ui-1     swaggerapi/swagger-ui:v5.17.14    "/docker-entrypoint.…"   swagger-ui     19 seconds ago   Up 18 seconds             0.0.0.0:8081->8080/tcp, [::]:8081->8080/tcp
+eventdrivennotificationsystem-worker-1-1       notification-system:local         "/app/worker"            worker-1       18 seconds ago   Up 5 seconds (healthy)    8080/tcp, 8090/tcp, 9091/tcp
+eventdrivennotificationsystem-worker-2-1       notification-system:local         "/app/worker"            worker-2       18 seconds ago   Up 5 seconds (healthy)    8080/tcp, 8090/tcp, 9091/tcp
+
+# exit code: 0

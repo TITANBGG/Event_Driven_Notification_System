@@ -1,0 +1,38 @@
+# 03-ratecheck-two-workers
+# command: ratecheck_two_workers
+# started: 2026-11-22T13:04:08Z
+# git: 4d62df4 (docs: OpenAPI 1.2.0, changelog, chaos rerun, key rotation and metrics token)
+
+created=3000 batches=3 elapsed=173ms created_per_sec=17318.2 batch_p50_ms=166.9 batch_p95_ms=170.7 batch_p99_ms=171.0
+draining non_terminal=3000 statuses=map[pending:3000]
+draining non_terminal=2813 statuses=map[pending:2764 processing:49 sent:187]
+draining non_terminal=2620 statuses=map[pending:2571 processing:49 sent:380]
+draining non_terminal=2426 statuses=map[pending:2376 processing:50 sent:574]
+draining non_terminal=2232 statuses=map[pending:2182 processing:50 sent:768]
+draining non_terminal=2039 statuses=map[pending:1994 processing:45 sent:961]
+draining non_terminal=1846 statuses=map[pending:1797 processing:49 sent:1154]
+draining non_terminal=1653 statuses=map[pending:1603 processing:50 sent:1347]
+draining non_terminal=1459 statuses=map[pending:1409 processing:50 sent:1541]
+draining non_terminal=1266 statuses=map[pending:1216 processing:50 sent:1734]
+draining non_terminal=1073 statuses=map[pending:1024 processing:49 sent:1927]
+draining non_terminal=880 statuses=map[pending:830 processing:50 sent:2120]
+draining non_terminal=687 statuses=map[pending:637 processing:50 sent:2313]
+draining non_terminal=494 statuses=map[pending:445 processing:49 sent:2506]
+draining non_terminal=302 statuses=map[pending:253 processing:49 sent:2698]
+draining non_terminal=110 statuses=map[pending:61 processing:49 sent:2890]
+completed=3000 total_elapsed=32.282s final_statuses=map[sent:3000]
+
+=== loadgen summary ===
+notifications          3000
+create throughput      17318.2 notif/s (173ms)
+batch create latency   p50=166.9ms p95=170.7ms p99=171.0ms
+time to all terminal   32.282s
+end-to-end throughput  92.9 sent/s
+final statuses         map[sent:3000]
+=== Rate check since 2026-11-22T13:04:08Z (limit 100/s per channel) ===
+side      channel     sends    span_s  avg_per_s max_1s_window  verdict
+system    sms          3000      31.7       94.8           96  PASS
+provider  all          3000      31.7       94.8           96  PASS (limit 100 = 100 x 1 channel(s))
+RATE CHECK PASSED
+
+# exit code: 0

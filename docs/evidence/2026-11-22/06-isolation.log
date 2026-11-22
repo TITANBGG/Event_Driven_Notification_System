@@ -1,0 +1,47 @@
+# 06-isolation
+# command: ./scripts/isolation.sh
+# started: 2026-11-22T13:11:44Z
+# git: 4d62df4 (docs: OpenAPI 1.2.0, changelog, chaos rerun, key rotation and metrics token)
+
+[16:11:45] isolation run 1795353104 since 2026-11-22T13:11:45Z
+[16:11:45] submitting 30000 SMS
+[16:11:50] email and push: 100 each every 2s for 120s, sampling the SMS queue
+[16:13:51] side batches accepted: 120 of 120; smallest SMS backlog seen: 17975
+[16:13:52] sms_backlog_held: PASS - smallest SMS ready queue 17975 (need >= 5000)
+[16:13:52] side_batches_accepted: PASS - 120/120
+[16:13:53] email_all_sent: PASS - 6000/6000 sent
+[16:13:53] email_p95_e2e: PASS - p50 673ms p95 1202ms p99 1334ms (need p95 < 2000ms)
+[16:13:53] push_all_sent: PASS - 6000/6000 sent
+[16:13:53] push_p95_e2e: PASS - p50 667ms p95 1185ms p99 1317ms (need p95 < 2000ms)
+[16:13:54] SMS still open after the side traffic: 17732; waiting for the backlog to drain
+[16:17:03] sms_all_sent: PASS - 30000/30000
+=== Rate check since 2026-11-22T13:11:45Z (limit 100/s per channel) ===
+side      channel     sends    span_s  avg_per_s max_1s_window  verdict
+system    email        6000     118.8       50.5           96  PASS
+system    push         6000     118.8       50.5           97  PASS
+system    sms         30000     316.3       94.8           97  PASS
+provider  all         42000     316.3      132.8          288  PASS (limit 300 = 100 x 3 channel(s))
+RATE CHECK PASSED
+[16:17:05] rate_limit: PASS - ratecheck.sh --since=2026-11-22T13:11:45Z
+=== System Invariants Report ===
+1. Stuck notifications       PASS  pending/processing/retrying=0, scheduled=0
+2. Attempts bounds           PASS  0 rows with attempts > max_attempts or attempts < 0
+3. Sent metadata complete    PASS  49981 sent rows all have provider_message_id and sent_at
+4. Cancelled never sent      PASS  0/3899 cancelled rows have a 'sent' attempt; provider cross-check over 42000 IDs: 0 unrecorded calls to cancelled IDs
+5. Redis-PG consistency      PASS  0 mismatches (ready=0, inflight=0, stale_msg=0, delayed_diff=0, dlq_bad=0)
+6. Duplicate deliveries      PASS  notifications created since 2026-11-22T13:11:45Z: pg double-sent=0, abandoned attempts=0; unrecorded provider calls=0 across 0 ID(s) in a 42000-ID mock window
+ALL INVARIANTS PASSED
+[16:17:17] invariants: PASS - invariants.sh --since=2026-11-22T13:11:45Z
+
+=== Channel isolation (1795353104) ===
+sms_backlog_held                         PASS  smallest SMS ready queue 17975 (need >= 5000)
+side_batches_accepted                    PASS  120/120
+email_all_sent                           PASS  6000/6000 sent
+email_p95_e2e                            PASS  p50 673ms p95 1202ms p99 1334ms (need p95 < 2000ms)
+push_all_sent                            PASS  6000/6000 sent
+push_p95_e2e                             PASS  p50 667ms p95 1185ms p99 1317ms (need p95 < 2000ms)
+sms_all_sent                             PASS  30000/30000
+rate_limit                               PASS  ratecheck.sh --since=2026-11-22T13:11:45Z
+invariants                               PASS  invariants.sh --since=2026-11-22T13:11:45Z
+
+# exit code: 0

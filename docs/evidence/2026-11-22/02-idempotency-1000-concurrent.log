@@ -1,0 +1,13 @@
+# 02-idempotency-1000-concurrent
+# command: idempotency_1000
+# started: 2026-11-22T13:04:04Z
+# git: 4d62df4 (docs: OpenAPI 1.2.0, changelog, chaos rerun, key rotation and metrics token)
+
+1000 concurrent POST /api/v1/notifications (200 connections), one Idempotency-Key: evidence-idem-1795352644
+-- status code / Idempotent-Replayed header counts:
+      1 202 (fresh)
+    999 202 replayed=true
+-- distinct notification ids returned: 1
+-- rows in PostgreSQL with this key: 1
+
+# exit code: 0
