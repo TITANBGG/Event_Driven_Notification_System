@@ -329,7 +329,10 @@ func TestWorkerCircuitBreakerIntegrationAndMaxDeferrals(t *testing.T) {
 		})
 		require.NoError(t, q.Enqueue(ctx, queue.Meta{ID: deferredID, Channel: domain.ChannelSMS, Priority: domain.PriorityHigh}))
 
-		time.Sleep(150 * time.Millisecond) // test-only: still well inside the 400ms open state
+		// Watched continuously for 150ms, well inside the 400ms open state: the item is never claimed.
+		require.Never(t, func() bool {
+			return store.get(deferredID).Status != domain.StatusPending
+		}, 150*time.Millisecond, 5*time.Millisecond, "an open circuit must not claim new items")
 		require.Equal(t, gobreaker.StateOpen, breaker.State(domain.ChannelSMS))
 		gotDeferred := store.get(deferredID)
 		assert.Equal(t, domain.StatusPending, gotDeferred.Status, "an open circuit must not claim new items")

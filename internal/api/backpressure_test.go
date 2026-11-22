@@ -72,12 +72,7 @@ func TestAPIRateLimitPerKey(t *testing.T) {
 	t.Parallel()
 	mr := miniredis.RunT(t)
 	rdb := queue.NewClient(mr.Addr(), 4)
-	t.Cleanup(func() {
-		_ = rdb.Close()
-		// go-redis v9 ConnPool.tryDial sleeps 1s before checking p.closed(); wait past one sleep
-		// cycle so goleak verifies the background dialer exits cleanly after Close().
-		time.Sleep(1100 * time.Millisecond)
-	})
+	t.Cleanup(func() { _ = rdb.Close() })
 
 	cfg, err := config.LoadFrom(func(string) (string, bool) { return "", false })
 	require.NoError(t, err)
@@ -163,8 +158,9 @@ func TestMetricsSnapshotIsComputedOnceForConcurrentRequests(t *testing.T) {
 		wg.Add(1)
 		go func() { defer wg.Done(); results <- poll() }()
 	}
+	// Every request either waits for this refresh or, arriving after it, hits the fresh cache; in
+	// neither case may a second computation start, so no scheduling delay is needed here.
 	require.Eventually(t, func() bool { return store.calls.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
-	time.Sleep(50 * time.Millisecond) // test-only: let the other 19 requests queue behind the refresh
 	close(store.release)
 	wg.Wait()
 	close(results)
